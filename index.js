@@ -9,6 +9,13 @@ import { getDisplayMode, setDisplayMode } from './src/metadata-store.js';
 
 const MODULE_NAME = 'chat_manager';
 const EXTENSION_PATH = '/scripts/extensions/third-party/chat_manager';
+const SETTINGS_CONTAINER_ID = 'chat_manager_settings_container';
+
+const templateCache = new Map();
+let settingsInjected = false;
+let pendingSettingsInjection = null;
+let currentInjectedMode = null;
+let pendingUIInjection = null;
 
 /**
  * Extension entry point — called by SillyTavern when the extension loads.
@@ -22,14 +29,10 @@ const EXTENSION_PATH = '/scripts/extensions/third-party/chat_manager';
         context.extensionSettings[MODULE_NAME] = { metadata: {}, displayMode: 'panel' };
     }
 
-    // Inject UI for current display mode
-    await injectUI(getDisplayMode());
-
-    // Bind panel events
-    bindPanelEvents();
-
-    // Inject settings panel into Extensions settings
-    await injectSettingsPanel();
+    // Inject settings panel asynchronously to avoid blocking startup.
+    setTimeout(() => {
+        void injectSettingsPanel();
+    }, 0);
 
     // Listen for SillyTavern events
     eventSource.on(eventTypes.CHAT_CHANGED, onChatChanged);
@@ -37,15 +40,49 @@ const EXTENSION_PATH = '/scripts/extensions/third-party/chat_manager';
     eventSource.on(eventTypes.MESSAGE_RECEIVED, onMessageUpdate);
 
     // Hijack TopInfoBar's chat manager button once all extensions are ready
-    eventSource.on(eventTypes.APP_READY, hijackTopBarButton);
+    eventSource.on(eventTypes.APP_READY, onAppReady);
 
     console.log(`[${MODULE_NAME}] Extension loaded.`);
 })();
+
+function onAppReady() {
+    hijackTopBarButton();
+    void injectSettingsPanel();
+}
+
+/**
+ * Fetch and sanitize a template once, then reuse it.
+ * @param {string} templateFile
+ * @returns {Promise<string|null>}
+ */
+async function loadTemplate(templateFile) {
+    if (templateCache.has(templateFile)) {
+        return templateCache.get(templateFile);
+    }
+
+    const context = SillyTavern.getContext();
+    const response = await fetch(`${EXTENSION_PATH}/templates/${templateFile}`, {
+        method: 'GET',
+        headers: context.getRequestHeaders(),
+    });
+
+    if (!response.ok) {
+        console.error(`[${MODULE_NAME}] Failed to load ${templateFile} template`);
+        return null;
+    }
+
+    const html = await response.text();
+    const { DOMPurify } = SillyTavern.libs;
+    const sanitized = DOMPurify.sanitize(html);
+    templateCache.set(templateFile, sanitized);
+    return sanitized;
+}
 
 /**
  * Inject the UI template for the given display mode into the DOM.
  * Removes any existing panel/overlay elements first.
  * @param {string} mode - 'panel' or 'popup'
+ * @returns {Promise<boolean>}
  */
 async function injectUI(mode) {
     // Remove existing UI elements
@@ -55,68 +92,113 @@ async function injectUI(mode) {
     if (existingOverlay) existingOverlay.remove();
 
     const templateFile = mode === 'popup' ? 'popup.html' : 'panel.html';
-    const context = SillyTavern.getContext();
-    const response = await fetch(`${EXTENSION_PATH}/templates/${templateFile}`, {
-        method: 'GET',
-        headers: context.getRequestHeaders(),
-    });
+    const html = await loadTemplate(templateFile);
+    if (!html) return false;
 
-    if (!response.ok) {
-        console.error(`[${MODULE_NAME}] Failed to load ${templateFile} template`);
-        return;
+    const wrapper = document.createElement('div');
+    wrapper.innerHTML = html;
+
+    const root = wrapper.firstElementChild;
+    if (!root) return false;
+
+    document.body.appendChild(root);
+    return true;
+}
+
+/**
+ * Ensure the panel/popup DOM exists for the selected display mode.
+ * @param {string} mode
+ * @returns {Promise<boolean>}
+ */
+async function ensureUI(mode) {
+    const hasPanel = !!document.getElementById('chat-manager-panel');
+    const hasOverlay = !!document.getElementById('chat-manager-shadow-overlay');
+    const hasCurrentUI = mode === 'popup' ? hasOverlay : hasPanel;
+
+    if (currentInjectedMode === mode && hasCurrentUI) {
+        return true;
     }
 
-    const html = await response.text();
-    const { DOMPurify } = SillyTavern.libs;
-    const wrapper = document.createElement('div');
-    wrapper.innerHTML = DOMPurify.sanitize(html);
+    if (pendingUIInjection) {
+        return pendingUIInjection;
+    }
 
-    document.body.appendChild(wrapper.firstElementChild);
+    pendingUIInjection = (async () => {
+        const injected = await injectUI(mode);
+        if (!injected) return false;
+        bindPanelEvents();
+        currentInjectedMode = mode;
+        return true;
+    })().finally(() => {
+        pendingUIInjection = null;
+    });
+
+    return pendingUIInjection;
+}
+
+async function handleTogglePanel(event) {
+    if (event) event.stopPropagation();
+
+    const mode = getDisplayMode();
+    const ready = await ensureUI(mode);
+    if (!ready) return;
+
+    await togglePanel();
 }
 
 /**
  * Inject the settings panel into SillyTavern's Extensions settings area.
  */
 async function injectSettingsPanel() {
-    const context = SillyTavern.getContext();
-    const response = await fetch(`${EXTENSION_PATH}/templates/settings.html`, {
-        method: 'GET',
-        headers: context.getRequestHeaders(),
-    });
+    if (settingsInjected) return;
+    if (pendingSettingsInjection) return pendingSettingsInjection;
 
-    if (!response.ok) {
-        console.error(`[${MODULE_NAME}] Failed to load settings template`);
-        return;
-    }
+    pendingSettingsInjection = (async () => {
+        if (document.getElementById(SETTINGS_CONTAINER_ID)) {
+            settingsInjected = true;
+            return;
+        }
 
-    const html = await response.text();
-    const { DOMPurify } = SillyTavern.libs;
+        const settingsArea = document.getElementById('extensions_settings2');
+        if (!settingsArea) {
+            return;
+        }
 
-    const container = document.createElement('div');
-    container.className = 'extension_container';
-    container.id = 'chat_manager_settings_container';
-    container.innerHTML = DOMPurify.sanitize(html);
+        const html = await loadTemplate('settings.html');
+        if (!html) return;
 
-    const settingsArea = document.getElementById('extensions_settings2');
-    if (settingsArea) {
+        if (document.getElementById(SETTINGS_CONTAINER_ID)) {
+            settingsInjected = true;
+            return;
+        }
+
+        const container = document.createElement('div');
+        container.className = 'extension_container';
+        container.id = SETTINGS_CONTAINER_ID;
+        container.innerHTML = html;
         settingsArea.appendChild(container);
-    }
+        settingsInjected = true;
 
-    // Set initial radio state
-    const currentMode = getDisplayMode();
-    const radio = container.querySelector(`input[name="chat_manager_display_mode"][value="${currentMode}"]`);
-    if (radio) radio.checked = true;
+        // Set initial radio state
+        const currentMode = getDisplayMode();
+        const radio = container.querySelector(`input[name="chat_manager_display_mode"][value="${currentMode}"]`);
+        if (radio) radio.checked = true;
 
-    // Bind change handler
-    container.querySelectorAll('input[name="chat_manager_display_mode"]').forEach(input => {
-        input.addEventListener('change', async (e) => {
-            const newMode = e.target.value;
-            // Close using the OLD mode before persisting the new one
-            closePanel();
-            setDisplayMode(newMode);
-            await switchDisplayMode(newMode);
+        // Bind change handler
+        container.querySelectorAll('input[name="chat_manager_display_mode"]').forEach(input => {
+            input.addEventListener('change', async (e) => {
+                const newMode = e.target.value;
+                // Close using the OLD mode before persisting the new one
+                closePanel();
+                setDisplayMode(newMode);
+                await switchDisplayMode(newMode);
+            });
         });
+    })().finally(() => {
+        pendingSettingsInjection = null;
     });
+
+    return pendingSettingsInjection;
 }
 
 /**
@@ -124,11 +206,10 @@ async function injectSettingsPanel() {
  * @param {string} newMode - 'panel' or 'popup'
  */
 async function switchDisplayMode(newMode) {
-    // Swap DOM template
-    await injectUI(newMode);
-
-    // Re-bind events on the new template
-    bindPanelEvents();
+    if (!currentInjectedMode && !document.getElementById('chat-manager-panel') && !document.getElementById('chat-manager-shadow-overlay')) {
+        return;
+    }
+    await ensureUI(newMode);
 }
 
 /**
@@ -148,8 +229,7 @@ function hijackTopBarButton() {
         clone.addEventListener('click', (e) => {
             // Respect TopInfoBar's disabled state
             if (clone.classList.contains('not-in-chat')) return;
-            e.stopPropagation();
-            togglePanel();
+            void handleTogglePanel(e);
         });
         parent.replaceChild(clone, existingBtn);
         console.log(`[${MODULE_NAME}] Hijacked TopInfoBar chat manager button.`);
@@ -164,7 +244,9 @@ function hijackTopBarButton() {
         icon.className = 'fa-solid fa-address-book';
         icon.title = 'Toggle Chat Manager';
         icon.tabIndex = 0;
-        icon.addEventListener('click', togglePanel);
+        icon.addEventListener('click', (e) => {
+            void handleTogglePanel(e);
+        });
         topBar.appendChild(icon);
         console.log(`[${MODULE_NAME}] Added Chat Manager icon to TopInfoBar.`);
         return;
@@ -179,7 +261,9 @@ function hijackTopBarButton() {
     btn.style.top = '8px';
     btn.style.right = '8px';
     btn.style.zIndex = '999';
-    btn.addEventListener('click', togglePanel);
+    btn.addEventListener('click', (e) => {
+        void handleTogglePanel(e);
+    });
     document.body.appendChild(btn);
     console.log(`[${MODULE_NAME}] Added floating Chat Manager button (no TopInfoBar).`);
 }
