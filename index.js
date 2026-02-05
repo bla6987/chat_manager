@@ -340,17 +340,25 @@ async function onChatChanged() {
 
 /**
  * Handle MESSAGE_SENT / MESSAGE_RECEIVED — lightweight update for active chat only.
+ * Debounced to avoid redundant updates during rapid message events (e.g., streaming).
  */
-async function onMessageUpdate() {
-    if (!isPanelOpen()) return;
+const onMessageUpdate = (() => {
+    let timer = null;
+    return function () {
+        if (timer) clearTimeout(timer);
+        timer = setTimeout(async () => {
+            timer = null;
+            if (!isPanelOpen()) return;
 
-    const context = SillyTavern.getContext();
-    const activeChatFile = context.chatMetadata?.chat_file_name;
+            const context = SillyTavern.getContext();
+            const activeChatFile = context.chatMetadata?.chat_file_name;
 
-    if (activeChatFile) {
-        const updated = await updateActiveChat(activeChatFile);
-        if (updated) {
-            renderThreadCards();
-        }
-    }
-}
+            if (activeChatFile) {
+                const updated = await updateActiveChat(activeChatFile);
+                if (updated) {
+                    renderThreadCards();
+                }
+            }
+        }, 250);
+    };
+})();

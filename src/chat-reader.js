@@ -3,8 +3,10 @@
  * Never modifies any chat files.
  */
 
+import { getCachedChatsForCharacter, putCachedChat, removeCachedChat } from './cache-store.js';
+
 const MODULE_NAME = 'chat_manager';
-const HYDRATION_BATCH_SIZE = 20;
+const HYDRATION_BATCH_SIZE = 50;
 const FALLBACK_SORT_TIMESTAMP = 0;
 
 /** @type {Object<string, ChatIndexEntry>} filename -> index entry */
@@ -20,6 +22,11 @@ let hydrationSessionId = 0;
 const entryHydrationPromises = new Map();
 const hydrationListeners = new Set();
 let progressCallback = null;
+
+/** Searchable messages cache — invalidated on every index mutation */
+let indexVersion = 0;
+let cachedSearchableMessages = null;
+let cachedSearchableVersion = -1;
 
 /**
  * @typedef {Object} IndexMessage
@@ -292,6 +299,10 @@ export function prioritizeInQueue(fileName) {
     }
 }
 
+function bumpIndexVersion() {
+    indexVersion++;
+}
+
 function normalizeEntryShape(entry) {
     if (!entry || typeof entry !== 'object') return;
 
@@ -359,6 +370,11 @@ async function hydrateEntry(fileName, sessionId) {
                 branchPoint: null,
                 isLoaded: true,
             };
+            bumpIndexVersion();
+
+            if (currentCharacterAvatar) {
+                putCachedChat(currentCharacterAvatar, fileName, chatIndex[fileName]);
+            }
 
             return true;
         }
@@ -463,6 +479,14 @@ export async function buildIndex(onProgress, onMetadataReady) {
             serverChats.set(metaObj.file_name, metaObj);
         }
 
+        // Bulk-read IndexedDB cache for this character
+        let idbCache = new Map();
+        try {
+            idbCache = await getCachedChatsForCharacter(character.avatar);
+        } catch {
+            // IndexedDB unavailable — proceed without cache
+        }
+
         const existingKeys = new Set(Object.keys(chatIndex));
 
         for (const [fileName, metaObj] of serverChats) {
@@ -474,6 +498,25 @@ export async function buildIndex(onProgress, onMetadataReady) {
 
             const cached = chatIndex[fileName];
             if (!cached) {
+                // Check IndexedDB cache before scheduling hydration
+                const idbEntry = idbCache.get(fileName);
+                if (idbEntry && idbEntry.lastModified === serverTimestamp && Array.isArray(idbEntry.messages) && idbEntry.messages.length > 0) {
+                    changed = true;
+                    chatIndex[fileName] = {
+                        fileName,
+                        lastModified: serverTimestamp,
+                        messageCount: idbEntry.messageCount,
+                        messages: idbEntry.messages,
+                        firstMessageTimestamp: idbEntry.firstMessageTimestamp,
+                        lastMessageTimestamp: idbEntry.lastMessageTimestamp || metaLastTimestamp,
+                        sortTimestamp: idbEntry.sortTimestamp || serverTimestamp,
+                        initialOrder: allocateInitialOrder(),
+                        branchPoint: null,
+                        isLoaded: true,
+                    };
+                    continue;
+                }
+
                 changed = true;
                 chatIndex[fileName] = {
                     fileName,
@@ -505,21 +548,44 @@ export async function buildIndex(onProgress, onMetadataReady) {
 
             if (timestampChanged) {
                 changed = true;
-                cached.isLoaded = false;
-                cached.messages = [];
-                cached.branchPoint = null;
-                cached.firstMessageTimestamp = null;
-                if (metaMessageCount !== null) {
-                    cached.messageCount = metaMessageCount;
+                // Check IndexedDB cache for updated entry
+                const idbEntry = idbCache.get(fileName);
+                if (idbEntry && idbEntry.lastModified === serverTimestamp && Array.isArray(idbEntry.messages) && idbEntry.messages.length > 0) {
+                    cached.isLoaded = true;
+                    cached.messages = idbEntry.messages;
+                    cached.messageCount = idbEntry.messageCount;
+                    cached.firstMessageTimestamp = idbEntry.firstMessageTimestamp;
+                    cached.lastMessageTimestamp = idbEntry.lastMessageTimestamp || metaLastTimestamp;
+                    cached.branchPoint = null;
                 } else {
-                    cached.messageCount = 0;
+                    cached.isLoaded = false;
+                    cached.messages = [];
+                    cached.branchPoint = null;
+                    cached.firstMessageTimestamp = null;
+                    if (metaMessageCount !== null) {
+                        cached.messageCount = metaMessageCount;
+                    } else {
+                        cached.messageCount = 0;
+                    }
+                    markEntryForHydration(fileName);
                 }
-                markEntryForHydration(fileName);
             } else if (!cached.isLoaded) {
-                if (metaMessageCount !== null) {
-                    cached.messageCount = metaMessageCount;
+                // Check IndexedDB cache before scheduling hydration
+                const idbEntry = idbCache.get(fileName);
+                if (idbEntry && idbEntry.lastModified === serverTimestamp && Array.isArray(idbEntry.messages) && idbEntry.messages.length > 0) {
+                    cached.isLoaded = true;
+                    cached.messages = idbEntry.messages;
+                    cached.messageCount = idbEntry.messageCount;
+                    cached.firstMessageTimestamp = idbEntry.firstMessageTimestamp;
+                    cached.lastMessageTimestamp = idbEntry.lastMessageTimestamp || metaLastTimestamp;
+                    cached.branchPoint = null;
+                    changed = true;
+                } else {
+                    if (metaMessageCount !== null) {
+                        cached.messageCount = metaMessageCount;
+                    }
+                    markEntryForHydration(fileName);
                 }
-                markEntryForHydration(fileName);
             }
 
             if (cached.isLoaded) {
@@ -535,10 +601,12 @@ export async function buildIndex(onProgress, onMetadataReady) {
             delete chatIndex[deletedKey];
             queuedFiles.delete(deletedKey);
             hydrationQueue = hydrationQueue.filter(name => name !== deletedKey);
+            removeCachedChat(character.avatar, deletedKey);
             changed = true;
         }
 
         if (changed) {
+            bumpIndexVersion();
             for (const entry of Object.values(chatIndex)) {
                 entry.branchPoint = null;
             }
@@ -584,6 +652,7 @@ export async function loadEntryNow(fileName) {
 
 /**
  * Update only the active chat's entry in the index (lightweight, no full rebuild).
+ * Reads from SillyTavern's in-memory chat array when possible, avoiding an HTTP request.
  * @param {string} fileName - The chat file to update
  * @returns {Promise<boolean>} Whether the entry was actually updated
  */
@@ -591,7 +660,15 @@ export async function updateActiveChat(fileName) {
     if (!fileName || !chatIndex[fileName]) return false;
 
     try {
-        const chatData = await fetchChatContent(fileName);
+        // Prefer in-memory chat data over HTTP fetch
+        const context = SillyTavern.getContext();
+        let chatData;
+        if (Array.isArray(context.chat) && context.chat.length > 0) {
+            chatData = context.chat;
+        } else {
+            chatData = await fetchChatContent(fileName);
+        }
+
         const messages = parseMessages(chatData, fileName);
         const cached = chatIndex[fileName];
         const lastTimestamp = messages.length > 0 ? messages[messages.length - 1].timestamp : null;
@@ -609,6 +686,11 @@ export async function updateActiveChat(fileName) {
             branchPoint: null,
             isLoaded: true,
         };
+        bumpIndexVersion();
+
+        if (currentCharacterAvatar) {
+            putCachedChat(currentCharacterAvatar, fileName, chatIndex[fileName]);
+        }
 
         queuedFiles.delete(fileName);
         hydrationQueue = hydrationQueue.filter(name => name !== fileName);
@@ -700,6 +782,7 @@ export function clearIndex() {
     currentCharacterAvatar = null;
     nextInitialOrder = 0;
     progressCallback = null;
+    bumpIndexVersion();
     resetHydrationQueue();
     emitHydrationUpdate();
 }
@@ -760,9 +843,14 @@ export function onHydrationUpdate(callback) {
 
 /**
  * Build a flat array of loaded messages for search.
+ * Returns a cached array if the index hasn't changed since the last call.
  * @returns {Array}
  */
 export function getSearchableMessages() {
+    if (cachedSearchableMessages && cachedSearchableVersion === indexVersion) {
+        return cachedSearchableMessages;
+    }
+
     const messages = [];
     for (const chatData of Object.values(chatIndex)) {
         if (!chatData.isLoaded) continue;
@@ -772,5 +860,8 @@ export function getSearchableMessages() {
             messages.push(msg);
         }
     }
+
+    cachedSearchableMessages = messages;
+    cachedSearchableVersion = indexVersion;
     return messages;
 }
