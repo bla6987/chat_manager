@@ -3,7 +3,7 @@
  */
 
 import {
-    buildIndex, getIndex, getSearchableMessages, clearIndex,
+    buildIndex, getIndex, getSearchableMessages, runDeferredBranchDetection,
 } from './chat-reader.js';
 import {
     getDisplayName, setDisplayName, getSummary, setSummary,
@@ -18,15 +18,16 @@ import {
 const MODULE_NAME = 'chat_manager';
 
 let panelOpen = false;
-let fuseInstance = null;
-let currentResults = [];
-let displayedResultCount = 0;
 const RESULTS_PAGE_SIZE = 50;
 
+/**
+ * Streaming search state — allows early termination and "load more" resumption.
+ * @type {{ query: string, lowerQuery: string, searchable: Array, position: number, results: Array, totalMatches: number } | null}
+ */
+let searchState = null;
+
 export function resetSearchState() {
-    currentResults = [];
-    displayedResultCount = 0;
-    fuseInstance = null;
+    searchState = null;
 }
 
 // ──────────────────────────────────────────────
@@ -135,10 +136,32 @@ export async function refreshPanel() {
         return;
     }
 
-    renderLoading();
-    await buildIndex(onIndexProgress);
-    rebuildFuse();
-    renderThreadCards();
+    const index = getIndex();
+    const hasCache = Object.keys(index).length > 0;
+
+    if (hasCache) {
+        // Cache-first: render immediately from existing index
+        renderThreadCards();
+    } else {
+        renderLoading();
+    }
+
+    const { changed } = await buildIndex(hasCache ? null : onIndexProgress);
+
+    if (changed || !hasCache) {
+        renderThreadCards();
+    }
+
+    // Deferred branch detection: run after cards are rendered, then patch indicators
+    setTimeout(() => {
+        runDeferredBranchDetection();
+        patchBranchIndicators();
+    }, 0);
+
+    // Invalidate search state since the index may have changed
+    if (changed) {
+        searchState = null;
+    }
 }
 
 function onIndexProgress(completed, total) {
@@ -148,17 +171,29 @@ function onIndexProgress(completed, total) {
     }
 }
 
-function rebuildFuse() {
-    const { Fuse } = SillyTavern.libs;
-    const searchable = getSearchableMessages();
+/**
+ * Patch branch indicators into already-rendered cards (called after deferred branch detection).
+ */
+function patchBranchIndicators() {
+    const index = getIndex();
+    const entries = Object.values(index);
 
-    fuseInstance = new Fuse(searchable, {
-        keys: ['text'],
-        includeMatches: true,
-        threshold: 0.0,
-        ignoreLocation: true,
-        minMatchCharLength: 2,
-    });
+    for (const entry of entries) {
+        if (entry.branchPoint === null) continue;
+        const card = document.querySelector(`.chat-manager-card[data-filename="${CSS.escape(entry.fileName)}"]`);
+        if (!card) continue;
+
+        const meta = card.querySelector('.chat-manager-card-meta');
+        if (!meta) continue;
+
+        // Skip if already patched
+        if (meta.querySelector('.chat-manager-branch')) continue;
+
+        const span = document.createElement('span');
+        span.className = 'chat-manager-branch';
+        span.textContent = `Branched at msg #${entry.branchPoint}`;
+        meta.appendChild(span);
+    }
 }
 
 // ──────────────────────────────────────────────
@@ -260,48 +295,94 @@ export function renderThreadCards() {
 export function performSearch(query) {
     const container = document.getElementById('chat-manager-content');
     const status = document.getElementById('chat-manager-status');
-    if (!container || !fuseInstance) return;
+    if (!container) return;
 
     if (!query || query.trim().length < 2) {
         renderThreadCards();
         return;
     }
 
-    const results = fuseInstance.search(query.trim());
-    currentResults = results;
-    displayedResultCount = 0;
+    const trimmed = query.trim();
+    const lowerQuery = trimmed.toLowerCase();
 
-    // Count unique threads
-    const threadSet = new Set(results.map(r => r.item.filename));
+    // Initialize streaming search state
+    searchState = {
+        query: trimmed,
+        lowerQuery,
+        searchable: getSearchableMessages(),
+        position: 0,
+        results: [],
+        totalMatches: 0,
+        exhausted: false,
+    };
+
+    // Find the first page of results
+    searchMoreResults(RESULTS_PAGE_SIZE);
 
     if (status) {
-        status.textContent = `Found ${results.length} match${results.length !== 1 ? 'es' : ''} across ${threadSet.size} thread${threadSet.size !== 1 ? 's' : ''} for: ${query.trim()}`;
+        const threadSet = new Set(searchState.results.map(r => r.item.filename));
+        const countLabel = searchState.exhausted
+            ? `Found ${searchState.totalMatches} match${searchState.totalMatches !== 1 ? 'es' : ''}`
+            : `Found ${searchState.totalMatches}+ match${searchState.totalMatches !== 1 ? 'es' : ''}`;
+        status.textContent = `${countLabel} across ${threadSet.size}${searchState.exhausted ? '' : '+'} thread${threadSet.size !== 1 ? 's' : ''} for: ${trimmed}`;
     }
 
-    if (results.length === 0) {
+    if (searchState.results.length === 0) {
         container.innerHTML = '<div class="chat-manager-empty">No results found.</div>';
         return;
     }
 
     container.innerHTML = '';
-    loadMoreResults(container, query.trim());
+    renderSearchPage(container, 0);
 }
 
-function loadMoreResults(container, query) {
+/**
+ * Search forward from the current position until we find `count` more matches or exhaust all messages.
+ */
+function searchMoreResults(count) {
+    if (!searchState || searchState.exhausted) return;
+
+    const { lowerQuery, searchable } = searchState;
+    let found = 0;
+
+    while (searchState.position < searchable.length && found < count) {
+        const msg = searchable[searchState.position];
+        const matchIndex = msg.textLower.indexOf(lowerQuery);
+        if (matchIndex !== -1) {
+            searchState.results.push({ item: msg, matchIndex });
+            searchState.totalMatches++;
+            found++;
+        }
+        searchState.position++;
+    }
+
+    if (searchState.position >= searchable.length) {
+        searchState.exhausted = true;
+    }
+}
+
+/**
+ * Render a page of search results starting from `fromIndex` within searchState.results.
+ * @param {HTMLElement} container
+ * @param {number} fromIndex - index into searchState.results to render from
+ */
+function renderSearchPage(container, fromIndex) {
+    if (!searchState) return;
+
     const { DOMPurify, moment } = SillyTavern.libs;
     const prevButtonCount = container.querySelectorAll('.chat-manager-jump-btn').length;
-    const end = Math.min(displayedResultCount + RESULTS_PAGE_SIZE, currentResults.length);
+    const end = Math.min(fromIndex + RESULTS_PAGE_SIZE, searchState.results.length);
     let html = '';
 
-    for (let i = displayedResultCount; i < end; i++) {
-        const result = currentResults[i];
+    for (let i = fromIndex; i < end; i++) {
+        const result = searchState.results[i];
         const item = result.item;
         const displayName = getDisplayName(item.filename) || item.filename;
         const roleLabel = item.role === 'user' ? 'User' : 'Character';
         const dateStr = item.timestamp ? moment(item.timestamp).format('MMM D') : '';
 
         // Build highlighted excerpt
-        const excerpt = buildHighlightedExcerpt(item.text, query);
+        const excerpt = buildHighlightedExcerpt(item.text, searchState.query);
 
         html += `
         <div class="chat-manager-search-result" data-filename="${escapeAttr(item.filename)}" data-msg-index="${item.index}">
@@ -316,8 +397,6 @@ function loadMoreResults(container, query) {
         </div>`;
     }
 
-    displayedResultCount = end;
-
     // Create fragment
     const temp = document.createElement('div');
     temp.innerHTML = DOMPurify.sanitize(html);
@@ -329,12 +408,44 @@ function loadMoreResults(container, query) {
     const existingBtn = container.querySelector('.chat-manager-load-more');
     if (existingBtn) existingBtn.remove();
 
-    // Add load more button if needed
-    if (displayedResultCount < currentResults.length) {
+    // Add load more button if there are more results already found, or more to search
+    const displayedUpTo = end;
+    const hasMoreFound = displayedUpTo < searchState.results.length;
+    const canSearchMore = !searchState.exhausted;
+
+    if (hasMoreFound || canSearchMore) {
         const loadMoreBtn = document.createElement('button');
         loadMoreBtn.className = 'chat-manager-btn chat-manager-load-more';
-        loadMoreBtn.textContent = `Load more (${currentResults.length - displayedResultCount} remaining)`;
-        loadMoreBtn.addEventListener('click', () => loadMoreResults(container, query));
+
+        if (searchState.exhausted) {
+            loadMoreBtn.textContent = `Load more (${searchState.results.length - displayedUpTo} remaining)`;
+        } else {
+            loadMoreBtn.textContent = 'Load more results...';
+        }
+
+        loadMoreBtn.addEventListener('click', () => {
+            // If we need more results beyond what we've found, search for more
+            if (displayedUpTo >= searchState.results.length && !searchState.exhausted) {
+                searchMoreResults(RESULTS_PAGE_SIZE);
+            }
+
+            // Update status
+            const status = document.getElementById('chat-manager-status');
+            if (status) {
+                const threadSet = new Set(searchState.results.map(r => r.item.filename));
+                const countLabel = searchState.exhausted
+                    ? `Found ${searchState.totalMatches} match${searchState.totalMatches !== 1 ? 'es' : ''}`
+                    : `Found ${searchState.totalMatches}+ match${searchState.totalMatches !== 1 ? 'es' : ''}`;
+                status.textContent = `${countLabel} across ${threadSet.size}${searchState.exhausted ? '' : '+'} thread${threadSet.size !== 1 ? 's' : ''} for: ${searchState.query}`;
+            }
+
+            if (searchState.results.length > displayedUpTo) {
+                renderSearchPage(container, displayedUpTo);
+            } else {
+                // Nothing more found
+                loadMoreBtn.remove();
+            }
+        });
         container.appendChild(loadMoreBtn);
     }
 
@@ -352,7 +463,6 @@ function buildHighlightedExcerpt(text, query) {
     const matchIndex = lowerText.indexOf(lowerQuery);
 
     if (matchIndex === -1) {
-        // Fuse fuzzy match — just show truncated text
         const truncated = text.length > 120 ? text.substring(0, 120) + '...' : text;
         return DOMPurify.sanitize(escapeHtml(truncated));
     }

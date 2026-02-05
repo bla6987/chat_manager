@@ -15,6 +15,7 @@ let indexBuildInProgress = false;
  * @property {number} index
  * @property {string} role - 'user' | 'assistant'
  * @property {string} text
+ * @property {string} textLower - pre-lowercased text for fast search
  * @property {string} timestamp
  */
 
@@ -100,6 +101,7 @@ function parseMessages(chatData) {
             index: i,
             role: msg.is_user ? 'user' : 'assistant',
             text: msg.mes,
+            textLower: msg.mes.toLowerCase(),
             timestamp: msg.send_date || '',
         });
     }
@@ -107,14 +109,25 @@ function parseMessages(chatData) {
 }
 
 /**
- * Build (or rebuild) the full search index for the current character.
+ * Extract a timestamp (ms since epoch) from a chat metadata object.
+ * @param {Object} metaObj
+ * @returns {number}
+ */
+function getMetaTimestamp(metaObj) {
+    if (metaObj.last_mes) return new Date(metaObj.last_mes).getTime();
+    return 0;
+}
+
+/**
+ * Build (or incrementally update) the search index for the current character.
+ * On incremental runs, only re-fetches chats whose `last_mes` timestamp changed.
  * @param {Function} [onProgress] - Called with (completed, total) for progress tracking
- * @returns {Promise<Object>} The chat index
+ * @returns {Promise<{ index: Object, changed: boolean }>}
  */
 export async function buildIndex(onProgress) {
     if (indexBuildInProgress) {
         console.warn(`[${MODULE_NAME}] Index build already in progress, skipping`);
-        return chatIndex;
+        return { index: chatIndex, changed: false };
     }
 
     indexBuildInProgress = true;
@@ -124,7 +137,7 @@ export async function buildIndex(onProgress) {
         chatIndex = {};
         currentCharacterAvatar = null;
         indexBuildInProgress = false;
-        return chatIndex;
+        return { index: chatIndex, changed: false };
     }
 
     const character = context.characters[context.characterId];
@@ -132,66 +145,135 @@ export async function buildIndex(onProgress) {
         chatIndex = {};
         currentCharacterAvatar = null;
         indexBuildInProgress = false;
-        return chatIndex;
+        return { index: chatIndex, changed: false };
     }
 
     currentCharacterAvatar = character.avatar;
+    let changed = false;
 
     try {
         const chatList = await fetchChatList();
         if (!chatList || !chatList.length) {
+            changed = Object.keys(chatIndex).length > 0;
             chatIndex = {};
             indexBuildInProgress = false;
-            return chatIndex;
+            return { index: chatIndex, changed };
         }
 
-        const newIndex = {};
-        const total = chatList.length;
-        const BATCH_SIZE = 10;
-
-        for (let i = 0; i < total; i += BATCH_SIZE) {
-            const batch = chatList.slice(i, i + BATCH_SIZE);
-            const results = await Promise.all(
-                batch.map(async (chatMeta) => {
-                    // chatMeta is an array with a single object; the key is the filename
-                    const metaObj = Array.isArray(chatMeta) ? chatMeta[0] : chatMeta;
-                    const fileName = metaObj.file_name;
-
-                    const chatData = await fetchChatContent(fileName);
-                    const messages = parseMessages(chatData);
-
-                    return {
-                        fileName,
-                        lastModified: metaObj.file_size ? Date.now() : (metaObj.last_mes ? new Date(metaObj.last_mes).getTime() : 0),
-                        messageCount: messages.length,
-                        messages,
-                        firstMessageTimestamp: messages.length > 0 ? messages[0].timestamp : null,
-                        lastMessageTimestamp: messages.length > 0 ? messages[messages.length - 1].timestamp : null,
-                        branchPoint: null,
-                    };
-                }),
-            );
-
-            for (const entry of results) {
-                newIndex[entry.fileName] = entry;
-            }
-
-            if (onProgress) {
-                onProgress(Math.min(i + BATCH_SIZE, total), total);
-            }
+        // Build a map of filename -> metaObj from the server list
+        const serverChats = new Map();
+        for (const chatMeta of chatList) {
+            const metaObj = Array.isArray(chatMeta) ? chatMeta[0] : chatMeta;
+            serverChats.set(metaObj.file_name, metaObj);
         }
 
-        // Detect branches
-        detectBranches(newIndex);
+        // Determine which chats need fetching (new or modified) vs unchanged
+        const toFetch = [];
+        const existingKeys = new Set(Object.keys(chatIndex));
 
-        chatIndex = newIndex;
+        for (const [fileName, metaObj] of serverChats) {
+            const cached = chatIndex[fileName];
+            const serverTimestamp = getMetaTimestamp(metaObj);
+
+            if (!cached || cached.lastModified !== serverTimestamp) {
+                toFetch.push({ fileName, metaObj });
+            }
+            existingKeys.delete(fileName);
+        }
+
+        // existingKeys now contains deleted chats
+        for (const deletedKey of existingKeys) {
+            delete chatIndex[deletedKey];
+            changed = true;
+        }
+
+        if (toFetch.length > 0) {
+            changed = true;
+            const total = toFetch.length;
+            const BATCH_SIZE = 25;
+
+            console.log(`[${MODULE_NAME}] Incremental update: ${total} chats to re-fetch (${serverChats.size - total} cached)`);
+
+            for (let i = 0; i < total; i += BATCH_SIZE) {
+                const batch = toFetch.slice(i, i + BATCH_SIZE);
+                const results = await Promise.all(
+                    batch.map(async ({ fileName, metaObj }) => {
+                        const chatData = await fetchChatContent(fileName);
+                        const messages = parseMessages(chatData);
+
+                        return {
+                            fileName,
+                            lastModified: getMetaTimestamp(metaObj),
+                            messageCount: messages.length,
+                            messages,
+                            firstMessageTimestamp: messages.length > 0 ? messages[0].timestamp : null,
+                            lastMessageTimestamp: messages.length > 0 ? messages[messages.length - 1].timestamp : null,
+                            branchPoint: null,
+                        };
+                    }),
+                );
+
+                for (const entry of results) {
+                    chatIndex[entry.fileName] = entry;
+                }
+
+                if (onProgress) {
+                    onProgress(Math.min(i + BATCH_SIZE, total), total);
+                }
+            }
+        } else {
+            console.log(`[${MODULE_NAME}] Incremental update: 0 chats re-fetched`);
+        }
+
+        // Deferred: branch detection runs after buildIndex returns (via caller's setTimeout)
+        // Reset branch points for fresh detection later
+        if (changed) {
+            for (const entry of Object.values(chatIndex)) {
+                entry.branchPoint = null;
+            }
+        }
     } catch (err) {
         console.error(`[${MODULE_NAME}] Error building index:`, err);
     } finally {
         indexBuildInProgress = false;
     }
 
-    return chatIndex;
+    return { index: chatIndex, changed };
+}
+
+/**
+ * Update only the active chat's entry in the index (lightweight, no full rebuild).
+ * @param {string} fileName - The chat file to update
+ * @returns {Promise<boolean>} Whether the entry was actually updated
+ */
+export async function updateActiveChat(fileName) {
+    if (!fileName || !chatIndex[fileName]) return false;
+
+    try {
+        const chatData = await fetchChatContent(fileName);
+        const messages = parseMessages(chatData);
+        const cached = chatIndex[fileName];
+
+        chatIndex[fileName] = {
+            ...cached,
+            messageCount: messages.length,
+            messages,
+            firstMessageTimestamp: messages.length > 0 ? messages[0].timestamp : null,
+            lastMessageTimestamp: messages.length > 0 ? messages[messages.length - 1].timestamp : null,
+            lastModified: Date.now(),
+        };
+        return true;
+    } catch (err) {
+        console.error(`[${MODULE_NAME}] Error updating active chat:`, err);
+        return false;
+    }
+}
+
+/**
+ * Run branch detection on the current index. Designed to be called deferred (via setTimeout).
+ */
+export function runDeferredBranchDetection() {
+    detectBranches(chatIndex);
 }
 
 /**
@@ -270,7 +352,7 @@ export function isBuilding() {
 }
 
 /**
- * Build a flat array of all messages for Fuse.js search.
+ * Build a flat array of all messages for search.
  * @returns {Array}
  */
 export function getSearchableMessages() {
@@ -282,6 +364,7 @@ export function getSearchableMessages() {
                 index: msg.index,
                 role: msg.role,
                 text: msg.text,
+                textLower: msg.textLower,
                 timestamp: msg.timestamp,
             });
         }

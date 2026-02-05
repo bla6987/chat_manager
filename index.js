@@ -3,8 +3,8 @@
  * Lifecycle hooks, event listeners, UI injection.
  */
 
-import { clearIndex } from './src/chat-reader.js';
-import { togglePanel, closePanel, refreshPanel, onSearchInput, isPanelOpen, resetSearchState } from './src/ui-controller.js';
+import { clearIndex, getIndexCharacterAvatar, updateActiveChat } from './src/chat-reader.js';
+import { togglePanel, closePanel, refreshPanel, renderThreadCards, onSearchInput, isPanelOpen, resetSearchState } from './src/ui-controller.js';
 import { getDisplayMode, setDisplayMode } from './src/metadata-store.js';
 
 const MODULE_NAME = 'chat_manager';
@@ -226,14 +226,26 @@ function bindPanelEvents() {
 }
 
 /**
- * Handle CHAT_CHANGED event — rebuild index and re-render panel.
+ * Handle CHAT_CHANGED event.
+ * If the character is the same, preserve the index for incremental refresh.
+ * If the character changed, clear the index for a full rebuild.
  */
 async function onChatChanged() {
+    const context = SillyTavern.getContext();
+    const character = context.characterId !== undefined ? context.characters[context.characterId] : null;
+    const currentAvatar = character ? character.avatar : null;
+    const indexAvatar = getIndexCharacterAvatar();
+
+    const sameCharacter = currentAvatar && currentAvatar === indexAvatar;
+
+    if (!sameCharacter) {
+        // Different character (or no character) — clear everything
+        clearIndex();
+    }
+    // If same character, keep index for incremental update
+
     if (isPanelOpen()) {
         await refreshPanel();
-    } else {
-        // Clear stale data so next open triggers a fresh build
-        clearIndex();
     }
 
     // Reset search input and state
@@ -243,11 +255,18 @@ async function onChatChanged() {
 }
 
 /**
- * Handle MESSAGE_SENT / MESSAGE_RECEIVED — update index for active chat.
+ * Handle MESSAGE_SENT / MESSAGE_RECEIVED — lightweight update for active chat only.
  */
 async function onMessageUpdate() {
-    if (isPanelOpen()) {
-        // Lightweight refresh — rebuild index and re-render
-        await refreshPanel();
+    if (!isPanelOpen()) return;
+
+    const context = SillyTavern.getContext();
+    const activeChatFile = context.chatMetadata?.chat_file_name;
+
+    if (activeChatFile) {
+        const updated = await updateActiveChat(activeChatFile);
+        if (updated) {
+            renderThreadCards();
+        }
     }
 }

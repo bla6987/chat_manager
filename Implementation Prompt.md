@@ -86,10 +86,9 @@ const {
 SillyTavern bundles several npm libraries accessible without installing them:
 
 ```javascript
-const { Fuse, lodash: _, moment, DOMPurify, Handlebars } = SillyTavern.libs;
+const { lodash: _, moment, DOMPurify, Handlebars } = SillyTavern.libs;
 ```
 
-- **Fuse** — Fuzzy search library. Use for search instead of raw substring matching.
 - **moment** — Date/time formatting (e.g., relative time like "2 days ago").
 - **lodash** — Utility functions including `_.debounce()`.
 - **DOMPurify** — Sanitize HTML before inserting into the DOM.
@@ -156,39 +155,41 @@ When the panel opens or the chat changes, build an in-memory search index:
 - Parse each message object. Extract the `mes` field (message text), `is_user` field (boolean for role), and `send_date` field for timestamp.
 - Cache this index. Only rebuild when the character changes or a chat is modified.
 
-**Search implementation with Fuse.js:**
+**Search implementation (indexOf with streaming):**
 
-SillyTavern bundles Fuse.js in `SillyTavern.libs.Fuse`:
+Search uses plain case-insensitive `indexOf` for fast substring matching with a streaming approach:
 
 ```javascript
-const { Fuse } = SillyTavern.libs;
-
-// Build a flat array of all messages across all chats
-const searchableMessages = [];
-for (const [filename, chatData] of Object.entries(index)) {
-    for (const msg of chatData.messages) {
-        searchableMessages.push({
-            filename,
-            index: msg.index,
-            role: msg.role,
-            text: msg.text,
-            timestamp: msg.timestamp,
-        });
-    }
-}
-
-const fuse = new Fuse(searchableMessages, {
-    keys: ['text'],
-    includeMatches: true,       // Gives match indices for highlighting
-    threshold: 0.0,             // Exact substring matching (0.0 = exact, 0.6 = fuzzy)
-    ignoreLocation: true,       // Search anywhere in the string
-    minMatchCharLength: 2,
+// At index time, pre-compute a lowercased field for each message
+searchableMessages.push({
+    filename,
+    index: msg.index,
+    role: msg.role,
+    text: msg.text,
+    textLower: msg.text.toLowerCase(),   // pre-lowercased for fast search
+    timestamp: msg.timestamp,
 });
 
-const results = fuse.search(query);
+// Search: stream results with early termination
+const queryLower = query.toLowerCase();
+const BATCH = 50;
+let found = 0;
+
+for (let i = searchState.startFrom; i < messages.length; i++) {
+    if (messages[i].textLower.indexOf(queryLower) !== -1) {
+        results.push(messages[i]);
+        found++;
+        if (found >= BATCH) {
+            searchState.startFrom = i + 1;   // save position for "Load more"
+            break;
+        }
+    }
+}
 ```
 
-Alternatively, for strict exact-substring matching with highlighting, a simple case-insensitive `indexOf` search is also acceptable. Fuse gives you fuzzy matching for free if you want it.
+- Each message stores a pre-lowercased `textLower` field so `toLowerCase()` runs once at index time, not per search.
+- The first 50 matches are rendered immediately; the search pauses and saves its position.
+- "Load more" resumes iteration from the saved position, returning the next batch.
 
 **Search behavior:**
 - **Scope**: current character's threads only.
@@ -452,7 +453,7 @@ element.innerHTML = DOMPurify.sanitize(htmlContent);
 | Scenario | Strategy |
 |---|---|
 | Index build <50 chats | Synchronous, ~1-2s |
-| Index build 50-200 chats | Progress indicator, async batches of 10 |
+| Index build 50-200 chats | Progress indicator, async batches of 25 |
 | Index build 200+ chats | Progressive rendering — show cards as indexed |
 | Search across cached index | <50ms |
 | Search input | 300ms debounce via `_.debounce()` |
