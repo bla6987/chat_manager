@@ -876,6 +876,13 @@ async function handleRenameFile(e) {
         return;
     }
 
+    // Pre-check: reject if a file with the target name already exists in the index
+    const index = getIndex();
+    if (index[newFilename]) {
+        toastr.warning(`A chat file named "${newFilename}" already exists. Choose a different name.`);
+        return;
+    }
+
     try {
         await context.renameChat(baseName, newBase);
         migrateFileKey(filename, newFilename);
@@ -883,7 +890,12 @@ async function handleRenameFile(e) {
         await refreshPanel();
     } catch (err) {
         console.error(`[${MODULE_NAME}] Rename failed:`, err);
-        toastr.error('Failed to rename chat file.');
+        // Server returns 400 when destination file already exists (race condition)
+        if (err?.status === 400 || String(err).includes('400')) {
+            toastr.error(`Rename failed — a file named "${newFilename}" may already exist.`);
+        } else {
+            toastr.error('Failed to rename chat file.');
+        }
     }
 }
 
