@@ -3,7 +3,8 @@
  */
 
 import {
-    buildIndex, getIndex, getSearchableMessages, runDeferredBranchDetection,
+    buildIndex, getHydrationProgress, getIndex, getSearchableMessages,
+    isHydrationComplete, onHydrationUpdate, runDeferredBranchDetection,
 } from './chat-reader.js';
 import {
     getDisplayName, setDisplayName, getSummary, setSummary,
@@ -19,6 +20,9 @@ const MODULE_NAME = 'chat_manager';
 
 let panelOpen = false;
 const RESULTS_PAGE_SIZE = 50;
+let hydrationSubscriptionReady = false;
+let refreshFromHydrationTimer = null;
+let refreshSearchFromHydrationTimer = null;
 
 /**
  * Streaming search state — allows early termination and "load more" resumption.
@@ -28,6 +32,71 @@ let searchState = null;
 
 export function resetSearchState() {
     searchState = null;
+}
+
+function getIndexingSuffix() {
+    const { loaded, total } = getHydrationProgress();
+    if (!isHydrationComplete() && total > 0) {
+        return ` • Indexing chats... ${loaded}/${total}`;
+    }
+    return '';
+}
+
+function withIndexingSuffix(text) {
+    return `${text}${getIndexingSuffix()}`;
+}
+
+function getCurrentSearchQuery() {
+    const searchInput = document.getElementById('chat-manager-search');
+    return searchInput ? searchInput.value.trim() : '';
+}
+
+function scheduleHydrationUIRefresh() {
+    if (refreshFromHydrationTimer) return;
+
+    refreshFromHydrationTimer = setTimeout(() => {
+        refreshFromHydrationTimer = null;
+        if (!panelOpen) return;
+
+        const query = getCurrentSearchQuery();
+        if (query.length >= 2) return;
+
+        renderThreadCards();
+        const activeFile = getActiveFilename();
+        runDeferredBranchDetection(activeFile);
+        patchBranchIndicators();
+    }, 120);
+}
+
+function scheduleSearchRefresh(query) {
+    if (refreshSearchFromHydrationTimer) {
+        clearTimeout(refreshSearchFromHydrationTimer);
+    }
+
+    refreshSearchFromHydrationTimer = setTimeout(() => {
+        refreshSearchFromHydrationTimer = null;
+        if (!panelOpen) return;
+
+        const latestQuery = getCurrentSearchQuery();
+        if (latestQuery.length < 2) return;
+        performSearch(latestQuery);
+    }, 180);
+}
+
+function ensureHydrationSubscription() {
+    if (hydrationSubscriptionReady) return;
+
+    onHydrationUpdate(() => {
+        if (!panelOpen) return;
+        const query = getCurrentSearchQuery();
+        if (query.length >= 2) {
+            scheduleSearchRefresh(query);
+        } else {
+            scheduleHydrationUIRefresh();
+        }
+    });
+
+    hydrationSubscriptionReady = true;
 }
 
 // ──────────────────────────────────────────────
@@ -153,8 +222,9 @@ export async function refreshPanel() {
     }
 
     // Deferred branch detection: run after cards are rendered, then patch indicators
+    const activeFile = getActiveFilename();
     setTimeout(() => {
-        runDeferredBranchDetection();
+        runDeferredBranchDetection(activeFile);
         patchBranchIndicators();
     }, 0);
 
@@ -176,6 +246,8 @@ function onIndexProgress(completed, total) {
  */
 function patchBranchIndicators() {
     const index = getIndex();
+    const activeFile = getActiveFilename();
+    const activeEntry = activeFile ? index[activeFile] : null;
     const entries = Object.values(index);
 
     for (const entry of entries) {
@@ -189,9 +261,10 @@ function patchBranchIndicators() {
         // Skip if already patched
         if (meta.querySelector('.chat-manager-branch')) continue;
 
+        const distance = activeEntry ? activeEntry.messageCount - entry.branchPoint : null;
         const span = document.createElement('span');
         span.className = 'chat-manager-branch';
-        span.textContent = `Branched at msg #${entry.branchPoint}`;
+        span.textContent = distance !== null ? `Branched ${distance} msgs ago` : `Branched at msg #${entry.branchPoint}`;
         meta.appendChild(span);
     }
 }
@@ -238,6 +311,8 @@ export function renderThreadCards() {
     const context = SillyTavern.getContext();
     const activeChatFile = getActiveFilename();
 
+    const activeEntry = activeChatFile ? index[activeChatFile] : null;
+
     let html = '';
     for (const entry of entries) {
         const displayName = getDisplayName(entry.fileName) || entry.fileName;
@@ -248,8 +323,10 @@ export function renderThreadCards() {
         const lastDate = entry.lastMessageTimestamp ? moment(entry.lastMessageTimestamp).format('MMM D') : '?';
         const lastActive = entry.lastMessageTimestamp ? moment(entry.lastMessageTimestamp).fromNow() : 'unknown';
 
+        const branchDistance = (entry.branchPoint !== null && activeEntry)
+            ? activeEntry.messageCount - entry.branchPoint : null;
         const branchInfo = entry.branchPoint !== null
-            ? `<span class="chat-manager-branch">Branched at msg #${entry.branchPoint}</span>`
+            ? `<span class="chat-manager-branch">${branchDistance !== null ? `Branched ${branchDistance} msgs ago` : `Branched at msg #${entry.branchPoint}`}</span>`
             : '';
 
         html += `
