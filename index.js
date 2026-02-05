@@ -10,12 +10,14 @@ import { getDisplayMode, setDisplayMode } from './src/metadata-store.js';
 const MODULE_NAME = 'chat_manager';
 const EXTENSION_PATH = '/scripts/extensions/third-party/chat_manager';
 const SETTINGS_CONTAINER_ID = 'chat_manager_settings_container';
+const START_BUTTON_ID = 'chat-manager-start-btn';
 
 const templateCache = new Map();
 let settingsInjected = false;
 let pendingSettingsInjection = null;
 let currentInjectedMode = null;
 let pendingUIInjection = null;
+let slashCommandsRegistered = false;
 
 /**
  * Extension entry point — called by SillyTavern when the extension loads.
@@ -42,10 +44,13 @@ let pendingUIInjection = null;
     // Hijack TopInfoBar's chat manager button once all extensions are ready
     eventSource.on(eventTypes.APP_READY, onAppReady);
 
+    registerSlashCommands();
+
     console.log(`[${MODULE_NAME}] Extension loaded.`);
 })();
 
 function onAppReady() {
+    registerSlashCommands();
     hijackTopBarButton();
     void injectSettingsPanel();
 }
@@ -146,6 +151,97 @@ async function handleTogglePanel(event) {
     await togglePanel();
 }
 
+async function openChatManager(event) {
+    if (event) event.stopPropagation();
+
+    const mode = getDisplayMode();
+    const ready = await ensureUI(mode);
+    if (!ready) return false;
+
+    if (isPanelOpen()) {
+        await refreshPanel();
+    } else {
+        await togglePanel();
+    }
+
+    const searchInput = document.getElementById('chat-manager-search');
+    if (searchInput) searchInput.focus();
+    return true;
+}
+
+function normalizeSlashArg(unnamedArgs) {
+    if (Array.isArray(unnamedArgs)) {
+        return unnamedArgs.join(' ').trim().toLowerCase();
+    }
+    if (unnamedArgs === undefined || unnamedArgs === null) {
+        return '';
+    }
+    return unnamedArgs.toString().trim().toLowerCase();
+}
+
+function registerSlashCommands() {
+    if (slashCommandsRegistered) return;
+
+    const context = SillyTavern.getContext();
+    const { SlashCommandParser, SlashCommand, SlashCommandArgument, ARGUMENT_TYPE } = context;
+
+    if (!SlashCommandParser || !SlashCommand) {
+        console.warn(`[${MODULE_NAME}] Slash command API unavailable; skipping command registration.`);
+        return;
+    }
+
+    const commandProps = {
+        name: 'chat-manager',
+        aliases: ['cm'],
+        callback: async (_namedArgs, unnamedArgs) => {
+            const arg = normalizeSlashArg(unnamedArgs);
+            if (arg && arg !== 'start') {
+                if (typeof toastr !== 'undefined') {
+                    toastr.warning('Usage: /chat-manager [start]');
+                } else {
+                    console.warn(`[${MODULE_NAME}] Usage: /chat-manager [start]`);
+                }
+                return '';
+            }
+
+            await openChatManager();
+            return '';
+        },
+        returns: 'nothing',
+        helpString: `
+            <div>
+                Opens and focuses Chat Manager.
+            </div>
+            <div>
+                <strong>Usage:</strong>
+                <ul>
+                    <li><code>/chat-manager</code></li>
+                    <li><code>/cm</code></li>
+                    <li><code>/chat-manager start</code></li>
+                </ul>
+            </div>
+        `,
+    };
+
+    if (SlashCommandArgument && ARGUMENT_TYPE) {
+        commandProps.unnamedArgumentList = [
+            SlashCommandArgument.fromProps({
+                description: 'Optional: "start" to open Chat Manager',
+                typeList: [ARGUMENT_TYPE.STRING],
+                isRequired: false,
+            }),
+        ];
+    }
+
+    try {
+        SlashCommandParser.addCommandObject(SlashCommand.fromProps(commandProps));
+        slashCommandsRegistered = true;
+        console.log(`[${MODULE_NAME}] Registered slash commands: /chat-manager, /cm`);
+    } catch (error) {
+        console.error(`[${MODULE_NAME}] Failed to register slash commands`, error);
+    }
+}
+
 /**
  * Inject the settings panel into SillyTavern's Extensions settings area.
  */
@@ -178,6 +274,13 @@ async function injectSettingsPanel() {
         container.innerHTML = html;
         settingsArea.appendChild(container);
         settingsInjected = true;
+
+        const startButton = container.querySelector(`#${START_BUTTON_ID}`);
+        if (startButton) {
+            startButton.addEventListener('click', (e) => {
+                void openChatManager(e);
+            });
+        }
 
         // Set initial radio state
         const currentMode = getDisplayMode();

@@ -518,6 +518,16 @@
     padding: 8px 4px;
 }
 
+.chat-manager-settings-actions {
+    margin-bottom: 10px;
+}
+
+.chat-manager-settings-start-btn {
+    width: 100%;
+    padding: 6px 10px;
+    font-weight: 600;
+}
+
 .chat-manager-settings-label {
     display: block;
     font-weight: 600;
