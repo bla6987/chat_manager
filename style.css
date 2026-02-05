@@ -1,0 +1,439 @@
+/* ══════════════════════════════════════════════
+   Chat Manager Extension — Styles
+   Uses SillyTavern CSS custom properties for theme integration
+   ══════════════════════════════════════════════ */
+
+/* ── Panel ── */
+
+.chat-manager-panel {
+    position: fixed;
+    top: 0;
+    right: 0;
+    width: 380px;
+    height: 100vh;
+    background-color: var(--SmartThemeBlurTintColor, rgba(20, 20, 30, 0.95));
+    color: var(--SmartThemeBodyColor, #ccc);
+    font-size: var(--mainFontSize, 14px);
+    z-index: 1000;
+    transform: translateX(100%);
+    transition: transform 0.3s ease;
+    display: flex;
+    flex-direction: column;
+    box-shadow: -4px 0 20px rgba(0, 0, 0, 0.4);
+    border-left: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.chat-manager-panel.open {
+    transform: translateX(0);
+}
+
+/* ── Panel Header ── */
+
+.chat-manager-panel-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 12px 16px;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.08);
+    flex-shrink: 0;
+}
+
+.chat-manager-title {
+    margin: 0;
+    font-size: 1.1em;
+    font-weight: 600;
+}
+
+.chat-manager-close {
+    font-size: 1.4em;
+    line-height: 1;
+    width: 32px;
+    height: 32px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+/* ── Search ── */
+
+.chat-manager-search-wrapper {
+    padding: 10px 16px 6px;
+    flex-shrink: 0;
+}
+
+.chat-manager-search-input {
+    width: 100%;
+    padding: 8px 12px;
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    border-radius: 6px;
+    background: rgba(0, 0, 0, 0.2);
+    color: inherit;
+    font-size: inherit;
+    outline: none;
+    box-sizing: border-box;
+}
+
+.chat-manager-search-input:focus {
+    border-color: rgba(255, 255, 255, 0.25);
+}
+
+.chat-manager-search-input::placeholder {
+    color: rgba(255, 255, 255, 0.35);
+}
+
+/* ── Status ── */
+
+.chat-manager-status {
+    padding: 4px 16px 8px;
+    font-size: 0.8em;
+    opacity: 0.6;
+    flex-shrink: 0;
+}
+
+/* ── Content Area ── */
+
+.chat-manager-content {
+    flex: 1;
+    overflow-y: auto;
+    padding: 8px 12px;
+}
+
+/* ── Thread Cards ── */
+
+.chat-manager-card {
+    background: rgba(255, 255, 255, 0.04);
+    border: 1px solid rgba(255, 255, 255, 0.06);
+    border-radius: 8px;
+    padding: 12px;
+    margin-bottom: 10px;
+    transition: border-color 0.2s, background 0.2s;
+}
+
+.chat-manager-card:hover {
+    border-color: rgba(255, 255, 255, 0.15);
+    background: rgba(255, 255, 255, 0.06);
+}
+
+.chat-manager-card.active {
+    border-color: rgba(100, 180, 255, 0.4);
+    background: rgba(100, 180, 255, 0.08);
+}
+
+/* Card Header */
+
+.chat-manager-card-header {
+    display: flex;
+    align-items: baseline;
+    justify-content: space-between;
+    gap: 8px;
+    margin-bottom: 6px;
+}
+
+.chat-manager-display-name {
+    font-weight: 600;
+    font-size: calc(var(--mainFontSize, 14px) * 0.95);
+    cursor: pointer;
+    flex: 1;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+    opacity: 0.9;
+}
+
+.chat-manager-display-name:hover {
+    opacity: 1;
+    filter: brightness(120%);
+}
+
+.chat-manager-card-actions {
+    display: flex;
+    gap: 6px;
+    flex-shrink: 0;
+    opacity: 0;
+    transition: opacity 0.15s;
+}
+
+.chat-manager-card:hover .chat-manager-card-actions {
+    opacity: 1;
+}
+
+/* Card Meta */
+
+.chat-manager-card-meta {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+    font-size: calc(var(--mainFontSize, 14px) * 0.8);
+    opacity: 0.6;
+    margin-bottom: 8px;
+}
+
+.chat-manager-branch {
+    color: rgba(255, 200, 50, 0.9);
+    font-style: italic;
+}
+
+/* Card Summary */
+
+.chat-manager-card-summary {
+    position: relative;
+}
+
+.chat-manager-summary-text {
+    font-size: 0.88em;
+    line-height: 1.4;
+    margin: 0 0 6px;
+    opacity: 0.8;
+}
+
+.chat-manager-no-summary {
+    font-style: italic;
+    opacity: 0.4;
+}
+
+.chat-manager-summary-actions {
+    display: flex;
+    gap: 6px;
+    opacity: 0;
+    transition: opacity 0.15s;
+}
+
+.chat-manager-card:hover .chat-manager-summary-actions {
+    opacity: 1;
+}
+
+/* Card Filename */
+
+.chat-manager-card-filename {
+    font-size: 0.72em;
+    opacity: 0.35;
+    margin-top: 6px;
+    word-break: break-all;
+}
+
+/* ── Buttons ── */
+
+.chat-manager-btn {
+    background: rgba(255, 255, 255, 0.06);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    color: inherit;
+    border-radius: 4px;
+    padding: 3px 7px;
+    cursor: pointer;
+    font-size: 0.85em;
+    line-height: 1.2;
+    transition: background 0.15s, border-color 0.15s;
+}
+
+.chat-manager-btn:hover {
+    background: rgba(255, 255, 255, 0.12);
+    border-color: rgba(255, 255, 255, 0.2);
+}
+
+.chat-manager-btn:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+}
+
+/* ── Icon Buttons (TopInfoBar-style) ── */
+
+.chat-manager-icon-btn {
+    cursor: pointer;
+    font-size: calc(var(--mainFontSize, 14px) * 0.85);
+    opacity: 0.6;
+    transition: opacity 0.15s, filter 0.15s;
+    padding: 2px;
+}
+
+.chat-manager-icon-btn:hover {
+    opacity: 1;
+    filter: brightness(150%);
+}
+
+.chat-manager-icon-btn.disabled {
+    opacity: 0.3;
+    cursor: not-allowed;
+    pointer-events: none;
+}
+
+.chat-manager-load-more {
+    display: block;
+    width: 100%;
+    padding: 8px;
+    margin-top: 8px;
+    text-align: center;
+}
+
+/* ── Toggle Button (injected into TopInfoBar) ── */
+
+#chat-manager-toggle {
+    background: rgba(255, 255, 255, 0.06);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    color: inherit;
+    border-radius: 4px;
+    padding: 4px 10px;
+    cursor: pointer;
+    font-size: 0.9em;
+    transition: background 0.15s;
+}
+
+#chat-manager-toggle:hover {
+    background: rgba(255, 255, 255, 0.12);
+}
+
+/* ── Inline Editing ── */
+
+.chat-manager-inline-edit {
+    width: 100%;
+    padding: 4px 8px;
+    border: 1px solid rgba(255, 255, 255, 0.2);
+    border-radius: 4px;
+    background: rgba(0, 0, 0, 0.3);
+    color: inherit;
+    font-size: inherit;
+    font-family: inherit;
+    outline: none;
+    box-sizing: border-box;
+}
+
+.chat-manager-summary-edit {
+    resize: vertical;
+    min-height: 50px;
+}
+
+/* ── Search Results ── */
+
+.chat-manager-search-result {
+    background: rgba(255, 255, 255, 0.03);
+    border: 1px solid rgba(255, 255, 255, 0.06);
+    border-radius: 6px;
+    padding: 10px;
+    margin-bottom: 8px;
+}
+
+.chat-manager-result-header {
+    margin-bottom: 4px;
+}
+
+.chat-manager-result-thread {
+    font-weight: 600;
+    font-size: 0.9em;
+}
+
+.chat-manager-result-meta {
+    font-size: 0.78em;
+    opacity: 0.55;
+    margin-bottom: 6px;
+}
+
+.chat-manager-result-excerpt {
+    font-size: 0.88em;
+    line-height: 1.35;
+    margin-bottom: 8px;
+    opacity: 0.8;
+}
+
+.chat-manager-jump-btn {
+    font-size: 0.8em;
+}
+
+/* ── Search Highlight ── */
+
+.chat-manager-highlight {
+    background-color: rgba(255, 200, 50, 0.4);
+    border-radius: 2px;
+    padding: 0 2px;
+}
+
+/* ── Flash Highlight (Jump to Message) ── */
+
+.chat-manager-flash {
+    animation: chat-manager-flash-anim 1.5s ease-out;
+}
+
+@keyframes chat-manager-flash-anim {
+    0% { background-color: rgba(255, 200, 50, 0.5); }
+    100% { background-color: transparent; }
+}
+
+/* ── Loading & Empty States ── */
+
+.chat-manager-loading {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    padding: 40px 20px;
+    gap: 10px;
+    opacity: 0.6;
+}
+
+.chat-manager-empty {
+    text-align: center;
+    padding: 40px 20px;
+    opacity: 0.5;
+    font-style: italic;
+}
+
+/* ── Spinners ── */
+
+.chat-manager-spinner {
+    width: 18px;
+    height: 18px;
+    border: 2px solid rgba(255, 255, 255, 0.2);
+    border-top-color: rgba(255, 255, 255, 0.7);
+    border-radius: 50%;
+    animation: chat-manager-spin 0.6s linear infinite;
+    display: inline-block;
+}
+
+.chat-manager-spinner-small {
+    width: 12px;
+    height: 12px;
+    border: 2px solid rgba(255, 255, 255, 0.2);
+    border-top-color: rgba(255, 255, 255, 0.7);
+    border-radius: 50%;
+    animation: chat-manager-spin 0.6s linear infinite;
+    display: inline-block;
+    vertical-align: middle;
+}
+
+@keyframes chat-manager-spin {
+    to { transform: rotate(360deg); }
+}
+
+/* ── Rename Dialog ── */
+
+.chat-manager-rename-dialog p {
+    margin: 0 0 10px;
+}
+
+.chat-manager-rename-dialog code {
+    background: rgba(0, 0, 0, 0.2);
+    padding: 2px 6px;
+    border-radius: 3px;
+    font-size: 0.9em;
+}
+
+.chat-manager-rename-suffix {
+    font-size: 0.8em;
+    opacity: 0.5;
+}
+
+/* ── Scrollbar ── */
+
+.chat-manager-content::-webkit-scrollbar {
+    width: 6px;
+}
+
+.chat-manager-content::-webkit-scrollbar-track {
+    background: transparent;
+}
+
+.chat-manager-content::-webkit-scrollbar-thumb {
+    background: rgba(255, 255, 255, 0.15);
+    border-radius: 3px;
+}
+
+.chat-manager-content::-webkit-scrollbar-thumb:hover {
+    background: rgba(255, 255, 255, 0.25);
+}
