@@ -4,9 +4,11 @@
  */
 
 import { clearIndex } from './src/chat-reader.js';
-import { togglePanel, closePanel, refreshPanel, onSearchInput, isPanelOpen } from './src/ui-controller.js';
+import { togglePanel, closePanel, refreshPanel, onSearchInput, isPanelOpen, resetSearchState } from './src/ui-controller.js';
+import { getDisplayMode, setDisplayMode } from './src/metadata-store.js';
 
 const MODULE_NAME = 'chat_manager';
+const EXTENSION_PATH = '/scripts/extensions/third-party/chat_manager';
 
 /**
  * Extension entry point — called by SillyTavern when the extension loads.
@@ -17,14 +19,17 @@ const MODULE_NAME = 'chat_manager';
 
     // Ensure settings structure exists
     if (!context.extensionSettings[MODULE_NAME]) {
-        context.extensionSettings[MODULE_NAME] = { metadata: {} };
+        context.extensionSettings[MODULE_NAME] = { metadata: {}, displayMode: 'panel' };
     }
 
-    // Inject panel HTML
-    await injectPanelHTML();
+    // Inject UI for current display mode
+    await injectUI(getDisplayMode());
 
     // Bind panel events
     bindPanelEvents();
+
+    // Inject settings panel into Extensions settings
+    await injectSettingsPanel();
 
     // Listen for SillyTavern events
     eventSource.on(eventTypes.CHAT_CHANGED, onChatChanged);
@@ -38,25 +43,92 @@ const MODULE_NAME = 'chat_manager';
 })();
 
 /**
- * Inject the panel HTML template into the DOM.
+ * Inject the UI template for the given display mode into the DOM.
+ * Removes any existing panel/overlay elements first.
+ * @param {string} mode - 'panel' or 'popup'
  */
-async function injectPanelHTML() {
+async function injectUI(mode) {
+    // Remove existing UI elements
+    const existingPanel = document.getElementById('chat-manager-panel');
+    if (existingPanel) existingPanel.remove();
+    const existingOverlay = document.getElementById('chat-manager-shadow-overlay');
+    if (existingOverlay) existingOverlay.remove();
+
+    const templateFile = mode === 'popup' ? 'popup.html' : 'panel.html';
     const context = SillyTavern.getContext();
-    const panelResponse = await fetch('/scripts/extensions/third-party/chat_manager/templates/panel.html', {
+    const response = await fetch(`${EXTENSION_PATH}/templates/${templateFile}`, {
         method: 'GET',
         headers: context.getRequestHeaders(),
     });
-    if (!panelResponse.ok) {
-        console.error(`[${MODULE_NAME}] Failed to load panel template`);
+
+    if (!response.ok) {
+        console.error(`[${MODULE_NAME}] Failed to load ${templateFile} template`);
         return;
     }
-    const panelHTML = await panelResponse.text();
 
+    const html = await response.text();
     const { DOMPurify } = SillyTavern.libs;
     const wrapper = document.createElement('div');
-    wrapper.innerHTML = DOMPurify.sanitize(panelHTML);
+    wrapper.innerHTML = DOMPurify.sanitize(html);
 
     document.body.appendChild(wrapper.firstElementChild);
+}
+
+/**
+ * Inject the settings panel into SillyTavern's Extensions settings area.
+ */
+async function injectSettingsPanel() {
+    const context = SillyTavern.getContext();
+    const response = await fetch(`${EXTENSION_PATH}/templates/settings.html`, {
+        method: 'GET',
+        headers: context.getRequestHeaders(),
+    });
+
+    if (!response.ok) {
+        console.error(`[${MODULE_NAME}] Failed to load settings template`);
+        return;
+    }
+
+    const html = await response.text();
+    const { DOMPurify } = SillyTavern.libs;
+
+    const container = document.createElement('div');
+    container.className = 'extension_container';
+    container.id = 'chat_manager_settings_container';
+    container.innerHTML = DOMPurify.sanitize(html);
+
+    const settingsArea = document.getElementById('extensions_settings2');
+    if (settingsArea) {
+        settingsArea.appendChild(container);
+    }
+
+    // Set initial radio state
+    const currentMode = getDisplayMode();
+    const radio = container.querySelector(`input[name="chat_manager_display_mode"][value="${currentMode}"]`);
+    if (radio) radio.checked = true;
+
+    // Bind change handler
+    container.querySelectorAll('input[name="chat_manager_display_mode"]').forEach(input => {
+        input.addEventListener('change', async (e) => {
+            const newMode = e.target.value;
+            // Close using the OLD mode before persisting the new one
+            closePanel();
+            setDisplayMode(newMode);
+            await switchDisplayMode(newMode);
+        });
+    });
+}
+
+/**
+ * Switch the display mode — close current UI, swap template, re-bind events.
+ * @param {string} newMode - 'panel' or 'popup'
+ */
+async function switchDisplayMode(newMode) {
+    // Swap DOM template
+    await injectUI(newMode);
+
+    // Re-bind events on the new template
+    bindPanelEvents();
 }
 
 /**
@@ -113,15 +185,31 @@ function hijackTopBarButton() {
 }
 
 /**
- * Bind events within the panel (close button, search input).
+ * Bind events within the panel/popup (close button, search input, overlay click).
  */
 function bindPanelEvents() {
     const { lodash: _ } = SillyTavern.libs;
 
-    // Close button
+    // Panel close button (side panel mode)
     const closeBtn = document.getElementById('chat-manager-close-btn');
     if (closeBtn) {
         closeBtn.addEventListener('click', closePanel);
+    }
+
+    // Popup close button
+    const popupCloseBtn = document.getElementById('chat-manager-popup-close');
+    if (popupCloseBtn) {
+        popupCloseBtn.addEventListener('click', closePanel);
+    }
+
+    // Overlay click-to-close (only if click target is the overlay itself)
+    const overlay = document.getElementById('chat-manager-shadow-overlay');
+    if (overlay) {
+        overlay.addEventListener('click', (e) => {
+            if (e.target === overlay) {
+                closePanel();
+            }
+        });
     }
 
     // Search input with debounce
@@ -148,7 +236,8 @@ async function onChatChanged() {
         clearIndex();
     }
 
-    // Reset search input
+    // Reset search input and state
+    resetSearchState();
     const searchInput = document.getElementById('chat-manager-search');
     if (searchInput) searchInput.value = '';
 }

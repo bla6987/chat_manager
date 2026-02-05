@@ -7,7 +7,7 @@ import {
 } from './chat-reader.js';
 import {
     getDisplayName, setDisplayName, getSummary, setSummary,
-    migrateFileKey,
+    migrateFileKey, getDisplayMode,
 } from './metadata-store.js';
 import {
     generateTitleForActiveChat, generateTitleForChat,
@@ -23,6 +23,12 @@ let currentResults = [];
 let displayedResultCount = 0;
 const RESULTS_PAGE_SIZE = 50;
 
+export function resetSearchState() {
+    currentResults = [];
+    displayedResultCount = 0;
+    fuseInstance = null;
+}
+
 // ──────────────────────────────────────────────
 //  Panel Toggle
 // ──────────────────────────────────────────────
@@ -32,22 +38,87 @@ export function isPanelOpen() {
 }
 
 export async function togglePanel() {
-    const panel = document.getElementById('chat-manager-panel');
-    if (!panel) return;
-
-    panelOpen = !panelOpen;
-
-    if (panelOpen) {
-        panel.classList.add('open');
-        await refreshPanel();
+    const mode = getDisplayMode();
+    if (mode === 'popup') {
+        await togglePopup();
     } else {
-        panel.classList.remove('open');
+        await toggleSidePanel();
     }
 }
 
 export function closePanel() {
+    const mode = getDisplayMode();
+    if (mode === 'popup') {
+        closePopup();
+    } else {
+        closeSidePanel();
+    }
+}
+
+// ── Side Panel ──
+
+let isToggling = false;
+
+async function toggleSidePanel() {
+    if (isToggling) return;
+    isToggling = true;
+    try {
+        const panel = document.getElementById('chat-manager-panel');
+        if (!panel) return;
+
+        panelOpen = !panelOpen;
+
+        if (panelOpen) {
+            panel.classList.add('open');
+            await refreshPanel();
+        } else {
+            panel.classList.remove('open');
+        }
+    } finally {
+        isToggling = false;
+    }
+}
+
+function closeSidePanel() {
     const panel = document.getElementById('chat-manager-panel');
     if (panel) panel.classList.remove('open');
+    panelOpen = false;
+}
+
+// ── Popup ──
+
+async function togglePopup() {
+    if (isToggling) return;
+    isToggling = true;
+    try {
+        const overlay = document.getElementById('chat-manager-shadow-overlay');
+        if (!overlay) return;
+
+        panelOpen = !panelOpen;
+
+        if (panelOpen) {
+            overlay.style.display = 'block';
+            // Force reflow so the transition triggers
+            void overlay.offsetHeight;
+            overlay.classList.add('visible');
+            await refreshPanel();
+        } else {
+            closePopup();
+        }
+    } finally {
+        isToggling = false;
+    }
+}
+
+function closePopup() {
+    const overlay = document.getElementById('chat-manager-shadow-overlay');
+    if (!overlay) return;
+    overlay.classList.remove('visible');
+    setTimeout(() => {
+        if (!overlay.classList.contains('visible')) {
+            overlay.style.display = 'none';
+        }
+    }, 300);
     panelOpen = false;
 }
 
@@ -218,6 +289,7 @@ export function performSearch(query) {
 
 function loadMoreResults(container, query) {
     const { DOMPurify, moment } = SillyTavern.libs;
+    const prevButtonCount = container.querySelectorAll('.chat-manager-jump-btn').length;
     const end = Math.min(displayedResultCount + RESULTS_PAGE_SIZE, currentResults.length);
     let html = '';
 
@@ -266,10 +338,11 @@ function loadMoreResults(container, query) {
         container.appendChild(loadMoreBtn);
     }
 
-    // Bind jump buttons
-    container.querySelectorAll('.chat-manager-jump-btn').forEach(btn => {
-        btn.addEventListener('click', handleJumpToMessage);
-    });
+    // Bind jump buttons (only newly added ones)
+    const allButtons = container.querySelectorAll('.chat-manager-jump-btn');
+    for (let i = prevButtonCount; i < allButtons.length; i++) {
+        allButtons[i].addEventListener('click', handleJumpToMessage);
+    }
 }
 
 function buildHighlightedExcerpt(text, query) {
@@ -344,7 +417,11 @@ async function handleSwitchThread(e) {
     if (filename === activeChatFile) return;
 
     const context = SillyTavern.getContext();
-    await context.openCharacterChat(filename);
+    await context.openCharacterChat(filename.replace(/\.jsonl$/i, ''));
+
+    if (getDisplayMode() === 'popup') {
+        closePanel();
+    }
 }
 
 function handleEditDisplayName(e) {
@@ -365,18 +442,25 @@ function handleEditDisplayName(e) {
     input.focus();
     input.select();
 
+    let cancelled = false;
     const save = () => {
+        const span = document.createElement('span');
+        span.className = 'chat-manager-display-name';
+        span.dataset.filename = filename;
+        span.title = 'Click to switch thread';
+        span.addEventListener('click', handleSwitchThread);
+
+        if (cancelled) {
+            span.textContent = currentName;
+            input.replaceWith(span);
+            return;
+        }
+
         const newName = input.value.trim();
         if (newName && newName !== filename) {
             setDisplayName(filename, newName);
         }
-        // Restore the span
-        const span = document.createElement('span');
-        span.className = 'chat-manager-display-name';
-        span.dataset.filename = filename;
         span.textContent = newName || filename;
-        span.title = 'Click to switch thread';
-        span.addEventListener('click', handleSwitchThread);
         input.replaceWith(span);
     };
 
@@ -386,7 +470,7 @@ function handleEditDisplayName(e) {
             ev.preventDefault();
             input.blur();
         } else if (ev.key === 'Escape') {
-            input.value = currentName;
+            cancelled = true;
             input.blur();
         }
     });
@@ -485,7 +569,7 @@ async function handleRenameFile(e) {
     }
 
     try {
-        await context.renameChat(filename, newFilename);
+        await context.renameChat(baseName, newBase);
         migrateFileKey(filename, newFilename);
         toastr.success(`Renamed to ${newFilename}`);
         await refreshPanel();
@@ -597,9 +681,13 @@ async function handleJumpToMessage(e) {
         const result = await popup.show();
         if (result !== POPUP_RESULT.AFFIRMATIVE) return;
 
-        await context.openCharacterChat(filename);
+        await context.openCharacterChat(filename.replace(/\.jsonl$/i, ''));
         // Wait a moment for chat to render
         await new Promise(r => setTimeout(r, 500));
+    }
+
+    if (getDisplayMode() === 'popup') {
+        closePanel();
     }
 
     // Scroll to message

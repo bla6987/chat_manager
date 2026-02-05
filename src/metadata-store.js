@@ -11,10 +11,13 @@ const MODULE_NAME = 'chat_manager';
 function ensureSettings() {
     const { extensionSettings } = SillyTavern.getContext();
     if (!extensionSettings[MODULE_NAME]) {
-        extensionSettings[MODULE_NAME] = { metadata: {} };
+        extensionSettings[MODULE_NAME] = { metadata: {}, displayMode: 'panel' };
     }
     if (!extensionSettings[MODULE_NAME].metadata) {
         extensionSettings[MODULE_NAME].metadata = {};
+    }
+    if (!extensionSettings[MODULE_NAME].displayMode) {
+        extensionSettings[MODULE_NAME].displayMode = 'panel';
     }
 }
 
@@ -149,4 +152,25 @@ export function getAllChatMeta() {
 
     const { extensionSettings } = SillyTavern.getContext();
     return extensionSettings[MODULE_NAME].metadata[key] || {};
+}
+
+/**
+ * Get the current display mode ('panel' or 'popup').
+ * @returns {string}
+ */
+export function getDisplayMode() {
+    ensureSettings();
+    const { extensionSettings } = SillyTavern.getContext();
+    return extensionSettings[MODULE_NAME].displayMode || 'panel';
+}
+
+/**
+ * Set the display mode ('panel' or 'popup').
+ * @param {string} mode
+ */
+export function setDisplayMode(mode) {
+    ensureSettings();
+    const { extensionSettings, saveSettingsDebounced } = SillyTavern.getContext();
+    extensionSettings[MODULE_NAME].displayMode = mode;
+    saveSettingsDebounced();
 }
