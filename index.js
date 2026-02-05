@@ -11,6 +11,8 @@ const MODULE_NAME = 'chat_manager';
 const EXTENSION_PATH = '/scripts/extensions/third-party/chat_manager';
 const SETTINGS_CONTAINER_ID = 'chat_manager_settings_container';
 const START_BUTTON_ID = 'chat-manager-start-btn';
+const TOPBAR_CHAT_MANAGER_ID = 'extensionTopBarChatManager';
+const FALLBACK_TOGGLE_ID = 'chat-manager-toggle';
 
 const templateCache = new Map();
 let settingsInjected = false;
@@ -18,13 +20,40 @@ let pendingSettingsInjection = null;
 let currentInjectedMode = null;
 let pendingUIInjection = null;
 let slashCommandsRegistered = false;
+let topBarInterceptorBound = false;
+
+/**
+ * Handle MESSAGE_SENT / MESSAGE_RECEIVED — lightweight update for active chat only.
+ * Debounced to avoid redundant updates during rapid message events (e.g., streaming).
+ */
+const onMessageUpdate = (() => {
+    let timer = null;
+    return function () {
+        if (timer) clearTimeout(timer);
+        timer = setTimeout(async () => {
+            timer = null;
+            if (!isPanelOpen()) return;
+
+            const context = SillyTavern.getContext();
+            const activeChatFile = context.chatMetadata?.chat_file_name;
+
+            if (activeChatFile) {
+                const updated = await updateActiveChat(activeChatFile);
+                if (updated) {
+                    renderThreadCards();
+                }
+            }
+        }, 250);
+    };
+})();
 
 /**
  * Extension entry point — called by SillyTavern when the extension loads.
  */
 (async function init() {
     const context = SillyTavern.getContext();
-    const { eventSource, eventTypes } = context;
+    const { eventSource } = context;
+    const eventTypes = context.eventTypes || context.event_types;
 
     // Ensure settings structure exists
     if (!context.extensionSettings[MODULE_NAME]) {
@@ -36,13 +65,22 @@ let slashCommandsRegistered = false;
         void injectSettingsPanel();
     }, 0);
 
-    // Listen for SillyTavern events
-    eventSource.on(eventTypes.CHAT_CHANGED, onChatChanged);
-    eventSource.on(eventTypes.MESSAGE_SENT, onMessageUpdate);
-    eventSource.on(eventTypes.MESSAGE_RECEIVED, onMessageUpdate);
+    bindTopBarClickInterceptor();
+    hijackTopBarButton();
 
-    // Hijack TopInfoBar's chat manager button once all extensions are ready
-    eventSource.on(eventTypes.APP_READY, onAppReady);
+    // Listen for SillyTavern events
+    if (eventSource && eventTypes) {
+        eventSource.on(eventTypes.CHAT_CHANGED, onChatChanged);
+        eventSource.on(eventTypes.MESSAGE_SENT, onMessageUpdate);
+        eventSource.on(eventTypes.MESSAGE_RECEIVED, onMessageUpdate);
+
+        // Hijack TopInfoBar's chat manager button once all extensions are ready
+        if (eventTypes.APP_READY) {
+            eventSource.on(eventTypes.APP_READY, onAppReady);
+        }
+    } else {
+        console.warn(`[${MODULE_NAME}] Missing eventSource/eventTypes; startup listeners not attached.`);
+    }
 
     registerSlashCommands();
 
@@ -53,6 +91,27 @@ function onAppReady() {
     registerSlashCommands();
     hijackTopBarButton();
     void injectSettingsPanel();
+}
+
+function bindTopBarClickInterceptor() {
+    if (topBarInterceptorBound) return;
+
+    document.addEventListener('click', (event) => {
+        if (!(event.target instanceof Element)) return;
+
+        const topBarButton = event.target.closest(`#${TOPBAR_CHAT_MANAGER_ID}`);
+        if (!topBarButton) return;
+
+        // Respect TopInfoBar's disabled state
+        if (topBarButton.classList.contains('not-in-chat')) return;
+
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        event.stopPropagation();
+        void handleTogglePanel(event);
+    }, true);
+
+    topBarInterceptorBound = true;
 }
 
 /**
@@ -322,28 +381,30 @@ async function switchDisplayMode(newMode) {
  * Falls back to creating a standalone button if TopInfoBar is not installed.
  */
 function hijackTopBarButton() {
-    const existingBtn = document.getElementById('extensionTopBarChatManager');
+    const existingBtn = document.getElementById(TOPBAR_CHAT_MANAGER_ID);
+    const existingFallback = document.getElementById(FALLBACK_TOGGLE_ID);
 
     if (existingBtn) {
-        // Clone-and-replace to strip all anonymous event listeners
-        const parent = existingBtn.parentNode;
-        const clone = existingBtn.cloneNode(true);
-        clone.title = 'Toggle Chat Manager';
-        clone.addEventListener('click', (e) => {
-            // Respect TopInfoBar's disabled state
-            if (clone.classList.contains('not-in-chat')) return;
-            void handleTogglePanel(e);
-        });
-        parent.replaceChild(clone, existingBtn);
-        console.log(`[${MODULE_NAME}] Hijacked TopInfoBar chat manager button.`);
+        existingBtn.title = 'Toggle Chat Manager';
+
+        if (existingFallback) {
+            existingFallback.remove();
+        }
+
+        if (!existingBtn.dataset.chatManagerHijacked) {
+            existingBtn.dataset.chatManagerHijacked = '1';
+            console.log(`[${MODULE_NAME}] Hijacked TopInfoBar chat manager button.`);
+        }
         return;
     }
 
     // Fallback: TopInfoBar bar exists but the button doesn't — add an icon
     const topBar = document.getElementById('extensionTopBar');
     if (topBar) {
+        if (existingFallback) return;
+
         const icon = document.createElement('i');
-        icon.id = 'chat-manager-toggle';
+        icon.id = FALLBACK_TOGGLE_ID;
         icon.className = 'fa-solid fa-address-book';
         icon.title = 'Toggle Chat Manager';
         icon.tabIndex = 0;
@@ -356,8 +417,10 @@ function hijackTopBarButton() {
     }
 
     // Final fallback: no TopInfoBar at all — floating button
+    if (existingFallback) return;
+
     const btn = document.createElement('button');
-    btn.id = 'chat-manager-toggle';
+    btn.id = FALLBACK_TOGGLE_ID;
     btn.textContent = 'Chat Manager';
     btn.title = 'Toggle Chat Manager';
     btn.style.position = 'fixed';
@@ -441,27 +504,3 @@ async function onChatChanged() {
     if (searchInput) searchInput.value = '';
 }
 
-/**
- * Handle MESSAGE_SENT / MESSAGE_RECEIVED — lightweight update for active chat only.
- * Debounced to avoid redundant updates during rapid message events (e.g., streaming).
- */
-const onMessageUpdate = (() => {
-    let timer = null;
-    return function () {
-        if (timer) clearTimeout(timer);
-        timer = setTimeout(async () => {
-            timer = null;
-            if (!isPanelOpen()) return;
-
-            const context = SillyTavern.getContext();
-            const activeChatFile = context.chatMetadata?.chat_file_name;
-
-            if (activeChatFile) {
-                const updated = await updateActiveChat(activeChatFile);
-                if (updated) {
-                    renderThreadCards();
-                }
-            }
-        }, 250);
-    };
-})();
