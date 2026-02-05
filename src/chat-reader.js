@@ -5,11 +5,13 @@
 
 const MODULE_NAME = 'chat_manager';
 const HYDRATION_BATCH_SIZE = 8;
+const FALLBACK_SORT_TIMESTAMP = 0;
 
 /** @type {Object<string, ChatIndexEntry>} filename -> index entry */
 let chatIndex = {};
 let currentCharacterAvatar = null;
 let indexBuildInProgress = false;
+let nextInitialOrder = 0;
 
 let hydrationQueue = [];
 let queuedFiles = new Set();
@@ -37,6 +39,8 @@ let progressCallback = null;
  * @property {IndexMessage[]} messages
  * @property {string|null} firstMessageTimestamp
  * @property {string|null} lastMessageTimestamp
+ * @property {number} sortTimestamp - stable recency key for list ordering
+ * @property {number} initialOrder - deterministic tie-breaker to avoid jitter while hydrating
  * @property {number|null} branchPoint - message index where this chat diverged from the active chat, or null
  * @property {boolean} isLoaded - whether full chat content has been fetched
  */
@@ -126,8 +130,7 @@ function parseMessages(chatData, fileName) {
  * @returns {number}
  */
 function getMetaTimestamp(metaObj) {
-    if (metaObj?.last_mes) return new Date(metaObj.last_mes).getTime();
-    return 0;
+    return normalizeTimestamp(metaObj?.last_mes);
 }
 
 /**
@@ -186,6 +189,37 @@ function normalizeMeta(chatMeta) {
     return metaObj;
 }
 
+function normalizeTimestamp(value) {
+    if (value === null || value === undefined || value === '') {
+        return FALLBACK_SORT_TIMESTAMP;
+    }
+
+    const parsed = new Date(value).getTime();
+    return Number.isFinite(parsed) ? parsed : FALLBACK_SORT_TIMESTAMP;
+}
+
+function allocateInitialOrder() {
+    const value = nextInitialOrder;
+    nextInitialOrder += 1;
+    return value;
+}
+
+function compareByRecency(a, b) {
+    const aTime = Number.isFinite(a.sortTimestamp) ? a.sortTimestamp : FALLBACK_SORT_TIMESTAMP;
+    const bTime = Number.isFinite(b.sortTimestamp) ? b.sortTimestamp : FALLBACK_SORT_TIMESTAMP;
+    if (aTime !== bTime) {
+        return bTime - aTime;
+    }
+
+    const aOrder = Number.isFinite(a.initialOrder) ? a.initialOrder : Number.MAX_SAFE_INTEGER;
+    const bOrder = Number.isFinite(b.initialOrder) ? b.initialOrder : Number.MAX_SAFE_INTEGER;
+    if (aOrder !== bOrder) {
+        return aOrder - bOrder;
+    }
+
+    return a.fileName.localeCompare(b.fileName);
+}
+
 function hasPendingHydration() {
     return hydrationQueue.length > 0 || entryHydrationPromises.size > 0;
 }
@@ -197,6 +231,15 @@ function getBuildStateResponse(changed = false) {
         hydrationStarted: hasPendingHydration() || hydrationInProgress,
         isComplete: isHydrationComplete(),
     };
+}
+
+function notifyMetadataReady(onMetadataReady, changed) {
+    if (typeof onMetadataReady !== 'function') return;
+    try {
+        onMetadataReady(getBuildStateResponse(changed));
+    } catch (err) {
+        console.error(`[${MODULE_NAME}] Metadata-ready callback failed:`, err);
+    }
 }
 
 function resetHydrationQueue() {
@@ -245,6 +288,12 @@ function normalizeEntryShape(entry) {
     if (entry.firstMessageTimestamp === undefined) entry.firstMessageTimestamp = null;
     if (entry.lastMessageTimestamp === undefined) entry.lastMessageTimestamp = null;
     if (entry.branchPoint === undefined) entry.branchPoint = null;
+    if (!Number.isFinite(entry.sortTimestamp)) {
+        entry.sortTimestamp = normalizeTimestamp(entry.lastMessageTimestamp || entry.lastModified);
+    }
+    if (!Number.isFinite(entry.initialOrder)) {
+        entry.initialOrder = allocateInitialOrder();
+    }
 
     if (typeof entry.isLoaded !== 'boolean') {
         entry.isLoaded = entry.messages.length > 0;
@@ -345,14 +394,18 @@ function startHydrationLoop() {
  * Build (or incrementally update) the index for the current character.
  * Metadata phase returns quickly; full chat hydration runs in the background.
  * @param {Function} [onProgress] - Called with (completed, total) for progress tracking
+ * @param {Function} [onMetadataReady] - Called once metadata is available for immediate UI rendering
  * @returns {Promise<{ index: Object, changed: boolean, hydrationStarted: boolean, isComplete: boolean }>}
  */
-export async function buildIndex(onProgress) {
+export async function buildIndex(onProgress, onMetadataReady) {
     if (onProgress) {
         progressCallback = onProgress;
     }
 
     if (indexBuildInProgress) {
+        if (Object.keys(chatIndex).length > 0) {
+            notifyMetadataReady(onMetadataReady, false);
+        }
         emitHydrationUpdate();
         return getBuildStateResponse(false);
     }
@@ -386,6 +439,7 @@ export async function buildIndex(onProgress) {
             changed = Object.keys(chatIndex).length > 0;
             chatIndex = {};
             resetHydrationQueue();
+            notifyMetadataReady(onMetadataReady, changed);
             emitHydrationUpdate();
             return getBuildStateResponse(changed);
         }
@@ -416,6 +470,8 @@ export async function buildIndex(onProgress) {
                     messages: [],
                     firstMessageTimestamp: null,
                     lastMessageTimestamp: metaLastTimestamp,
+                    sortTimestamp: serverTimestamp,
+                    initialOrder: allocateInitialOrder(),
                     branchPoint: null,
                     isLoaded: false,
                 };
@@ -427,6 +483,9 @@ export async function buildIndex(onProgress) {
 
             const timestampChanged = cached.lastModified !== serverTimestamp;
             cached.lastModified = serverTimestamp;
+            if (timestampChanged) {
+                cached.sortTimestamp = serverTimestamp;
+            }
 
             if (metaLastTimestamp) {
                 cached.lastMessageTimestamp = metaLastTimestamp;
@@ -472,6 +531,8 @@ export async function buildIndex(onProgress) {
                 entry.branchPoint = null;
             }
         }
+
+        notifyMetadataReady(onMetadataReady, changed);
 
         emitHydrationUpdate();
 
@@ -523,6 +584,7 @@ export async function updateActiveChat(fileName) {
         const cached = chatIndex[fileName];
         const lastTimestamp = messages.length > 0 ? messages[messages.length - 1].timestamp : null;
         const parsedLastModified = lastTimestamp ? new Date(lastTimestamp).getTime() : NaN;
+        const hasValidLastModified = Number.isFinite(parsedLastModified);
 
         chatIndex[fileName] = {
             ...cached,
@@ -530,7 +592,8 @@ export async function updateActiveChat(fileName) {
             messages,
             firstMessageTimestamp: messages.length > 0 ? messages[0].timestamp : null,
             lastMessageTimestamp: lastTimestamp || cached.lastMessageTimestamp,
-            lastModified: Number.isFinite(parsedLastModified) ? parsedLastModified : cached.lastModified,
+            lastModified: hasValidLastModified ? parsedLastModified : cached.lastModified,
+            sortTimestamp: hasValidLastModified ? parsedLastModified : cached.sortTimestamp,
             branchPoint: null,
             isLoaded: true,
         };
@@ -600,6 +663,16 @@ export function getIndex() {
 }
 
 /**
+ * Get a stable, recent-first snapshot of entries.
+ * @returns {ChatIndexEntry[]}
+ */
+export function getSortedEntries() {
+    const entries = Object.values(chatIndex);
+    entries.sort(compareByRecency);
+    return entries;
+}
+
+/**
  * Get the avatar of the character the index was built for.
  * @returns {string|null}
  */
@@ -613,6 +686,7 @@ export function getIndexCharacterAvatar() {
 export function clearIndex() {
     chatIndex = {};
     currentCharacterAvatar = null;
+    nextInitialOrder = 0;
     progressCallback = null;
     resetHydrationQueue();
     emitHydrationUpdate();

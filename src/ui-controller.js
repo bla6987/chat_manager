@@ -3,7 +3,7 @@
  */
 
 import {
-    buildIndex, getHydrationProgress, getIndex, getSearchableMessages,
+    buildIndex, getHydrationProgress, getIndex, getSearchableMessages, getSortedEntries,
     isHydrationComplete, onHydrationUpdate, runDeferredBranchDetection,
 } from './chat-reader.js';
 import {
@@ -48,6 +48,18 @@ function withIndexingSuffix(text) {
 function getCurrentSearchQuery() {
     const searchInput = document.getElementById('chat-manager-search');
     return searchInput ? searchInput.value.trim() : '';
+}
+
+function formatDateOrFallback(momentLib, value, fallback = '?') {
+    if (!value) return fallback;
+    const parsed = momentLib(value);
+    return parsed.isValid() ? parsed.format('MMM D') : fallback;
+}
+
+function formatFromNowOrFallback(momentLib, value, fallback = 'unknown') {
+    if (!value) return fallback;
+    const parsed = momentLib(value);
+    return parsed.isValid() ? parsed.fromNow() : fallback;
 }
 
 function scheduleHydrationUIRefresh() {
@@ -208,32 +220,49 @@ export async function refreshPanel() {
     const index = getIndex();
     const hasCache = Object.keys(index).length > 0;
 
+    const renderThreadListWithBranches = () => {
+        renderThreadCards();
+        const activeFile = getActiveFilename();
+        setTimeout(() => {
+            runDeferredBranchDetection(activeFile);
+            patchBranchIndicators();
+        }, 0);
+    };
+
+    const renderFromLatestIndex = () => {
+        const query = getCurrentSearchQuery();
+        if (query.length >= 2) {
+            performSearch(query);
+        } else {
+            renderThreadListWithBranches();
+        }
+    };
+
     if (hasCache) {
         // Cache-first: render immediately from existing index
-        renderThreadCards();
+        renderFromLatestIndex();
     } else {
         renderLoading();
     }
 
-    const { changed } = await buildIndex(onIndexProgress);
-
-    // Deferred branch detection: run after cards are rendered, then patch indicators
-    const activeFile = getActiveFilename();
-    setTimeout(() => {
-        runDeferredBranchDetection(activeFile);
-        patchBranchIndicators();
-    }, 0);
+    let renderedFromMetadata = false;
+    const { changed } = await buildIndex(onIndexProgress, (buildState) => {
+        if (renderedFromMetadata) return;
+        if (buildState?.changed) {
+            searchState = null;
+        }
+        renderedFromMetadata = true;
+        if (!panelOpen) return;
+        renderFromLatestIndex();
+    });
 
     // Invalidate search state since the index may have changed
-    if (changed) {
+    if (changed && !renderedFromMetadata) {
         searchState = null;
     }
 
-    const query = getCurrentSearchQuery();
-    if (query.length >= 2) {
-        performSearch(query);
-    } else {
-        renderThreadCards();
+    if (!renderedFromMetadata) {
+        renderFromLatestIndex();
     }
 }
 
@@ -252,7 +281,7 @@ function patchBranchIndicators() {
     const index = getIndex();
     const activeFile = getActiveFilename();
     const activeEntry = activeFile ? index[activeFile] : null;
-    const entries = Object.values(index);
+    const entries = getSortedEntries();
 
     for (const entry of entries) {
         const card = document.querySelector(`.chat-manager-card[data-filename="${CSS.escape(entry.fileName)}"]`);
@@ -308,19 +337,12 @@ export function renderThreadCards() {
     if (!container) return;
 
     const index = getIndex();
-    const entries = Object.values(index);
+    const entries = getSortedEntries();
 
     if (entries.length === 0) {
         renderEmptyState('No chats found for this character.');
         return;
     }
-
-    // Sort by last message timestamp, most recent first
-    entries.sort((a, b) => {
-        const aTime = a.lastMessageTimestamp ? new Date(a.lastMessageTimestamp).getTime() : 0;
-        const bTime = b.lastMessageTimestamp ? new Date(b.lastMessageTimestamp).getTime() : 0;
-        return bTime - aTime;
-    });
 
     const { moment, DOMPurify } = SillyTavern.libs;
     const activeChatFile = getActiveFilename();
@@ -333,9 +355,9 @@ export function renderThreadCards() {
         const summary = getSummary(entry.fileName);
         const isActive = entry.fileName === activeChatFile;
 
-        const firstDate = entry.firstMessageTimestamp ? moment(entry.firstMessageTimestamp).format('MMM D') : '?';
-        const lastDate = entry.lastMessageTimestamp ? moment(entry.lastMessageTimestamp).format('MMM D') : '?';
-        const lastActive = entry.lastMessageTimestamp ? moment(entry.lastMessageTimestamp).fromNow() : 'unknown';
+        const firstDate = formatDateOrFallback(moment, entry.firstMessageTimestamp, '?');
+        const lastDate = formatDateOrFallback(moment, entry.lastMessageTimestamp, '?');
+        const lastActive = formatFromNowOrFallback(moment, entry.lastMessageTimestamp, 'unknown');
 
         const branchDistance = (entry.isLoaded && entry.branchPoint !== null && activeEntry?.isLoaded)
             ? activeEntry.messageCount - entry.branchPoint : null;
@@ -489,7 +511,7 @@ function renderSearchPage(container, fromIndex) {
         const item = result.item;
         const displayName = getDisplayName(item.filename) || item.filename;
         const roleLabel = item.role === 'user' ? 'User' : 'Character';
-        const dateStr = item.timestamp ? moment(item.timestamp).format('MMM D') : '';
+        const dateStr = formatDateOrFallback(moment, item.timestamp, '');
 
         // Build highlighted excerpt
         const excerpt = buildHighlightedExcerpt(item.text, searchState.query);
