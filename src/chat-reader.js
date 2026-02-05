@@ -4,7 +4,7 @@
  */
 
 const MODULE_NAME = 'chat_manager';
-const HYDRATION_BATCH_SIZE = 8;
+const HYDRATION_BATCH_SIZE = 20;
 const FALLBACK_SORT_TIMESTAMP = 0;
 
 /** @type {Object<string, ChatIndexEntry>} filename -> index entry */
@@ -278,6 +278,18 @@ function markEntryForHydration(fileName) {
 
     hydrationQueue.push(fileName);
     queuedFiles.add(fileName);
+}
+
+/**
+ * Move a file to the front of the hydration queue so it loads first.
+ * @param {string} fileName
+ */
+export function prioritizeInQueue(fileName) {
+    const idx = hydrationQueue.indexOf(fileName);
+    if (idx > 0) {
+        hydrationQueue.splice(idx, 1);
+        hydrationQueue.unshift(fileName);
+    }
 }
 
 function normalizeEntryShape(entry) {

@@ -4,7 +4,7 @@
 
 import {
     buildIndex, getHydrationProgress, getIndex, getSearchableMessages, getSortedEntries,
-    isHydrationComplete, onHydrationUpdate, runDeferredBranchDetection,
+    isHydrationComplete, onHydrationUpdate, prioritizeInQueue, runDeferredBranchDetection,
 } from './chat-reader.js';
 import {
     getDisplayName, setDisplayName, getSummary, setSummary,
@@ -72,11 +72,14 @@ function scheduleHydrationUIRefresh() {
         const query = getCurrentSearchQuery();
         if (query.length >= 2) return;
 
-        renderThreadCards();
-        const activeFile = getActiveFilename();
-        runDeferredBranchDetection(activeFile);
-        patchBranchIndicators();
-    }, 120);
+        patchCardData();
+
+        if (isHydrationComplete()) {
+            const activeFile = getActiveFilename();
+            runDeferredBranchDetection(activeFile);
+            patchBranchIndicators();
+        }
+    }, 600);
 }
 
 function scheduleSearchRefresh() {
@@ -245,6 +248,11 @@ export async function refreshPanel() {
         renderLoading();
     }
 
+    const activeFile = getActiveFilename();
+    if (activeFile) {
+        prioritizeInQueue(activeFile);
+    }
+
     let renderedFromMetadata = false;
     const { changed } = await buildIndex(onIndexProgress, (buildState) => {
         if (renderedFromMetadata) return;
@@ -310,6 +318,64 @@ function patchBranchIndicators() {
         span.className = 'chat-manager-branch';
         span.textContent = label;
         meta.appendChild(span);
+    }
+}
+
+// ──────────────────────────────────────────────
+//  Incremental Card Patching (used during hydration)
+// ──────────────────────────────────────────────
+
+/**
+ * Patch already-rendered cards in-place with updated data from hydrated entries.
+ * Much cheaper than a full renderThreadCards() call — avoids HTML rebuild,
+ * DOMPurify.sanitize, and event re-binding.
+ */
+function patchCardData() {
+    const { moment } = SillyTavern.libs;
+    const entries = getSortedEntries();
+
+    for (const entry of entries) {
+        const card = document.querySelector(`.chat-manager-card[data-filename="${CSS.escape(entry.fileName)}"]`);
+        if (!card) continue;
+
+        const meta = card.querySelector('.chat-manager-card-meta');
+        if (!meta) continue;
+
+        // Update the three meta spans: message count, date range, last active
+        const spans = meta.querySelectorAll(':scope > span:not(.chat-manager-branch)');
+        if (spans[0]) spans[0].textContent = `${entry.messageCount} messages`;
+
+        const firstDate = formatDateOrFallback(moment, entry.firstMessageTimestamp, '?');
+        const lastDate = formatDateOrFallback(moment, entry.lastMessageTimestamp, '?');
+        if (spans[1]) spans[1].textContent = `${firstDate} – ${lastDate}`;
+
+        const lastActive = formatFromNowOrFallback(moment, entry.lastMessageTimestamp, 'unknown');
+        if (spans[2]) spans[2].textContent = lastActive;
+
+        // Remove "Indexing..." span and enable AI buttons when loaded
+        if (entry.isLoaded) {
+            const indexingSpan = Array.from(meta.querySelectorAll('span'))
+                .find(s => s.textContent === 'Indexing...');
+            if (indexingSpan) indexingSpan.remove();
+
+            const aiTitleBtn = card.querySelector('.chat-manager-ai-title-btn');
+            if (aiTitleBtn && aiTitleBtn.classList.contains('disabled')) {
+                aiTitleBtn.classList.remove('disabled');
+                aiTitleBtn.title = 'Generate AI title';
+            }
+
+            const regenBtn = card.querySelector('.chat-manager-regen-summary-btn');
+            if (regenBtn && regenBtn.classList.contains('disabled')) {
+                regenBtn.classList.remove('disabled');
+                regenBtn.title = 'Generate/regenerate summary';
+            }
+        }
+    }
+
+    // Update status bar
+    const status = document.getElementById('chat-manager-status');
+    if (status) {
+        status.textContent = withIndexingSuffix(`Showing ${entries.length} threads`);
     }
 }
 
