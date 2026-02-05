@@ -202,6 +202,7 @@ function getBuildStateResponse(changed = false) {
 function resetHydrationQueue() {
     hydrationQueue = [];
     queuedFiles = new Set();
+    entryHydrationPromises.clear();
     hydrationInProgress = false;
     hydrationSessionId++;
 }
@@ -439,6 +440,8 @@ export async function buildIndex(onProgress) {
                 cached.firstMessageTimestamp = null;
                 if (metaMessageCount !== null) {
                     cached.messageCount = metaMessageCount;
+                } else {
+                    cached.messageCount = 0;
                 }
                 markEntryForHydration(fileName);
             } else if (!cached.isLoaded) {
@@ -518,13 +521,16 @@ export async function updateActiveChat(fileName) {
         const chatData = await fetchChatContent(fileName);
         const messages = parseMessages(chatData, fileName);
         const cached = chatIndex[fileName];
+        const lastTimestamp = messages.length > 0 ? messages[messages.length - 1].timestamp : null;
+        const parsedLastModified = lastTimestamp ? new Date(lastTimestamp).getTime() : NaN;
 
         chatIndex[fileName] = {
             ...cached,
             messageCount: messages.length,
             messages,
             firstMessageTimestamp: messages.length > 0 ? messages[0].timestamp : null,
-            lastMessageTimestamp: messages.length > 0 ? messages[messages.length - 1].timestamp : cached.lastMessageTimestamp,
+            lastMessageTimestamp: lastTimestamp || cached.lastMessageTimestamp,
+            lastModified: Number.isFinite(parsedLastModified) ? parsedLastModified : cached.lastModified,
             branchPoint: null,
             isLoaded: true,
         };

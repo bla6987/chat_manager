@@ -13,7 +13,6 @@ import {
 import {
     generateTitleForActiveChat, generateTitleForChat,
     generateSummaryForActiveChat, generateSummaryForChat,
-    isLLMAvailable,
 } from './ai-features.js';
 
 const MODULE_NAME = 'chat_manager';
@@ -68,7 +67,7 @@ function scheduleHydrationUIRefresh() {
     }, 120);
 }
 
-function scheduleSearchRefresh(query) {
+function scheduleSearchRefresh() {
     if (refreshSearchFromHydrationTimer) {
         clearTimeout(refreshSearchFromHydrationTimer);
     }
@@ -90,7 +89,7 @@ function ensureHydrationSubscription() {
         if (!panelOpen) return;
         const query = getCurrentSearchQuery();
         if (query.length >= 2) {
-            scheduleSearchRefresh(query);
+            scheduleSearchRefresh();
         } else {
             scheduleHydrationUIRefresh();
         }
@@ -198,6 +197,7 @@ function closePopup() {
 
 export async function refreshPanel() {
     const context = SillyTavern.getContext();
+    ensureHydrationSubscription();
 
     // Guard: no character selected or group chat
     if (context.characterId === undefined) {
@@ -215,11 +215,7 @@ export async function refreshPanel() {
         renderLoading();
     }
 
-    const { changed } = await buildIndex(hasCache ? null : onIndexProgress);
-
-    if (changed || !hasCache) {
-        renderThreadCards();
-    }
+    const { changed } = await buildIndex(onIndexProgress);
 
     // Deferred branch detection: run after cards are rendered, then patch indicators
     const activeFile = getActiveFilename();
@@ -232,11 +228,19 @@ export async function refreshPanel() {
     if (changed) {
         searchState = null;
     }
+
+    const query = getCurrentSearchQuery();
+    if (query.length >= 2) {
+        performSearch(query);
+    } else {
+        renderThreadCards();
+    }
 }
 
 function onIndexProgress(completed, total) {
     const status = document.getElementById('chat-manager-status');
-    if (status) {
+    const query = getCurrentSearchQuery();
+    if (status && query.length < 2) {
         status.textContent = `Indexing chats... ${completed}/${total}`;
     }
 }
@@ -251,20 +255,31 @@ function patchBranchIndicators() {
     const entries = Object.values(index);
 
     for (const entry of entries) {
-        if (entry.branchPoint === null) continue;
         const card = document.querySelector(`.chat-manager-card[data-filename="${CSS.escape(entry.fileName)}"]`);
         if (!card) continue;
 
         const meta = card.querySelector('.chat-manager-card-meta');
         if (!meta) continue;
 
-        // Skip if already patched
-        if (meta.querySelector('.chat-manager-branch')) continue;
+        const existing = meta.querySelector('.chat-manager-branch');
+        const canShowBranch = entry.isLoaded && entry.branchPoint !== null;
 
-        const distance = activeEntry ? activeEntry.messageCount - entry.branchPoint : null;
+        if (!canShowBranch) {
+            if (existing) existing.remove();
+            continue;
+        }
+
+        const distance = (activeEntry && activeEntry.isLoaded) ? activeEntry.messageCount - entry.branchPoint : null;
+        const label = distance !== null ? `Branched ${distance} msgs ago` : `Branched at msg #${entry.branchPoint}`;
+
+        if (existing) {
+            existing.textContent = label;
+            continue;
+        }
+
         const span = document.createElement('span');
         span.className = 'chat-manager-branch';
-        span.textContent = distance !== null ? `Branched ${distance} msgs ago` : `Branched at msg #${entry.branchPoint}`;
+        span.textContent = label;
         meta.appendChild(span);
     }
 }
@@ -308,7 +323,6 @@ export function renderThreadCards() {
     });
 
     const { moment, DOMPurify } = SillyTavern.libs;
-    const context = SillyTavern.getContext();
     const activeChatFile = getActiveFilename();
 
     const activeEntry = activeChatFile ? index[activeChatFile] : null;
@@ -323,11 +337,20 @@ export function renderThreadCards() {
         const lastDate = entry.lastMessageTimestamp ? moment(entry.lastMessageTimestamp).format('MMM D') : '?';
         const lastActive = entry.lastMessageTimestamp ? moment(entry.lastMessageTimestamp).fromNow() : 'unknown';
 
-        const branchDistance = (entry.branchPoint !== null && activeEntry)
+        const branchDistance = (entry.isLoaded && entry.branchPoint !== null && activeEntry?.isLoaded)
             ? activeEntry.messageCount - entry.branchPoint : null;
-        const branchInfo = entry.branchPoint !== null
+        const branchInfo = (entry.isLoaded && entry.branchPoint !== null)
             ? `<span class="chat-manager-branch">${branchDistance !== null ? `Branched ${branchDistance} msgs ago` : `Branched at msg #${entry.branchPoint}`}</span>`
             : '';
+        const indexingInfo = entry.isLoaded ? '' : '<span>Indexing...</span>';
+        const aiTitleClasses = `chat-manager-icon-btn chat-manager-ai-title-btn fa-fw fa-solid fa-robot${entry.isLoaded ? '' : ' disabled'}`;
+        const regenSummaryClasses = `chat-manager-icon-btn chat-manager-regen-summary-btn fa-fw fa-solid fa-rotate${entry.isLoaded ? '' : ' disabled'}`;
+        const aiTitle = entry.isLoaded
+            ? 'Generate AI title'
+            : 'AI title will be available once indexing finishes';
+        const summaryTitle = entry.isLoaded
+            ? 'Generate/regenerate summary'
+            : 'AI summary will be available once indexing finishes';
 
         html += `
         <div class="chat-manager-card${isActive ? ' active' : ''}" data-filename="${escapeAttr(entry.fileName)}">
@@ -335,7 +358,7 @@ export function renderThreadCards() {
                 <span class="chat-manager-display-name" data-filename="${escapeAttr(entry.fileName)}" title="Click to switch thread">${escapeHtml(displayName)}</span>
                 <div class="chat-manager-card-actions">
                     <i class="chat-manager-icon-btn chat-manager-edit-name-btn fa-fw fa-solid fa-pen" data-filename="${escapeAttr(entry.fileName)}" title="Edit display name" tabindex="0"></i>
-                    <i class="chat-manager-icon-btn chat-manager-ai-title-btn fa-fw fa-solid fa-robot" data-filename="${escapeAttr(entry.fileName)}" title="Generate AI title" tabindex="0"></i>
+                    <i class="${aiTitleClasses}" data-filename="${escapeAttr(entry.fileName)}" title="${escapeAttr(aiTitle)}" tabindex="0"></i>
                     <i class="chat-manager-icon-btn chat-manager-rename-file-btn fa-fw fa-solid fa-file-pen" data-filename="${escapeAttr(entry.fileName)}" title="Rename original file" tabindex="0"></i>
                 </div>
             </div>
@@ -343,6 +366,7 @@ export function renderThreadCards() {
                 <span>${entry.messageCount} messages</span>
                 <span>${firstDate} – ${lastDate}</span>
                 <span>${lastActive}</span>
+                ${indexingInfo}
                 ${branchInfo}
             </div>
             <div class="chat-manager-card-summary" data-filename="${escapeAttr(entry.fileName)}">
@@ -352,7 +376,7 @@ export function renderThreadCards() {
                 }
                 <div class="chat-manager-summary-actions">
                     <i class="chat-manager-icon-btn chat-manager-edit-summary-btn fa-fw fa-solid fa-pen" data-filename="${escapeAttr(entry.fileName)}" title="Edit summary" tabindex="0"></i>
-                    <i class="chat-manager-icon-btn chat-manager-regen-summary-btn fa-fw fa-solid fa-rotate" data-filename="${escapeAttr(entry.fileName)}" title="Generate/regenerate summary" tabindex="0"></i>
+                    <i class="${regenSummaryClasses}" data-filename="${escapeAttr(entry.fileName)}" title="${escapeAttr(summaryTitle)}" tabindex="0"></i>
                 </div>
             </div>
             <div class="chat-manager-card-filename">${escapeHtml(entry.fileName)}</div>
@@ -360,7 +384,7 @@ export function renderThreadCards() {
     }
 
     container.innerHTML = DOMPurify.sanitize(html);
-    if (status) status.textContent = `Showing ${entries.length} threads`;
+    if (status) status.textContent = withIndexingSuffix(`Showing ${entries.length} threads`);
 
     bindCardEvents(container);
 }
@@ -396,13 +420,7 @@ export function performSearch(query) {
     // Find the first page of results
     searchMoreResults(RESULTS_PAGE_SIZE);
 
-    if (status) {
-        const threadSet = new Set(searchState.results.map(r => r.item.filename));
-        const countLabel = searchState.exhausted
-            ? `Found ${searchState.totalMatches} match${searchState.totalMatches !== 1 ? 'es' : ''}`
-            : `Found ${searchState.totalMatches}+ match${searchState.totalMatches !== 1 ? 'es' : ''}`;
-        status.textContent = `${countLabel} across ${threadSet.size}${searchState.exhausted ? '' : '+'} thread${threadSet.size !== 1 ? 's' : ''} for: ${trimmed}`;
-    }
+    if (status) setSearchStatus(trimmed);
 
     if (searchState.results.length === 0) {
         container.innerHTML = '<div class="chat-manager-empty">No results found.</div>';
@@ -411,6 +429,20 @@ export function performSearch(query) {
 
     container.innerHTML = '';
     renderSearchPage(container, 0);
+}
+
+function setSearchStatus(queryText) {
+    const status = document.getElementById('chat-manager-status');
+    if (!status || !searchState) return;
+
+    const threadSet = new Set(searchState.results.map(r => r.item.filename));
+    const countLabel = searchState.exhausted
+        ? `Found ${searchState.totalMatches} match${searchState.totalMatches !== 1 ? 'es' : ''}`
+        : `Found ${searchState.totalMatches}+ match${searchState.totalMatches !== 1 ? 'es' : ''}`;
+
+    status.textContent = withIndexingSuffix(
+        `${countLabel} across ${threadSet.size}${searchState.exhausted ? '' : '+'} thread${threadSet.size !== 1 ? 's' : ''} for: ${queryText}`,
+    );
 }
 
 /**
@@ -424,7 +456,8 @@ function searchMoreResults(count) {
 
     while (searchState.position < searchable.length && found < count) {
         const msg = searchable[searchState.position];
-        const matchIndex = msg.textLower.indexOf(lowerQuery);
+        const textLower = msg.textLower || (msg.textLower = msg.text.toLowerCase());
+        const matchIndex = textLower.indexOf(lowerQuery);
         if (matchIndex !== -1) {
             searchState.results.push({ item: msg, matchIndex });
             searchState.totalMatches++;
@@ -508,13 +541,7 @@ function renderSearchPage(container, fromIndex) {
 
             // Update status
             const status = document.getElementById('chat-manager-status');
-            if (status) {
-                const threadSet = new Set(searchState.results.map(r => r.item.filename));
-                const countLabel = searchState.exhausted
-                    ? `Found ${searchState.totalMatches} match${searchState.totalMatches !== 1 ? 'es' : ''}`
-                    : `Found ${searchState.totalMatches}+ match${searchState.totalMatches !== 1 ? 'es' : ''}`;
-                status.textContent = `${countLabel} across ${threadSet.size}${searchState.exhausted ? '' : '+'} thread${threadSet.size !== 1 ? 's' : ''} for: ${searchState.query}`;
-            }
+            if (status) setSearchStatus(searchState.query);
 
             if (searchState.results.length > displayedUpTo) {
                 renderSearchPage(container, displayedUpTo);
@@ -669,6 +696,13 @@ async function handleAITitle(e) {
     const filename = btn.dataset.filename;
     if (btn.classList.contains('disabled')) return;
 
+    const index = getIndex();
+    const entry = index[filename];
+    if (!entry || !entry.isLoaded) {
+        toastr.info('This thread is still indexing. Try again in a moment.');
+        return;
+    }
+
     btn.classList.add('disabled', 'fa-spin');
     btn.classList.replace('fa-robot', 'fa-gear');
 
@@ -679,7 +713,6 @@ async function handleAITitle(e) {
         if (filename === activeChatFile) {
             title = await generateTitleForActiveChat();
         } else {
-            const index = getIndex();
             const chatData = index[filename];
             if (!chatData || !chatData.messages.length) {
                 toastr.warning('No messages in this chat.');
@@ -810,6 +843,13 @@ async function handleRegenSummary(e) {
     const filename = btn.dataset.filename;
     if (btn.classList.contains('disabled')) return;
 
+    const index = getIndex();
+    const entry = index[filename];
+    if (!entry || !entry.isLoaded) {
+        toastr.info('This thread is still indexing. Try again in a moment.');
+        return;
+    }
+
     btn.classList.add('disabled', 'fa-spin');
 
     try {
@@ -819,7 +859,6 @@ async function handleRegenSummary(e) {
         if (filename === activeChatFile) {
             summary = await generateSummaryForActiveChat();
         } else {
-            const index = getIndex();
             const chatData = index[filename];
             if (!chatData || !chatData.messages.length) {
                 toastr.warning('No messages in this chat.');
@@ -910,6 +949,7 @@ function getActiveFilename() {
         const lastText = lastMsg?.mes;
 
         for (const [filename, entry] of Object.entries(index)) {
+            if (!entry.isLoaded) continue;
             if (entry.messages.length !== context.chat.length) continue;
             const entryFirst = entry.messages[0]?.text;
             const entryLast = entry.messages[entry.messages.length - 1]?.text;
