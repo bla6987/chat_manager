@@ -691,6 +691,13 @@
     margin-bottom: 4px;
 }
 
+.chat-manager-timeline-tooltip-run {
+    font-size: 0.86em;
+    color: rgba(140, 205, 255, 0.95);
+    margin-bottom: 4px;
+    letter-spacing: 0.01em;
+}
+
 .chat-manager-timeline-tooltip-preview {
     line-height: 1.3;
     margin-bottom: 4px;
@@ -725,6 +732,12 @@
     margin-bottom: 4px;
 }
 
+.chat-manager-timeline-popup-run-tag {
+    color: rgba(140, 205, 255, 0.95);
+    font-size: 0.88em;
+    font-weight: normal;
+}
+
 .chat-manager-timeline-popup-preview {
     opacity: 0.7;
     font-size: 0.92em;
@@ -743,6 +756,7 @@
 .chat-manager-timeline-popup-entry {
     display: flex;
     align-items: center;
+    flex-wrap: wrap;
     gap: 8px;
 }
 
@@ -770,4 +784,10 @@
     flex-shrink: 0;
     font-size: 0.85em;
     padding: 2px 8px;
+}
+
+.chat-manager-timeline-popup-actions {
+    display: inline-flex;
+    gap: 6px;
+    margin-left: auto;
 }

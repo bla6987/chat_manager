@@ -13,6 +13,9 @@ const EXTENSION_PATH = '/scripts/extensions/third-party/chat_manager';
 let cyInstance = null;
 let currentMode = null; // 'mini' | 'full'
 let nodeDetailsMap = null;
+let baseElements = [];
+let baseNodeDetailsMap = null;
+let expandedRunNodeId = null;
 let tooltipEl = null;
 let popupEl = null;
 let modalInjected = false;
@@ -52,7 +55,10 @@ export function mountTimeline(container, mode) {
     const chatIndex = getIndex();
     const { elements, nodeDetails } = buildTimelineData(chatIndex, activeChatFile, mode);
 
+    baseElements = elements;
+    baseNodeDetailsMap = nodeDetails;
     nodeDetailsMap = nodeDetails;
+    expandedRunNodeId = null;
 
     if (elements.length === 0) {
         container.innerHTML = '<div class="chat-manager-empty">No loaded chats to visualize.</div>';
@@ -101,6 +107,9 @@ export function unmountTimeline() {
     }
     currentMode = null;
     nodeDetailsMap = null;
+    baseElements = [];
+    baseNodeDetailsMap = null;
+    expandedRunNodeId = null;
     removeTooltip();
     removePopup();
 }
@@ -115,13 +124,14 @@ export function updateTimelineData() {
     const chatIndex = getIndex();
     const { elements, nodeDetails } = buildTimelineData(chatIndex, activeChatFile, currentMode);
 
+    baseElements = elements;
+    baseNodeDetailsMap = nodeDetails;
     nodeDetailsMap = nodeDetails;
+    expandedRunNodeId = null;
 
     if (elements.length === 0) return;
 
-    cyInstance.elements().remove();
-    cyInstance.add(elements);
-    cyInstance.layout(getLayoutConfig(currentMode)).run();
+    applyTimelineElements(elements, { fit: true, preserveViewport: false });
 }
 
 /**
@@ -201,10 +211,10 @@ export function closeFullScreen() {
 //  Cytoscape Configuration
 // ──────────────────────────────────────────────
 
-function getLayoutConfig(mode) {
+function getLayoutConfig(mode, fit = true) {
     return {
         name: 'preset',
-        fit: true,
+        fit,
         padding: mode === 'full' ? 30 : 15,
     };
 }
@@ -287,6 +297,48 @@ function getCytoscapeStyle(mode) {
                 'border-width': 2,
             },
         },
+        // ── Collapsed repeated-run node ──
+        {
+            selector: 'node[?isCollapsedRun]',
+            style: {
+                'shape': 'round-rectangle',
+                'background-color': '#8298b1',
+                'border-width': 2,
+                'border-color': 'rgba(170,210,255,0.55)',
+                'width': isFull ? 'mapData(runLength, 2, 12, 42, 96)' : 'mapData(runLength, 2, 12, 18, 34)',
+                'height': isFull ? 20 : 12,
+                'label': isFull ? 'data(label)' : '',
+                'text-halign': 'center',
+                'text-valign': 'center',
+                'text-margin-x': 0,
+                'text-wrap': 'none',
+                'font-size': isFull ? 9 : 0,
+                'color': '#eef4ff',
+            },
+        },
+        {
+            selector: 'node[?isCollapsedRun][?hasModifiedGreeting]',
+            style: {
+                'background-color': '#bc9460',
+                'border-color': 'rgba(220,180,100,0.75)',
+            },
+        },
+        {
+            selector: 'node[?isCollapsedRun][?isActive]',
+            style: {
+                'background-color': '#5ba3e6',
+                'border-color': 'rgba(110,190,255,0.85)',
+            },
+        },
+        // ── Peek-expanded member node ──
+        {
+            selector: 'node[?isRunMember]',
+            style: {
+                'border-style': 'dashed',
+                'border-width': 2,
+                'border-color': 'rgba(120,185,255,0.55)',
+            },
+        },
         // ── Default edge ──
         {
             selector: 'edge',
@@ -298,6 +350,14 @@ function getCytoscapeStyle(mode) {
                 'arrow-scale': isFull ? 0.6 : 0.4,
                 'curve-style': 'taxi',
                 'taxi-direction': isFull ? 'rightward' : 'downward',
+            },
+        },
+        // ── Bridging edges added during temporary run expansion ──
+        {
+            selector: 'edge[?isRunBridge]',
+            style: {
+                'line-style': 'dashed',
+                'opacity': 0.9,
             },
         },
         // ── Active path edge ──
@@ -330,6 +390,7 @@ function bindCytoscapeEvents() {
     cyInstance.on('tap', (e) => {
         if (e.target === cyInstance) {
             removePopup();
+            collapseExpandedRun();
         }
     });
 
@@ -348,10 +409,19 @@ function onNodeMouseOver(e) {
         : '';
     const preview = truncateForTooltip(details?.msg || '', 100);
     const chatCount = details?.chatFiles ? details.chatFiles.length : 0;
+    const startIndex = getNodeStartIndex(data);
+    const endIndex = getNodeEndIndex(data);
+    const msgLabel = startIndex === endIndex
+        ? `msg #${startIndex}`
+        : `msgs #${startIndex}-${endIndex}`;
+    const runInfo = data.isCollapsedRun
+        ? `<div class="chat-manager-timeline-tooltip-run">Repeated x${data.runLength || 1}</div>`
+        : '';
 
     showTooltip(
         e.renderedPosition,
-        `<div class="chat-manager-timeline-tooltip-role">${role} — msg #${data.msgIndex}</div>` +
+        `<div class="chat-manager-timeline-tooltip-role">${role} — ${msgLabel}</div>` +
+        runInfo +
         (time ? `<div class="chat-manager-timeline-tooltip-time">${time}</div>` : '') +
         `<div class="chat-manager-timeline-tooltip-preview">${escapeHtml(preview)}</div>` +
         `<div class="chat-manager-timeline-tooltip-count">${chatCount} chat${chatCount !== 1 ? 's' : ''}</div>`,
@@ -365,37 +435,25 @@ function onNodeMouseOut() {
 function onNodeTap(e) {
     const node = e.target;
     const data = node.data();
+    const isExpandedMember = !!(expandedRunNodeId && data.isRunMember && data.collapsedOwnerId === expandedRunNodeId);
+
+    if (expandedRunNodeId && !isExpandedMember) {
+        collapseExpandedRun();
+    }
+
     removePopup();
 
-    const details = nodeDetailsMap ? nodeDetailsMap.get(data.id) : null;
+    const detailsFromCurrentMap = nodeDetailsMap ? nodeDetailsMap.get(data.id) : null;
+    const detailsFromBaseMap = baseNodeDetailsMap ? baseNodeDetailsMap.get(data.id) : null;
+    const details = data.isCollapsedRun ? detailsFromBaseMap : detailsFromCurrentMap;
     const chatFiles = details?.chatFiles || [];
     if (chatFiles.length === 0) return;
 
-    const activeChatFile = getActiveChatFile ? getActiveChatFile() : null;
-
-    let html = '<div class="chat-manager-timeline-popup-inner">';
-    html += `<div class="chat-manager-timeline-popup-title">Message #${data.msgIndex}</div>`;
-    html += `<div class="chat-manager-timeline-popup-preview">${escapeHtml(truncateForTooltip(details?.msg || '', 120))}</div>`;
-    html += '<div class="chat-manager-timeline-popup-list">';
-
-    const chatLengths = details?.chatLengths || {};
-    for (const file of chatFiles) {
-        const displayName = getDisplayName(file) || file;
-        const totalMsgs = chatLengths[file] || '?';
-        const isCurrentChat = file === activeChatFile;
-        const label = isCurrentChat ? 'Scroll' : 'Jump';
-        const activeTag = isCurrentChat ? ' <span class="chat-manager-timeline-popup-active">(current)</span>' : '';
-
-        html += `<div class="chat-manager-timeline-popup-entry">`;
-        html += `<span class="chat-manager-timeline-popup-name">${escapeHtml(displayName)}${activeTag}</span>`;
-        html += `<span class="chat-manager-timeline-popup-meta">${totalMsgs} msgs</span>`;
-        html += `<button class="chat-manager-btn chat-manager-timeline-jump-btn" data-filename="${escapeAttr(file)}" data-msg-index="${data.msgIndex}">${label}</button>`;
-        html += '</div>';
+    if (data.isCollapsedRun) {
+        expandRunTemporarily(data.id);
     }
 
-    html += '</div></div>';
-
-    showPopup(e.renderedPosition, html);
+    showNodePopup(e.renderedPosition, data, details);
 
     // Bind jump buttons
     if (popupEl) {
@@ -416,7 +474,7 @@ function onNodeDoubleTap(e) {
     // Prefer active chat, otherwise first
     const targetFile = chatFiles.includes(activeChatFile) ? activeChatFile : chatFiles[0];
     if (onJumpToChat) {
-        onJumpToChat(targetFile, data.msgIndex);
+        onJumpToChat(targetFile, getNodeStartIndex(data));
     }
 }
 
@@ -425,9 +483,199 @@ function handleTimelineJump(e) {
     const msgIndex = parseInt(e.currentTarget.dataset.msgIndex, 10);
     if (!filename || isNaN(msgIndex)) return;
     removePopup();
+    collapseExpandedRun();
     if (onJumpToChat) {
         onJumpToChat(filename, msgIndex);
     }
+}
+
+function showNodePopup(position, data, details) {
+    const activeChatFile = getActiveChatFile ? getActiveChatFile() : null;
+    const isCollapsedRun = !!data.isCollapsedRun;
+    const startMsgIndex = getNodeStartIndex(data);
+    const endMsgIndex = getNodeEndIndex(data);
+
+    let html = '<div class="chat-manager-timeline-popup-inner">';
+    if (isCollapsedRun && endMsgIndex > startMsgIndex) {
+        html += `<div class="chat-manager-timeline-popup-title">Messages #${startMsgIndex}-${endMsgIndex} <span class="chat-manager-timeline-popup-run-tag">(x${data.runLength || 1})</span></div>`;
+    } else {
+        html += `<div class="chat-manager-timeline-popup-title">Message #${startMsgIndex}</div>`;
+    }
+    html += `<div class="chat-manager-timeline-popup-preview">${escapeHtml(truncateForTooltip(details?.msg || '', 120))}</div>`;
+    html += '<div class="chat-manager-timeline-popup-list">';
+
+    const chatFiles = details?.chatFiles || [];
+    const chatLengths = details?.chatLengths || {};
+    for (const file of chatFiles) {
+        const displayName = getDisplayName(file) || file;
+        const totalMsgs = chatLengths[file] || '?';
+        const isCurrentChat = file === activeChatFile;
+        const activeTag = isCurrentChat ? ' <span class="chat-manager-timeline-popup-active">(current)</span>' : '';
+
+        html += '<div class="chat-manager-timeline-popup-entry">';
+        html += `<span class="chat-manager-timeline-popup-name">${escapeHtml(displayName)}${activeTag}</span>`;
+        html += `<span class="chat-manager-timeline-popup-meta">${totalMsgs} msgs</span>`;
+
+        if (isCollapsedRun && endMsgIndex > startMsgIndex) {
+            const startLabel = isCurrentChat ? 'Scroll Start' : 'Jump Start';
+            const endLabel = isCurrentChat ? 'Scroll End' : 'Jump End';
+            html += '<span class="chat-manager-timeline-popup-actions">';
+            html += `<button class="chat-manager-btn chat-manager-timeline-jump-btn" data-filename="${escapeAttr(file)}" data-msg-index="${startMsgIndex}">${startLabel}</button>`;
+            html += `<button class="chat-manager-btn chat-manager-timeline-jump-btn" data-filename="${escapeAttr(file)}" data-msg-index="${endMsgIndex}">${endLabel}</button>`;
+            html += '</span>';
+        } else {
+            const label = isCurrentChat ? 'Scroll' : 'Jump';
+            html += `<button class="chat-manager-btn chat-manager-timeline-jump-btn" data-filename="${escapeAttr(file)}" data-msg-index="${startMsgIndex}">${label}</button>`;
+        }
+
+        html += '</div>';
+    }
+
+    html += '</div></div>';
+    showPopup(position, html);
+}
+
+function applyTimelineElements(elements, { fit = false, preserveViewport = true } = {}) {
+    if (!cyInstance) return;
+
+    const previousZoom = preserveViewport ? cyInstance.zoom() : null;
+    const previousPan = preserveViewport ? { ...cyInstance.pan() } : null;
+
+    cyInstance.batch(() => {
+        cyInstance.elements().remove();
+        cyInstance.add(elements);
+    });
+
+    cyInstance.layout(getLayoutConfig(currentMode, fit)).run();
+
+    if (preserveViewport && previousZoom !== null && previousPan) {
+        cyInstance.zoom(previousZoom);
+        cyInstance.pan(previousPan);
+    }
+}
+
+function expandRunTemporarily(runNodeId) {
+    if (!cyInstance || !baseNodeDetailsMap || !Array.isArray(baseElements) || baseElements.length === 0) {
+        return false;
+    }
+    if (expandedRunNodeId === runNodeId) return true;
+
+    if (expandedRunNodeId && expandedRunNodeId !== runNodeId) {
+        collapseExpandedRun();
+    }
+
+    const runDetails = baseNodeDetailsMap.get(runNodeId);
+    if (!runDetails?.isCollapsedRun || !Array.isArray(runDetails.runMembers) || runDetails.runMembers.length < 2) {
+        return false;
+    }
+
+    const expanded = buildExpandedElementsForRun(runNodeId, runDetails);
+    if (!expanded) return false;
+
+    expandedRunNodeId = runNodeId;
+    nodeDetailsMap = expanded.nodeDetails;
+    applyTimelineElements(expanded.elements, { fit: false, preserveViewport: true });
+    return true;
+}
+
+function collapseExpandedRun() {
+    if (!expandedRunNodeId) return;
+
+    expandedRunNodeId = null;
+    nodeDetailsMap = baseNodeDetailsMap;
+
+    if (Array.isArray(baseElements) && baseElements.length > 0) {
+        applyTimelineElements(baseElements, { fit: false, preserveViewport: true });
+    }
+}
+
+function buildExpandedElementsForRun(runNodeId, runDetails) {
+    const runMembers = Array.isArray(runDetails.runMembers) ? runDetails.runMembers : [];
+    if (runMembers.length < 2) return null;
+
+    const incomingEdges = [];
+    const outgoingEdges = [];
+    const expandedElements = [];
+
+    for (const element of baseElements) {
+        if (element.group === 'nodes') {
+            if (element.data.id === runNodeId) continue;
+            expandedElements.push(element);
+            continue;
+        }
+
+        if (element.group !== 'edges') continue;
+
+        if (element.data.target === runNodeId) {
+            incomingEdges.push(element);
+            continue;
+        }
+        if (element.data.source === runNodeId) {
+            outgoingEdges.push(element);
+            continue;
+        }
+
+        expandedElements.push(element);
+    }
+
+    for (const member of runMembers) {
+        expandedElements.push(member.node);
+    }
+
+    for (let i = 0; i < runMembers.length - 1; i++) {
+        const sourceId = runMembers[i].id;
+        const targetId = runMembers[i + 1].id;
+        expandedElements.push({
+            group: 'edges',
+            data: {
+                id: `e_${sourceId}->${targetId}__run_${runNodeId}`,
+                source: sourceId,
+                target: targetId,
+                isActive: !!(runMembers[i].node.data.isActive || runMembers[i + 1].node.data.isActive),
+                isRunBridge: true,
+            },
+        });
+    }
+
+    const firstMemberId = runMembers[0].id;
+    const lastMemberId = runMembers[runMembers.length - 1].id;
+
+    for (const edge of incomingEdges) {
+        expandedElements.push({
+            group: 'edges',
+            data: {
+                id: `e_${edge.data.source}->${firstMemberId}__in_${runNodeId}`,
+                source: edge.data.source,
+                target: firstMemberId,
+                isActive: !!edge.data.isActive,
+                isRunBridge: true,
+            },
+        });
+    }
+
+    for (const edge of outgoingEdges) {
+        expandedElements.push({
+            group: 'edges',
+            data: {
+                id: `e_${lastMemberId}->${edge.data.target}__out_${runNodeId}`,
+                source: lastMemberId,
+                target: edge.data.target,
+                isActive: !!edge.data.isActive,
+                isRunBridge: true,
+            },
+        });
+    }
+
+    const expandedDetails = new Map(baseNodeDetailsMap || []);
+    expandedDetails.delete(runNodeId);
+    for (const member of runMembers) {
+        expandedDetails.set(member.id, member.detail);
+    }
+
+    return {
+        elements: expandedElements,
+        nodeDetails: expandedDetails,
+    };
 }
 
 // ──────────────────────────────────────────────
@@ -576,6 +824,20 @@ async function ensureModalInjected() {
 // ──────────────────────────────────────────────
 //  Helpers
 // ──────────────────────────────────────────────
+
+function getNodeStartIndex(data) {
+    const start = Number(data?.startMsgIndex);
+    if (Number.isFinite(start)) return start;
+
+    const msg = Number(data?.msgIndex);
+    return Number.isFinite(msg) ? msg : 0;
+}
+
+function getNodeEndIndex(data) {
+    const end = Number(data?.endMsgIndex);
+    if (Number.isFinite(end)) return end;
+    return getNodeStartIndex(data);
+}
 
 function truncateForTooltip(text, max) {
     if (!text) return '';
