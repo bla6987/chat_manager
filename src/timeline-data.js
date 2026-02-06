@@ -101,6 +101,18 @@ export function buildTimelineData(chatIndex, activeChatFile, mode = 'mini') {
 
         const groupCount = groups.size;
 
+        // At depth 0, identify the majority greeting so modified variants can be flagged
+        let majorityGroupIdx = -1;
+        if (depth === 0 && groupCount > 1) {
+            let maxCount = 0;
+            for (const [, g] of groups) {
+                if (g.items.length > maxCount) {
+                    maxCount = g.items.length;
+                    majorityGroupIdx = g.groupIdx;
+                }
+            }
+        }
+
         // Create nodes and edges for each group
         for (const [, group] of groups) {
             const nodeId = `d${depth}_g${group.groupIdx}`;
@@ -116,6 +128,7 @@ export function buildTimelineData(chatIndex, activeChatFile, mode = 'mini') {
             }
 
             const isActive = activeChatFile && chatFiles.includes(activeChatFile);
+            const isModifiedRoot = depth === 0 && groupCount > 1 && group.groupIdx !== majorityGroupIdx;
 
             // Pre-compute position: center groups within each depth row
             const offset = (group.groupIdx - (groupCount - 1) / 2) * spacingX;
@@ -133,6 +146,7 @@ export function buildTimelineData(chatIndex, activeChatFile, mode = 'mini') {
                     isUser: representative.role === 'user',
                     isActive: !!isActive,
                     isRoot: depth === 0,
+                    isModifiedRoot: !!isModifiedRoot,
                     msgIndex: depth,
                     sharedCount: chatFiles.length,
                 },

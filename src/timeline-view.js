@@ -249,6 +249,14 @@ function getCytoscapeStyle(mode) {
                 'label': isFull ? 'data(label)' : '',
             },
         },
+        // ── Modified root node (user-edited greeting) ──
+        {
+            selector: 'node[?isModifiedRoot]',
+            style: {
+                'background-color': '#c49a5c',
+                'border-color': 'rgba(220,180,100,0.6)',
+            },
+        },
         // ── User message node ──
         {
             selector: 'node[?isUser]',
