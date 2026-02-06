@@ -246,7 +246,7 @@ function getCytoscapeStyle(mode) {
                 'border-color': 'rgba(100,180,255,0.5)',
                 'width': nodeSize + 4,
                 'height': nodeSize + 4,
-                'label': isFull ? 'Start' : '',
+                'label': isFull ? 'data(label)' : '',
             },
         },
         // ── User message node ──
@@ -332,8 +332,6 @@ function bindCytoscapeEvents() {
 function onNodeMouseOver(e) {
     const node = e.target;
     const data = node.data();
-    if (data.isRoot) return;
-
     const details = nodeDetailsMap ? nodeDetailsMap.get(data.id) : null;
     const { moment } = SillyTavern.libs;
     const role = data.isUser ? 'User' : 'Character';
@@ -359,8 +357,6 @@ function onNodeMouseOut() {
 function onNodeTap(e) {
     const node = e.target;
     const data = node.data();
-    if (data.isRoot) return;
-
     removePopup();
 
     const details = nodeDetailsMap ? nodeDetailsMap.get(data.id) : null;
@@ -403,8 +399,6 @@ function onNodeTap(e) {
 
 function onNodeDoubleTap(e) {
     const data = e.target.data();
-    if (data.isRoot) return;
-
     const details = nodeDetailsMap ? nodeDetailsMap.get(data.id) : null;
     const chatFiles = details?.chatFiles || [];
     if (chatFiles.length === 0) return;

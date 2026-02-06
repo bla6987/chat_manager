@@ -5,7 +5,7 @@
  * 1. Filter chatIndex to loaded entries with messages
  * 2. Transpose: build depthBuckets[depth] = [{fileName, message}]
  * 3. Group identical messages at each depth (by normalized text)
- * 4. Create one Cytoscape node per group + one virtual root
+ * 4. Create one Cytoscape node per group (depth-0 nodes are graph roots)
  * 5. Track previousNodeId[fileName] to create edges (parent→child per file)
  * 6. Deduplicate edges with same source+target
  * 7. Mark active chat path on edges/nodes
@@ -83,37 +83,6 @@ export function buildTimelineData(chatIndex, activeChatFile, mode = 'mini') {
     const activeNodeIds = new Set();
     const activeEdgeIds = new Set();
 
-    // Virtual root node
-    const rootPosition = mode === 'full'
-        ? { x: -spacingX, y: 0 }
-        : { x: 0, y: -spacingY };
-
-    nodes.push({
-        group: 'nodes',
-        data: {
-            id: 'root',
-            label: 'Start',
-            chat_depth: -1,
-            isUser: false,
-            isActive: !!activeChatFile,
-            isRoot: true,
-            sharedCount: loadedEntries.length,
-        },
-        position: rootPosition,
-    });
-
-    nodeDetails.set('root', {
-        chatFiles: loadedEntries.map(e => e.fileName),
-        chatLengths: {},
-        msg: '',
-        timestamp: null,
-    });
-
-    // Set root as previous for all files
-    for (const { fileName } of loadedEntries) {
-        previousNodeId[fileName] = 'root';
-    }
-
     for (let depth = 0; depth <= effectiveMaxDepth; depth++) {
         const bucket = depthBuckets[depth];
         if (!bucket || bucket.length === 0) continue;
@@ -163,7 +132,7 @@ export function buildTimelineData(chatIndex, activeChatFile, mode = 'mini') {
                     chat_depth: depth,
                     isUser: representative.role === 'user',
                     isActive: !!isActive,
-                    isRoot: false,
+                    isRoot: depth === 0,
                     msgIndex: depth,
                     sharedCount: chatFiles.length,
                 },
@@ -216,11 +185,6 @@ export function buildTimelineData(chatIndex, activeChatFile, mode = 'mini') {
                 previousNodeId[item.fileName] = nodeId;
             }
         }
-    }
-
-    // Mark root as active if the active chat is present
-    if (activeChatFile && activeNodeIds.size > 0) {
-        activeNodeIds.add('root');
     }
 
     return {
