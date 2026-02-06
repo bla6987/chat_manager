@@ -227,13 +227,13 @@ function getCytoscapeStyle(mode) {
     const activeEdgeWidth = isFull ? 3.5 : 2.5;
 
     return [
-        // ── Default node ──
+        // ── Default node (leaf / out-degree 0) ──
         {
             selector: 'node',
             style: {
                 'width': nodeSize,
                 'height': nodeSize,
-                'background-color': '#b0b8c8',
+                'background-color': '#6b7a8d',
                 'border-width': 1,
                 'border-color': 'rgba(255,255,255,0.15)',
                 'label': isFull ? 'data(label)' : '',
@@ -244,8 +244,25 @@ function getCytoscapeStyle(mode) {
                 'text-margin-x': 8,
                 'text-max-width': 120,
                 'text-wrap': 'ellipsis',
-                'shape': isFull ? 'ellipse' : 'ellipse',
+                'shape': 'ellipse',
             },
+        },
+        // ── Heatmap tiers by out-degree ──
+        {
+            selector: 'node[outDegree = 1]',
+            style: { 'background-color': '#7e9bb5' },
+        },
+        {
+            selector: 'node[outDegree = 2]',
+            style: { 'background-color': '#7fb8a4' },
+        },
+        {
+            selector: 'node[outDegree = 3]',
+            style: { 'background-color': '#c4a85a' },
+        },
+        {
+            selector: 'node[outDegree >= 4]',
+            style: { 'background-color': '#d4735e' },
         },
         // ── Root node ──
         {
@@ -265,20 +282,6 @@ function getCytoscapeStyle(mode) {
             style: {
                 'background-color': '#c49a5c',
                 'border-color': 'rgba(220,180,100,0.6)',
-            },
-        },
-        // ── User message node ──
-        {
-            selector: 'node[?isUser]',
-            style: {
-                'background-color': '#7badd8',
-            },
-        },
-        // ── Character/assistant node ──
-        {
-            selector: 'node[role = "assistant"]',
-            style: {
-                'background-color': '#c8ccd4',
             },
         },
         // ── Active path node ──
@@ -302,7 +305,6 @@ function getCytoscapeStyle(mode) {
             selector: 'node[?isCollapsedRun]',
             style: {
                 'shape': 'round-rectangle',
-                'background-color': '#8298b1',
                 'border-width': 2,
                 'border-color': 'rgba(170,210,255,0.55)',
                 'width': isFull ? 'mapData(runLength, 2, 12, 42, 96)' : 'mapData(runLength, 2, 12, 18, 34)',
@@ -417,11 +419,15 @@ function onNodeMouseOver(e) {
     const runInfo = data.isCollapsedRun
         ? `<div class="chat-manager-timeline-tooltip-run">Repeated x${data.runLength || 1}</div>`
         : '';
+    const branchInfo = (data.outDegree || 0) > 1
+        ? `<div class="chat-manager-timeline-tooltip-branches">${data.outDegree} branches</div>`
+        : '';
 
     showTooltip(
         e.renderedPosition,
         `<div class="chat-manager-timeline-tooltip-role">${role} — ${msgLabel}</div>` +
         runInfo +
+        branchInfo +
         (time ? `<div class="chat-manager-timeline-tooltip-time">${time}</div>` : '') +
         `<div class="chat-manager-timeline-tooltip-preview">${escapeHtml(preview)}</div>` +
         `<div class="chat-manager-timeline-tooltip-count">${chatCount} chat${chatCount !== 1 ? 's' : ''}</div>`,
@@ -664,6 +670,20 @@ function buildExpandedElementsForRun(runNodeId, runDetails) {
                 isRunBridge: true,
             },
         });
+    }
+
+    // Compute out-degree for expanded member nodes
+    const expandedOutDegree = new Map();
+    for (const el of expandedElements) {
+        if (el.group === 'edges') {
+            const src = el.data.source;
+            expandedOutDegree.set(src, (expandedOutDegree.get(src) || 0) + 1);
+        }
+    }
+    for (const el of expandedElements) {
+        if (el.group === 'nodes') {
+            el.data.outDegree = expandedOutDegree.get(el.data.id) || 0;
+        }
     }
 
     const expandedDetails = new Map(baseNodeDetailsMap || []);

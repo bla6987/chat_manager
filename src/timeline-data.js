@@ -214,6 +214,16 @@ export function buildTimelineData(chatIndex, activeChatFile, mode = 'mini') {
 
     const collapsed = collapseRepeatedRuns(rawNodes, rawEdges, nodeDetails);
 
+    // ── Step 5: Compute out-degree per node from post-collapse edges ──
+    const outDegreeMap = new Map();
+    for (const edge of collapsed.edges) {
+        const src = edge.data.source;
+        outDegreeMap.set(src, (outDegreeMap.get(src) || 0) + 1);
+    }
+    for (const node of collapsed.nodes) {
+        node.data.outDegree = outDegreeMap.get(node.data.id) || 0;
+    }
+
     return {
         elements: [...collapsed.nodes, ...collapsed.edges],
         nodeDetails: collapsed.nodeDetails,
