@@ -231,10 +231,11 @@ function hasPendingHydration() {
     return hydrationQueue.length > 0 || entryHydrationPromises.size > 0;
 }
 
-function getBuildStateResponse(changed = false) {
+function getBuildStateResponse(changed = false, buildInProgress = false) {
     return {
         index: chatIndex,
         changed,
+        buildInProgress,
         hydrationStarted: hasPendingHydration() || hydrationInProgress,
         isComplete: isHydrationComplete(),
     };
@@ -347,7 +348,13 @@ async function hydrateEntry(fileName, sessionId) {
             if (entry.isLoaded) return true;
 
             const expectedTimestamp = entry.lastModified;
-            const chatData = await fetchChatContent(fileName);
+            let chatData;
+            try {
+                chatData = await fetchChatContent(fileName);
+            } catch (err) {
+                console.error(`[${MODULE_NAME}] Failed to hydrate ${fileName}:`, err);
+                return false;
+            }
 
             if (sessionId !== hydrationSessionId) return false;
 
@@ -423,19 +430,17 @@ function startHydrationLoop() {
  * Metadata phase returns quickly; full chat hydration runs in the background.
  * @param {Function} [onProgress] - Called with (completed, total) for progress tracking
  * @param {Function} [onMetadataReady] - Called once metadata is available for immediate UI rendering
- * @returns {Promise<{ index: Object, changed: boolean, hydrationStarted: boolean, isComplete: boolean }>}
+ * @returns {Promise<{ index: Object, changed: boolean, buildInProgress: boolean, hydrationStarted: boolean, isComplete: boolean }>}
  */
 export async function buildIndex(onProgress, onMetadataReady) {
-    if (onProgress) {
-        progressCallback = onProgress;
-    }
+    progressCallback = onProgress || null;
 
     if (indexBuildInProgress) {
         if (Object.keys(chatIndex).length > 0) {
             notifyMetadataReady(onMetadataReady, false);
         }
         emitHydrationUpdate();
-        return getBuildStateResponse(false);
+        return getBuildStateResponse(false, true);
     }
 
     indexBuildInProgress = true;

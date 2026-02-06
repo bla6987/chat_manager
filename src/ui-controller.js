@@ -372,6 +372,7 @@ export async function refreshPanel() {
             if (content) {
                 content.innerHTML = '<div class="chat-manager-loading"><div class="chat-manager-spinner"></div> Building graph\u2026</div>';
                 requestAnimationFrame(() => {
+                    if (!timelineActive) return;
                     if (content) mountIcicle(content, 'mini');
                 });
             }
@@ -983,6 +984,9 @@ async function handleAITitle(e) {
             }
             toastr.success('Title generated!');
         }
+    } catch (err) {
+        console.error(`[${MODULE_NAME}] AI title generation failed:`, err);
+        toastr.error('Failed to generate title.');
     } finally {
         btn.classList.remove('disabled', 'fa-spin');
         btn.classList.replace('fa-gear', 'fa-robot');
@@ -1143,6 +1147,9 @@ async function handleRegenSummary(e) {
             }
             toastr.success('Summary generated!');
         }
+    } catch (err) {
+        console.error(`[${MODULE_NAME}] AI summary generation failed:`, err);
+        toastr.error('Failed to generate summary.');
     } finally {
         btn.classList.remove('disabled', 'fa-spin');
     }

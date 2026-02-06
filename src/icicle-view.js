@@ -417,18 +417,24 @@ function viewAnimFrame(timestamp) {
     const t = Math.min(elapsed / ANIM_DURATION, 1);
     const ease = t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;
 
-    viewX = viewAnimFrom.x + (viewAnimTo.x - viewAnimFrom.x) * ease;
-    viewY0 = viewAnimFrom.y0 + (viewAnimTo.y0 - viewAnimFrom.y0) * ease;
-    viewY1 = viewAnimFrom.y1 + (viewAnimTo.y1 - viewAnimFrom.y1) * ease;
+    if (t >= 1) {
+        // Snap to exact targets to avoid IEEE 754 imprecision
+        viewX = viewAnimTo.x;
+        viewY0 = viewAnimTo.y0;
+        viewY1 = viewAnimTo.y1;
+        viewAnimId = null;
+        viewAnimFrom = null;
+        viewAnimTo = null;
+    } else {
+        viewX = viewAnimFrom.x + (viewAnimTo.x - viewAnimFrom.x) * ease;
+        viewY0 = viewAnimFrom.y0 + (viewAnimTo.y0 - viewAnimFrom.y0) * ease;
+        viewY1 = viewAnimFrom.y1 + (viewAnimTo.y1 - viewAnimFrom.y1) * ease;
+    }
 
     render();
 
     if (t < 1) {
         viewAnimId = requestAnimationFrame(viewAnimFrame);
-    } else {
-        viewAnimId = null;
-        viewAnimFrom = null;
-        viewAnimTo = null;
     }
 }
 
