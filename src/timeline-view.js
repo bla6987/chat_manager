@@ -83,6 +83,9 @@ export function mountTimeline(container, mode) {
         wheelSensitivity: 0.3,
         boxSelectionEnabled: false,
         autounselectify: true,
+        textureOnViewport: true,
+        hideEdgesOnViewport: true,
+        pixelRatio: 1,
     });
 
     // Create tooltip element
@@ -243,7 +246,7 @@ function getCytoscapeStyle(mode) {
                 'text-valign': 'center',
                 'text-margin-x': 8,
                 'text-max-width': 120,
-                'text-wrap': 'ellipsis',
+                'text-wrap': 'none',
                 'shape': 'ellipse',
             },
         },
@@ -350,8 +353,7 @@ function getCytoscapeStyle(mode) {
                 'target-arrow-color': 'rgba(180,180,200,0.3)',
                 'target-arrow-shape': 'triangle',
                 'arrow-scale': isFull ? 0.6 : 0.4,
-                'curve-style': 'taxi',
-                'taxi-direction': isFull ? 'rightward' : 'downward',
+                'curve-style': isFull ? 'bezier' : 'straight',
             },
         },
         // ── Bridging edges added during temporary run expansion ──
