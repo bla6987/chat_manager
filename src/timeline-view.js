@@ -249,9 +249,9 @@ function getCytoscapeStyle(mode) {
                 'label': isFull ? 'data(label)' : '',
             },
         },
-        // ── Modified root node (user-edited greeting) ──
+        // ── Modified greeting node (user-edited character greeting) ──
         {
-            selector: 'node[?isModifiedRoot]',
+            selector: 'node[?hasModifiedGreeting]',
             style: {
                 'background-color': '#c49a5c',
                 'border-color': 'rgba(220,180,100,0.6)',

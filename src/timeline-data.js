@@ -4,11 +4,13 @@
  * Algorithm:
  * 1. Filter chatIndex to loaded entries with messages
  * 2. Transpose: build depthBuckets[depth] = [{fileName, message}]
- * 3. Group identical messages at each depth (by normalized text)
- * 4. Create one Cytoscape node per group (depth-0 nodes are graph roots)
- * 5. Track previousNodeId[fileName] to create edges (parent→child per file)
- * 6. Deduplicate edges with same source+target
- * 7. Mark active chat path on edges/nodes
+ * 3. Pre-scan depth 0 to detect modified greetings (not rendered as nodes)
+ * 4. Group identical messages at each depth starting from depth 1 (first user message)
+ * 5. Create one Cytoscape node per group (depth-1 nodes are graph roots)
+ * 6. Track previousNodeId[fileName] to create edges (parent→child per file)
+ * 7. Deduplicate edges with same source+target
+ * 8. Mark active chat path on edges/nodes
+ * 9. Propagate hasModifiedGreeting flag to root nodes
  */
 
 /**
@@ -70,7 +72,36 @@ export function buildTimelineData(chatIndex, activeChatFile, mode = 'mini') {
     const spacingX = mode === 'full' ? 60 : 25;
     const spacingY = mode === 'full' ? 30 : 15;
 
-    // ── Step 2: Group by normalized text at each depth ──
+    // ── Step 2: Pre-scan depth 0 to detect modified greetings ──
+    // Depth 0 (character greeting) is NOT rendered as a node; instead we
+    // detect which chats have a modified greeting and propagate that flag
+    // to the first visible node (depth 1).
+    const modifiedGreetingFiles = new Set();
+    const greetingBucket = depthBuckets[0];
+    if (greetingBucket && greetingBucket.length > 1) {
+        // Find the majority greeting text
+        const greetingCounts = new Map(); // normalizedText → count
+        for (const item of greetingBucket) {
+            const count = greetingCounts.get(item.normalizedText) || 0;
+            greetingCounts.set(item.normalizedText, count + 1);
+        }
+        let majorityText = '';
+        let majorityCount = 0;
+        for (const [text, count] of greetingCounts) {
+            if (count > majorityCount) {
+                majorityCount = count;
+                majorityText = text;
+            }
+        }
+        // Flag files whose greeting differs from the majority
+        for (const item of greetingBucket) {
+            if (item.normalizedText !== majorityText) {
+                modifiedGreetingFiles.add(item.fileName);
+            }
+        }
+    }
+
+    // ── Step 3: Group by normalized text at each depth, starting from depth 1 ──
     // Each group becomes one node. nodeId = `d${depth}_g${groupIdx}`
     const nodes = [];
     const edges = [];
@@ -83,7 +114,7 @@ export function buildTimelineData(chatIndex, activeChatFile, mode = 'mini') {
     const activeNodeIds = new Set();
     const activeEdgeIds = new Set();
 
-    for (let depth = 0; depth <= effectiveMaxDepth; depth++) {
+    for (let depth = 1; depth <= effectiveMaxDepth; depth++) {
         const bucket = depthBuckets[depth];
         if (!bucket || bucket.length === 0) continue;
 
@@ -100,18 +131,7 @@ export function buildTimelineData(chatIndex, activeChatFile, mode = 'mini') {
         }
 
         const groupCount = groups.size;
-
-        // At depth 0, identify the majority greeting so modified variants can be flagged
-        let majorityGroupIdx = -1;
-        if (depth === 0 && groupCount > 1) {
-            let maxCount = 0;
-            for (const [, g] of groups) {
-                if (g.items.length > maxCount) {
-                    maxCount = g.items.length;
-                    majorityGroupIdx = g.groupIdx;
-                }
-            }
-        }
+        const isRootDepth = depth === 1;
 
         // Create nodes and edges for each group
         for (const [, group] of groups) {
@@ -128,13 +148,17 @@ export function buildTimelineData(chatIndex, activeChatFile, mode = 'mini') {
             }
 
             const isActive = activeChatFile && chatFiles.includes(activeChatFile);
-            const isModifiedRoot = depth === 0 && groupCount > 1 && group.groupIdx !== majorityGroupIdx;
+
+            // Check if any chat in this group had a modified greeting
+            const hasModifiedGreeting = isRootDepth && chatFiles.some(f => modifiedGreetingFiles.has(f));
 
             // Pre-compute position: center groups within each depth row
+            // Use (depth - 1) for layout so the first visible row starts at origin
+            const layoutDepth = depth - 1;
             const offset = (group.groupIdx - (groupCount - 1) / 2) * spacingX;
             const position = mode === 'full'
-                ? { x: depth * spacingX, y: offset }
-                : { x: offset, y: depth * spacingY };
+                ? { x: layoutDepth * spacingX, y: offset }
+                : { x: offset, y: layoutDepth * spacingY };
 
             nodes.push({
                 group: 'nodes',
@@ -145,8 +169,8 @@ export function buildTimelineData(chatIndex, activeChatFile, mode = 'mini') {
                     chat_depth: depth,
                     isUser: representative.role === 'user',
                     isActive: !!isActive,
-                    isRoot: depth === 0,
-                    isModifiedRoot: !!isModifiedRoot,
+                    isRoot: isRootDepth,
+                    hasModifiedGreeting: !!hasModifiedGreeting,
                     msgIndex: depth,
                     sharedCount: chatFiles.length,
                 },
