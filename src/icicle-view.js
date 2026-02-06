@@ -21,6 +21,10 @@ const GAP = 1;               // pixel gap between sibling blocks
 const MIN_LABEL_HEIGHT = 14; // minimum block height to show a label
 const MIN_BLOCK_HEIGHT = 2;  // minimum rendered block height
 const ANIM_DURATION = 300;   // zoom animation ms
+const MIN_VIEW_SPAN = 0.001; // prevents infinite zoom
+const MAX_VIEW_SPAN = 1.0;   // full view
+const ZOOM_FACTOR = 0.1;     // fraction of span per wheel tick
+const DRAG_THRESHOLD = 4;    // pixels before drag activates
 
 // ── Module state ──
 let canvas = null;
@@ -35,24 +39,36 @@ let flatNodes = [];
 let maxDepth = 0;
 let loadedCount = 0;
 
-// Viewport
-let scrollX = 0;             // horizontal scroll in pixels
+// Viewport (free navigation model)
+let viewX = 0;               // horizontal offset in world pixels
+let viewY0 = 0;              // visible top in [0,1] normalized Y space
+let viewY1 = 1;              // visible bottom in [0,1]
 let canvasWidth = 0;
 let canvasHeight = 0;
 let dpr = 1;
 
-// Zoom stack for click-to-zoom
-let zoomStack = [];           // stack of { node, prevY0, prevY1 }
-let zoomRoot = null;          // current zoom root node (null = full view)
+// Zoom stack for click-to-zoom (navigation bookmarks for breadcrumbs)
+let zoomStack = [];
+let zoomRoot = null;
 
-// Animation
-let animationId = null;
-let animStartTime = 0;
-let animFrom = null;          // { y0Map, y1Map } snapshot before zoom
-let animTo = null;            // { y0Map, y1Map } snapshot after zoom
+// Viewport animation
+let viewAnimId = null;
+let viewAnimFrom = null;     // { x, y0, y1 }
+let viewAnimTo = null;       // { x, y0, y1 }
+let viewAnimStart = 0;
+
+// Drag state
+let isDragging = false;
+let dragStartX = 0;
+let dragStartY = 0;
+let dragStartViewX = 0;
+let dragStartViewY0 = 0;
+let dragStartViewY1 = 0;
+let wasDragging = false;
 
 // Interaction state
 let hoveredNode = null;
+let resetBtnEl = null;
 let tooltipEl = null;
 let popupEl = null;
 let breadcrumbEl = null;
@@ -92,9 +108,13 @@ export function mountIcicle(containerEl, mode) {
     flatNodes = data.flatNodes;
     maxDepth = data.maxDepth;
     loadedCount = data.loadedCount;
-    scrollX = 0;
+    viewX = 0;
+    viewY0 = 0;
+    viewY1 = 1;
     zoomStack = [];
     zoomRoot = null;
+    isDragging = false;
+    wasDragging = false;
 
     if (!icicleRoot || flatNodes.length === 0) {
         container.innerHTML = '<div class="chat-manager-empty">No loaded chats to visualize.</div>';
@@ -110,6 +130,17 @@ export function mountIcicle(containerEl, mode) {
     breadcrumbEl = document.createElement('div');
     breadcrumbEl.className = 'chat-manager-icicle-breadcrumbs';
     container.appendChild(breadcrumbEl);
+
+    // Create reset button
+    resetBtnEl = document.createElement('button');
+    resetBtnEl.className = 'chat-manager-btn chat-manager-icicle-reset-btn';
+    resetBtnEl.textContent = 'Reset';
+    resetBtnEl.style.display = 'none';
+    resetBtnEl.addEventListener('click', (e) => {
+        e.stopPropagation();
+        zoomToRoot();
+    });
+    container.appendChild(resetBtnEl);
 
     // Create tooltip
     createTooltip();
@@ -130,10 +161,7 @@ export function mountIcicle(containerEl, mode) {
 }
 
 export function unmountIcicle() {
-    if (animationId) {
-        cancelAnimationFrame(animationId);
-        animationId = null;
-    }
+    cancelViewportAnim();
     unbindEvents();
     removeTooltip();
     removePopup();
@@ -147,6 +175,10 @@ export function unmountIcicle() {
         breadcrumbEl.remove();
         breadcrumbEl = null;
     }
+    if (resetBtnEl) {
+        resetBtnEl.remove();
+        resetBtnEl = null;
+    }
 
     container = null;
     currentMode = null;
@@ -154,6 +186,11 @@ export function unmountIcicle() {
     flatNodes = [];
     zoomStack = [];
     zoomRoot = null;
+    viewX = 0;
+    viewY0 = 0;
+    viewY1 = 1;
+    isDragging = false;
+    wasDragging = false;
     hoveredNode = null;
     mounted = false;
 }
@@ -171,11 +208,18 @@ export function updateIcicleData() {
     loadedCount = data.loadedCount;
     zoomStack = [];
     zoomRoot = null;
+    viewX = 0;
+    viewY0 = 0;
+    viewY1 = 1;
+    isDragging = false;
+    wasDragging = false;
+    cancelViewportAnim();
 
     if (!icicleRoot || flatNodes.length === 0) return;
 
     render();
     updateBreadcrumbs();
+    updateResetButton();
 }
 
 export async function expandToFullScreen() {
@@ -266,26 +310,26 @@ function render() {
 
     const activeChatFile = getActiveChatFile ? getActiveChatFile() : null;
 
-    // Determine visible depth range from scrollX
-    const minVisibleDepth = Math.floor(scrollX / COL_WIDTH);
-    const maxVisibleDepth = Math.ceil((scrollX + canvasWidth) / COL_WIDTH);
+    // Determine visible depth range from viewX
+    const minVisibleDepth = Math.floor(viewX / COL_WIDTH);
+    const maxVisibleDepth = Math.ceil((viewX + canvasWidth) / COL_WIDTH);
 
-    // Determine y range from zoom
-    const yStart = zoomRoot ? zoomRoot.y0 : 0;
-    const yEnd = zoomRoot ? zoomRoot.y1 : 1;
+    // Y range from viewport state
+    const yStart = viewY0;
+    const yEnd = viewY1;
     const ySpan = yEnd - yStart;
 
     for (const node of flatNodes) {
         if (node.depth < minVisibleDepth || node.depth > maxVisibleDepth) continue;
 
-        // Skip nodes outside zoomed y range
+        // Skip nodes outside viewport y range
         if (node.y1 <= yStart || node.y0 >= yEnd) continue;
 
-        // Map node y range to pixel coordinates within zoomed view
+        // Map node y range to pixel coordinates within viewport
         const relY0 = (Math.max(node.y0, yStart) - yStart) / ySpan;
         const relY1 = (Math.min(node.y1, yEnd) - yStart) / ySpan;
 
-        const x = node.depth * COL_WIDTH - scrollX;
+        const x = node.depth * COL_WIDTH - viewX;
         const y = relY0 * canvasHeight;
         const w = COL_WIDTH - 2;
         const h = Math.max((relY1 - relY0) * canvasHeight - GAP, MIN_BLOCK_HEIGHT);
@@ -347,39 +391,54 @@ function render() {
     ctx.font = '10px sans-serif';
     ctx.textBaseline = 'top';
     for (let d = minVisibleDepth; d <= maxVisibleDepth; d++) {
-        const x = d * COL_WIDTH - scrollX;
+        const x = d * COL_WIDTH - viewX;
         if (x >= 0 && x < canvasWidth) {
             ctx.fillText(`${d}`, x + 3, 3);
         }
     }
+
+    updateResetButton();
 }
 
-function renderAnimationFrame(timestamp) {
-    if (!animFrom || !animTo) return;
+// ── Viewport Animation ──
 
-    const elapsed = timestamp - animStartTime;
+function animateViewportTo(targetX, targetY0, targetY1) {
+    cancelViewportAnim();
+    viewAnimFrom = { x: viewX, y0: viewY0, y1: viewY1 };
+    viewAnimTo = { x: targetX, y0: targetY0, y1: targetY1 };
+    viewAnimStart = performance.now();
+    viewAnimId = requestAnimationFrame(viewAnimFrame);
+}
+
+function viewAnimFrame(timestamp) {
+    if (!viewAnimFrom || !viewAnimTo) return;
+
+    const elapsed = timestamp - viewAnimStart;
     const t = Math.min(elapsed / ANIM_DURATION, 1);
     const ease = t < 0.5 ? 2 * t * t : 1 - Math.pow(-2 * t + 2, 2) / 2;
 
-    // Interpolate y0/y1 for all nodes
-    for (const node of flatNodes) {
-        const fromY0 = animFrom.get(node);
-        const toY0 = animTo.get(node);
-        if (fromY0 !== undefined && toY0 !== undefined) {
-            node.y0 = fromY0.y0 + (toY0.y0 - fromY0.y0) * ease;
-            node.y1 = fromY0.y1 + (toY0.y1 - fromY0.y1) * ease;
-        }
-    }
+    viewX = viewAnimFrom.x + (viewAnimTo.x - viewAnimFrom.x) * ease;
+    viewY0 = viewAnimFrom.y0 + (viewAnimTo.y0 - viewAnimFrom.y0) * ease;
+    viewY1 = viewAnimFrom.y1 + (viewAnimTo.y1 - viewAnimFrom.y1) * ease;
 
     render();
 
     if (t < 1) {
-        animationId = requestAnimationFrame(renderAnimationFrame);
+        viewAnimId = requestAnimationFrame(viewAnimFrame);
     } else {
-        animationId = null;
-        animFrom = null;
-        animTo = null;
+        viewAnimId = null;
+        viewAnimFrom = null;
+        viewAnimTo = null;
     }
+}
+
+function cancelViewportAnim() {
+    if (viewAnimId) {
+        cancelAnimationFrame(viewAnimId);
+        viewAnimId = null;
+    }
+    viewAnimFrom = null;
+    viewAnimTo = null;
 }
 
 // ──────────────────────────────────────────────
@@ -387,12 +446,12 @@ function renderAnimationFrame(timestamp) {
 // ──────────────────────────────────────────────
 
 function hitTest(px, py) {
-    const yStart = zoomRoot ? zoomRoot.y0 : 0;
-    const yEnd = zoomRoot ? zoomRoot.y1 : 1;
+    const yStart = viewY0;
+    const yEnd = viewY1;
     const ySpan = yEnd - yStart;
 
     // Determine depth column
-    const depth = Math.floor((px + scrollX) / COL_WIDTH);
+    const depth = Math.floor((px + viewX) / COL_WIDTH);
 
     // Collect candidates at this depth
     for (const node of flatNodes) {
@@ -405,7 +464,7 @@ function hitTest(px, py) {
 
         const y = relY0 * canvasHeight;
         const h = Math.max((relY1 - relY0) * canvasHeight - GAP, MIN_BLOCK_HEIGHT);
-        const x = node.depth * COL_WIDTH - scrollX;
+        const x = node.depth * COL_WIDTH - viewX;
         const w = COL_WIDTH - 2;
 
         if (px >= x && px <= x + w && py >= y && py <= y + h) {
@@ -427,14 +486,18 @@ function bindEvents() {
 
     boundHandlers.onMouseMove = onMouseMove;
     boundHandlers.onMouseLeave = onMouseLeave;
+    boundHandlers.onMouseDown = onMouseDown;
+    boundHandlers.onMouseUp = onMouseUp;
     boundHandlers.onClick = onClick;
     boundHandlers.onWheel = onWheel;
     boundHandlers.onResize = onResize;
 
     canvas.addEventListener('mousemove', boundHandlers.onMouseMove);
     canvas.addEventListener('mouseleave', boundHandlers.onMouseLeave);
+    canvas.addEventListener('mousedown', boundHandlers.onMouseDown);
     canvas.addEventListener('click', boundHandlers.onClick);
     canvas.addEventListener('wheel', boundHandlers.onWheel, { passive: false });
+    window.addEventListener('mouseup', boundHandlers.onMouseUp);
     window.addEventListener('resize', boundHandlers.onResize);
 }
 
@@ -442,18 +505,67 @@ function unbindEvents() {
     if (canvas) {
         canvas.removeEventListener('mousemove', boundHandlers.onMouseMove);
         canvas.removeEventListener('mouseleave', boundHandlers.onMouseLeave);
+        canvas.removeEventListener('mousedown', boundHandlers.onMouseDown);
         canvas.removeEventListener('click', boundHandlers.onClick);
         canvas.removeEventListener('wheel', boundHandlers.onWheel);
     }
+    window.removeEventListener('mouseup', boundHandlers.onMouseUp);
     window.removeEventListener('resize', boundHandlers.onResize);
     boundHandlers = {};
 }
 
+function onMouseDown(e) {
+    if (e.button !== 0) return; // left button only
+    dragStartX = e.clientX;
+    dragStartY = e.clientY;
+    dragStartViewX = viewX;
+    dragStartViewY0 = viewY0;
+    dragStartViewY1 = viewY1;
+    isDragging = true;
+    wasDragging = false;
+    cancelViewportAnim();
+}
+
+function onMouseUp() {
+    isDragging = false;
+    if (canvas) {
+        // Restore cursor based on hover
+        canvas.style.cursor = hoveredNode ? 'pointer' : 'grab';
+    }
+}
+
 function onMouseMove(e) {
+    if (!canvas) return;
     const rect = canvas.getBoundingClientRect();
     const px = e.clientX - rect.left;
     const py = e.clientY - rect.top;
 
+    if (isDragging) {
+        const dx = e.clientX - dragStartX;
+        const dy = e.clientY - dragStartY;
+        const dist = Math.sqrt(dx * dx + dy * dy);
+
+        if (dist > DRAG_THRESHOLD) {
+            wasDragging = true;
+            hideTooltip();
+
+            // Pan horizontally: pixel movement maps 1:1
+            viewX = dragStartViewX - dx;
+
+            // Pan vertically: pixel movement maps to Y-space proportionally
+            const viewSpan = dragStartViewY1 - dragStartViewY0;
+            const yShift = -(dy / canvasHeight) * viewSpan;
+            viewY0 = dragStartViewY0 + yShift;
+            viewY1 = dragStartViewY1 + yShift;
+
+            clampViewport();
+            render();
+            canvas.style.cursor = 'grabbing';
+        }
+        return;
+    }
+
+    // Normal hover behavior
     const node = hitTest(px, py);
 
     if (node !== hoveredNode) {
@@ -465,7 +577,7 @@ function onMouseMove(e) {
             canvas.style.cursor = 'pointer';
         } else {
             hideTooltip();
-            canvas.style.cursor = 'default';
+            canvas.style.cursor = 'grab';
         }
     } else if (node && tooltipEl) {
         // Update tooltip position
@@ -475,15 +587,22 @@ function onMouseMove(e) {
 }
 
 function onMouseLeave() {
+    if (isDragging) return; // don't clear hover mid-drag
     if (hoveredNode) {
         hoveredNode = null;
         render();
     }
     hideTooltip();
-    if (canvas) canvas.style.cursor = 'default';
+    if (canvas) canvas.style.cursor = 'grab';
 }
 
 function onClick(e) {
+    // Suppress click if we just finished dragging
+    if (wasDragging) {
+        wasDragging = false;
+        return;
+    }
+
     const rect = canvas.getBoundingClientRect();
     const px = e.clientX - rect.left;
     const py = e.clientY - rect.top;
@@ -505,10 +624,76 @@ function onClick(e) {
 
 function onWheel(e) {
     e.preventDefault();
+    cancelViewportAnim();
 
-    const maxScroll = Math.max(0, (maxDepth + 1) * COL_WIDTH - canvasWidth);
-    scrollX = Math.max(0, Math.min(scrollX + e.deltaX + e.deltaY, maxScroll));
-    render();
+    if (e.ctrlKey || e.metaKey) {
+        // ── Ctrl+wheel: zoom around cursor ──
+        const rect = canvas.getBoundingClientRect();
+        const py = e.clientY - rect.top;
+
+        // Cursor position in normalized Y space
+        const viewSpan = viewY1 - viewY0;
+        const cursorY = viewY0 + (py / canvasHeight) * viewSpan;
+
+        // Scale factor: scroll up = zoom in, scroll down = zoom out
+        const delta = e.deltaY > 0 ? 1 : -1;
+        const scale = 1 + delta * ZOOM_FACTOR;
+        let newSpan = viewSpan * scale;
+        newSpan = Math.max(MIN_VIEW_SPAN, Math.min(MAX_VIEW_SPAN, newSpan));
+
+        // Keep cursor point fixed: adjust y0/y1 around cursorY
+        const ratio = (cursorY - viewY0) / viewSpan;
+        viewY0 = cursorY - ratio * newSpan;
+        viewY1 = cursorY + (1 - ratio) * newSpan;
+
+        // Free zoom clears zoom context
+        zoomStack = [];
+        zoomRoot = null;
+        updateBreadcrumbs();
+
+        clampViewport();
+        render();
+    } else if (e.shiftKey || Math.abs(e.deltaX) > Math.abs(e.deltaY)) {
+        // ── Shift+wheel or horizontal trackpad: horizontal pan ──
+        const delta = e.shiftKey ? e.deltaY : e.deltaX;
+        viewX += delta;
+        clampViewport();
+        render();
+    } else {
+        // ── Plain wheel: vertical pan ──
+        const viewSpan = viewY1 - viewY0;
+        const yShift = (e.deltaY / canvasHeight) * viewSpan;
+        viewY0 += yShift;
+        viewY1 += yShift;
+        clampViewport();
+        render();
+    }
+}
+
+function clampViewport() {
+    // Clamp horizontal
+    const maxScrollX = Math.max(0, (maxDepth + 1) * COL_WIDTH - canvasWidth);
+    viewX = Math.max(0, Math.min(viewX, maxScrollX));
+
+    // Clamp vertical: keep view within [0, 1]
+    const span = viewY1 - viewY0;
+    if (viewY0 < 0) {
+        viewY0 = 0;
+        viewY1 = span;
+    }
+    if (viewY1 > 1) {
+        viewY1 = 1;
+        viewY0 = 1 - span;
+    }
+    // Final safety clamp
+    viewY0 = Math.max(0, viewY0);
+    viewY1 = Math.min(1, viewY1);
+}
+
+function updateResetButton() {
+    if (!resetBtnEl) return;
+    const isDefault = viewX === 0 && viewY0 === 0 && viewY1 === 1;
+    resetBtnEl.style.display = isDefault ? 'none' : 'block';
 }
 
 function onResize() {
@@ -524,33 +709,15 @@ function onResize() {
 function zoomTo(node) {
     removePopup();
 
-    // Save current y positions for animation
-    const fromMap = new Map();
-    for (const n of flatNodes) {
-        fromMap.set(n, { y0: n.y0, y1: n.y1 });
-    }
-
     // Push zoom stack
     if (zoomRoot) {
         zoomStack.push(zoomRoot);
     }
     zoomRoot = node;
 
-    // Scroll to show the zoomed node's depth
-    scrollX = Math.max(0, node.depth * COL_WIDTH - 20);
-
-    // Save target positions
-    const toMap = new Map();
-    for (const n of flatNodes) {
-        toMap.set(n, { y0: n.y0, y1: n.y1 });
-    }
-
-    // Animate
-    animFrom = fromMap;
-    animTo = toMap;
-    animStartTime = performance.now();
-    if (animationId) cancelAnimationFrame(animationId);
-    animationId = requestAnimationFrame(renderAnimationFrame);
+    // Animate viewport to the node's range
+    const targetX = Math.max(0, node.depth * COL_WIDTH - 20);
+    animateViewportTo(targetX, node.y0, node.y1);
 
     updateBreadcrumbs();
 }
@@ -558,23 +725,12 @@ function zoomTo(node) {
 function zoomOut() {
     removePopup();
 
-    const fromMap = new Map();
-    for (const n of flatNodes) {
-        fromMap.set(n, { y0: n.y0, y1: n.y1 });
-    }
-
     zoomRoot = zoomStack.length > 0 ? zoomStack.pop() : null;
 
-    const toMap = new Map();
-    for (const n of flatNodes) {
-        toMap.set(n, { y0: n.y0, y1: n.y1 });
-    }
-
-    animFrom = fromMap;
-    animTo = toMap;
-    animStartTime = performance.now();
-    if (animationId) cancelAnimationFrame(animationId);
-    animationId = requestAnimationFrame(renderAnimationFrame);
+    const targetY0 = zoomRoot ? zoomRoot.y0 : 0;
+    const targetY1 = zoomRoot ? zoomRoot.y1 : 1;
+    const targetX = zoomRoot ? Math.max(0, zoomRoot.depth * COL_WIDTH - 20) : 0;
+    animateViewportTo(targetX, targetY0, targetY1);
 
     updateBreadcrumbs();
 }
@@ -582,26 +738,11 @@ function zoomOut() {
 function zoomToRoot() {
     removePopup();
 
-    const fromMap = new Map();
-    for (const n of flatNodes) {
-        fromMap.set(n, { y0: n.y0, y1: n.y1 });
-    }
-
     zoomStack = [];
     zoomRoot = null;
 
-    const toMap = new Map();
-    for (const n of flatNodes) {
-        toMap.set(n, { y0: n.y0, y1: n.y1 });
-    }
+    animateViewportTo(0, 0, 1);
 
-    animFrom = fromMap;
-    animTo = toMap;
-    animStartTime = performance.now();
-    if (animationId) cancelAnimationFrame(animationId);
-    animationId = requestAnimationFrame(renderAnimationFrame);
-
-    scrollX = 0;
     updateBreadcrumbs();
 }
 

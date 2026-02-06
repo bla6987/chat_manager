@@ -597,6 +597,22 @@
     display: block;
     width: 100%;
     height: 100%;
+    cursor: grab;
+}
+
+.chat-manager-icicle-reset-btn {
+    position: absolute;
+    bottom: 8px;
+    right: 8px;
+    z-index: 10;
+    font-size: 0.8em;
+    padding: 3px 10px;
+    opacity: 0.6;
+    transition: opacity 0.15s;
+}
+
+.chat-manager-icicle-reset-btn:hover {
+    opacity: 1;
 }
 
 .chat-manager-content.timeline-active {
