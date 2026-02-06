@@ -12,6 +12,7 @@ const EXTENSION_PATH = '/scripts/extensions/third-party/chat_manager';
 
 let cyInstance = null;
 let currentMode = null; // 'mini' | 'full'
+let nodeDetailsMap = null;
 let tooltipEl = null;
 let popupEl = null;
 let modalInjected = false;
@@ -49,7 +50,9 @@ export function mountTimeline(container, mode) {
     currentMode = mode;
     const activeChatFile = getActiveChatFile ? getActiveChatFile() : null;
     const chatIndex = getIndex();
-    const { elements } = buildTimelineData(chatIndex, activeChatFile);
+    const { elements, nodeDetails } = buildTimelineData(chatIndex, activeChatFile, mode);
+
+    nodeDetailsMap = nodeDetails;
 
     if (elements.length === 0) {
         container.innerHTML = '<div class="chat-manager-empty">No loaded chats to visualize.</div>';
@@ -97,6 +100,7 @@ export function unmountTimeline() {
         cyInstance = null;
     }
     currentMode = null;
+    nodeDetailsMap = null;
     removeTooltip();
     removePopup();
 }
@@ -109,7 +113,9 @@ export function updateTimelineData() {
 
     const activeChatFile = getActiveChatFile ? getActiveChatFile() : null;
     const chatIndex = getIndex();
-    const { elements } = buildTimelineData(chatIndex, activeChatFile);
+    const { elements, nodeDetails } = buildTimelineData(chatIndex, activeChatFile, currentMode);
+
+    nodeDetailsMap = nodeDetails;
 
     if (elements.length === 0) return;
 
@@ -138,7 +144,8 @@ export async function expandToFullScreen() {
         cyInstance = null;
     }
 
-    mountTimeline(container, 'full');
+    // Show loading state, then defer mount to next frame
+    container.innerHTML = '<div class="chat-manager-loading"><div class="chat-manager-spinner"></div> Building graph\u2026</div>';
 
     // Bind modal close
     const closeBtn = document.getElementById('chat-manager-timeline-modal-close');
@@ -156,6 +163,11 @@ export async function expandToFullScreen() {
         if (e.key === 'Escape') closeFullScreen();
     };
     document.addEventListener('keydown', modal._escHandler);
+
+    requestAnimationFrame(() => {
+        if (!modal.classList.contains('visible')) return;
+        mountTimeline(container, 'full');
+    });
 }
 
 /**
@@ -190,26 +202,10 @@ export function closeFullScreen() {
 // ──────────────────────────────────────────────
 
 function getLayoutConfig(mode) {
-    if (mode === 'full') {
-        return {
-            name: 'dagre',
-            rankDir: 'LR',
-            nodeSep: 30,
-            rankSep: 60,
-            edgeSep: 15,
-            fit: true,
-            padding: 30,
-        };
-    }
-    // mini (panel)
     return {
-        name: 'dagre',
-        rankDir: 'TB',
-        nodeSep: 15,
-        rankSep: 25,
-        edgeSep: 8,
+        name: 'preset',
         fit: true,
-        padding: 15,
+        padding: mode === 'full' ? 30 : 15,
     };
 }
 
@@ -338,13 +334,14 @@ function onNodeMouseOver(e) {
     const data = node.data();
     if (data.isRoot) return;
 
+    const details = nodeDetailsMap ? nodeDetailsMap.get(data.id) : null;
     const { moment } = SillyTavern.libs;
     const role = data.isUser ? 'User' : 'Character';
-    const time = data.timestamp && moment
-        ? moment(data.timestamp).format('MMM D, h:mm A')
+    const time = details?.timestamp && moment
+        ? moment(details.timestamp).format('MMM D, h:mm A')
         : '';
-    const preview = truncateForTooltip(data.msg || '', 100);
-    const chatCount = data.chatFiles ? data.chatFiles.length : 0;
+    const preview = truncateForTooltip(details?.msg || '', 100);
+    const chatCount = details?.chatFiles ? details.chatFiles.length : 0;
 
     showTooltip(
         e.renderedPosition,
@@ -366,19 +363,21 @@ function onNodeTap(e) {
 
     removePopup();
 
-    const chatFiles = data.chatFiles || [];
+    const details = nodeDetailsMap ? nodeDetailsMap.get(data.id) : null;
+    const chatFiles = details?.chatFiles || [];
     if (chatFiles.length === 0) return;
 
     const activeChatFile = getActiveChatFile ? getActiveChatFile() : null;
 
     let html = '<div class="chat-manager-timeline-popup-inner">';
     html += `<div class="chat-manager-timeline-popup-title">Message #${data.msgIndex}</div>`;
-    html += `<div class="chat-manager-timeline-popup-preview">${escapeHtml(truncateForTooltip(data.msg || '', 120))}</div>`;
+    html += `<div class="chat-manager-timeline-popup-preview">${escapeHtml(truncateForTooltip(details?.msg || '', 120))}</div>`;
     html += '<div class="chat-manager-timeline-popup-list">';
 
+    const chatLengths = details?.chatLengths || {};
     for (const file of chatFiles) {
         const displayName = getDisplayName(file) || file;
-        const totalMsgs = data.chatLengths[file] || '?';
+        const totalMsgs = chatLengths[file] || '?';
         const isCurrentChat = file === activeChatFile;
         const label = isCurrentChat ? 'Scroll' : 'Jump';
         const activeTag = isCurrentChat ? ' <span class="chat-manager-timeline-popup-active">(current)</span>' : '';
@@ -406,7 +405,8 @@ function onNodeDoubleTap(e) {
     const data = e.target.data();
     if (data.isRoot) return;
 
-    const chatFiles = data.chatFiles || [];
+    const details = nodeDetailsMap ? nodeDetailsMap.get(data.id) : null;
+    const chatFiles = details?.chatFiles || [];
     if (chatFiles.length === 0) return;
 
     const activeChatFile = getActiveChatFile ? getActiveChatFile() : null;

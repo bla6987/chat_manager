@@ -68,11 +68,17 @@ export function toggleTimeline() {
             getActive: getActiveFilename,
         });
 
-        // Build and mount
-        if (content) mountTimeline(content, 'mini');
-
+        // Show loading state immediately so the browser can paint before heavy work
+        if (content) content.innerHTML = '<div class="chat-manager-loading"><div class="chat-manager-spinner"></div> Building graph\u2026</div>';
         const status = document.getElementById('chat-manager-status');
-        if (status) status.textContent = 'Timeline view';
+        if (status) status.textContent = 'Loading timeline\u2026';
+
+        // Defer mount to next frame
+        requestAnimationFrame(() => {
+            if (!timelineActive) return;
+            if (content) mountTimeline(content, 'mini');
+            if (status) status.textContent = 'Timeline view';
+        });
     } else {
         // Dismiss modal if open, then tear down
         dismissTimelineModal();
@@ -360,10 +366,15 @@ export async function refreshPanel() {
     // If timeline is active, rebuild timeline data instead of thread cards
     if (timelineActive) {
         if (isTimelineMounted()) {
-            updateTimelineData();
+            requestAnimationFrame(() => updateTimelineData());
         } else {
             const content = document.getElementById('chat-manager-content');
-            if (content) mountTimeline(content, 'mini');
+            if (content) {
+                content.innerHTML = '<div class="chat-manager-loading"><div class="chat-manager-spinner"></div> Building graph\u2026</div>';
+                requestAnimationFrame(() => {
+                    if (content) mountTimeline(content, 'mini');
+                });
+            }
         }
         // Still run index build in the background
         const activeFile = getActiveFilename();
