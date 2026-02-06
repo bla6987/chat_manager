@@ -14,14 +14,20 @@ import {
     generateTitleForActiveChat, generateTitleForChat,
     generateSummaryForActiveChat, generateSummaryForChat,
 } from './ai-features.js';
+import {
+    mountTimeline, unmountTimeline, updateTimelineData,
+    isTimelineMounted, setTimelineCallbacks,
+} from './timeline-view.js';
 
 const MODULE_NAME = 'chat_manager';
 
 let panelOpen = false;
+let timelineActive = false;
 const RESULTS_PAGE_SIZE = 50;
 let hydrationSubscriptionReady = false;
 let refreshFromHydrationTimer = null;
 let refreshSearchFromHydrationTimer = null;
+let refreshTimelineFromHydrationTimer = null;
 
 /**
  * Streaming search state — allows early termination and "load more" resumption.
@@ -31,6 +37,85 @@ let searchState = null;
 
 export function resetSearchState() {
     searchState = null;
+}
+
+export function isTimelineActive() {
+    return timelineActive;
+}
+
+/**
+ * Toggle timeline view on/off. Called from index.js when the toggle button is clicked.
+ * Expects Cytoscape libs to be loaded before this is called.
+ */
+export function toggleTimeline() {
+    timelineActive = !timelineActive;
+
+    // Update toggle button active state
+    const btn = document.getElementById('chat-manager-timeline-toggle');
+    if (btn) btn.classList.toggle('active', timelineActive);
+
+    const searchWrapper = document.querySelector('.chat-manager-search-wrapper');
+    const content = document.getElementById('chat-manager-content');
+
+    if (timelineActive) {
+        // Hide search, switch content to timeline
+        if (searchWrapper) searchWrapper.style.display = 'none';
+        if (content) content.classList.add('timeline-active');
+
+        // Set up callbacks so timeline-view can navigate
+        setTimelineCallbacks({
+            onJump: handleTimelineJumpToMessage,
+            getActive: getActiveFilename,
+        });
+
+        // Build and mount
+        if (content) mountTimeline(content, 'mini');
+
+        const status = document.getElementById('chat-manager-status');
+        if (status) status.textContent = 'Timeline view';
+    } else {
+        // Dismiss modal if open, then tear down
+        dismissTimelineModal();
+        unmountTimeline();
+
+        // Restore search and content
+        if (searchWrapper) searchWrapper.style.display = '';
+        if (content) {
+            content.classList.remove('timeline-active');
+            content.innerHTML = '';
+        }
+
+        // Re-render thread cards
+        renderThreadCards();
+    }
+}
+
+/**
+ * Handle jump-to-message from the timeline popup.
+ * @param {string} filename
+ * @param {number} msgIndex
+ */
+async function handleTimelineJumpToMessage(filename, msgIndex) {
+    const activeChatFile = getActiveFilename();
+    const context = SillyTavern.getContext();
+
+    if (filename !== activeChatFile) {
+        await context.openCharacterChat(filename.replace(/\.jsonl$/i, ''));
+        // Wait for chat to render
+        await new Promise(r => setTimeout(r, 500));
+    }
+
+    if (getDisplayMode() === 'popup') {
+        closePanel();
+    }
+
+    // Scroll to message
+    const messageEl = document.querySelector(`#chat .mes[mesid="${msgIndex}"]`);
+    if (messageEl) {
+        messageEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        messageEl.classList.add('chat-manager-flash');
+        setTimeout(() => messageEl.classList.remove('chat-manager-flash'), 1500);
+    }
 }
 
 function getIndexingSuffix() {
@@ -97,11 +182,29 @@ function scheduleSearchRefresh() {
     }, 180);
 }
 
+function scheduleTimelineRefresh() {
+    if (refreshTimelineFromHydrationTimer) return;
+
+    refreshTimelineFromHydrationTimer = setTimeout(() => {
+        refreshTimelineFromHydrationTimer = null;
+        if (!panelOpen || !timelineActive) return;
+        if (isTimelineMounted()) {
+            updateTimelineData();
+        }
+    }, 600);
+}
+
 function ensureHydrationSubscription() {
     if (hydrationSubscriptionReady) return;
 
     onHydrationUpdate(() => {
         if (!panelOpen) return;
+
+        if (timelineActive) {
+            scheduleTimelineRefresh();
+            return;
+        }
+
         const query = getCurrentSearchQuery();
         if (query.length >= 2) {
             scheduleSearchRefresh();
@@ -167,6 +270,7 @@ function closeSidePanel() {
     const panel = document.getElementById('chat-manager-panel');
     if (panel) panel.classList.remove('open');
     panelOpen = false;
+    deactivateTimeline();
 }
 
 // ── Popup ──
@@ -204,6 +308,39 @@ function closePopup() {
         }
     }, 300);
     panelOpen = false;
+    deactivateTimeline();
+}
+
+/**
+ * Dismiss the full-screen modal without restoring a minimap.
+ */
+function dismissTimelineModal() {
+    const modal = document.getElementById('chat-manager-timeline-modal');
+    if (!modal) return;
+    modal.classList.remove('visible');
+    if (modal._escHandler) {
+        document.removeEventListener('keydown', modal._escHandler);
+        modal._escHandler = null;
+    }
+}
+
+/**
+ * Clean up timeline state when panel closes.
+ */
+function deactivateTimeline() {
+    if (!timelineActive) return;
+    timelineActive = false;
+    dismissTimelineModal();
+    unmountTimeline();
+
+    const btn = document.getElementById('chat-manager-timeline-toggle');
+    if (btn) btn.classList.remove('active');
+
+    const searchWrapper = document.querySelector('.chat-manager-search-wrapper');
+    if (searchWrapper) searchWrapper.style.display = '';
+
+    const content = document.getElementById('chat-manager-content');
+    if (content) content.classList.remove('timeline-active');
 }
 
 // ──────────────────────────────────────────────
@@ -217,6 +354,21 @@ export async function refreshPanel() {
     // Guard: no character selected or group chat
     if (context.characterId === undefined) {
         renderEmptyState('Select a character to manage chats.');
+        return;
+    }
+
+    // If timeline is active, rebuild timeline data instead of thread cards
+    if (timelineActive) {
+        if (isTimelineMounted()) {
+            updateTimelineData();
+        } else {
+            const content = document.getElementById('chat-manager-content');
+            if (content) mountTimeline(content, 'mini');
+        }
+        // Still run index build in the background
+        const activeFile = getActiveFilename();
+        if (activeFile) prioritizeInQueue(activeFile);
+        await buildIndex(null, null);
         return;
     }
 
