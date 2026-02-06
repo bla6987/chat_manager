@@ -21,8 +21,6 @@ let currentInjectedMode = null;
 let pendingUIInjection = null;
 let slashCommandsRegistered = false;
 let topBarInterceptorBound = false;
-let cytoscapeLibsLoaded = false;
-let cytoscapeLibsLoading = null;
 
 /**
  * Handle MESSAGE_SENT / MESSAGE_RECEIVED — lightweight update for active chat only.
@@ -437,65 +435,10 @@ function hijackTopBarButton() {
 }
 
 /**
- * Dynamically load a script by URL. Resolves when loaded, rejects on error.
- * @param {string} src
- * @returns {Promise<void>}
+ * Handle timeline toggle button click.
  */
-function loadScript(src) {
-    return new Promise((resolve, reject) => {
-        // Check if already loaded
-        if (document.querySelector(`script[src="${src}"]`)) {
-            resolve();
-            return;
-        }
-        const script = document.createElement('script');
-        script.src = src;
-        script.onload = resolve;
-        script.onerror = () => reject(new Error(`Failed to load ${src}`));
-        document.head.appendChild(script);
-    });
-}
-
-/**
- * Lazy-load Cytoscape + Dagre libraries on first timeline toggle.
- * @returns {Promise<boolean>}
- */
-async function ensureCytoscapeLibs() {
-    if (cytoscapeLibsLoaded) return true;
-    if (cytoscapeLibsLoading) return cytoscapeLibsLoading;
-
-    cytoscapeLibsLoading = (async () => {
-        try {
-            // Load cytoscape core first, then dagre, then the dagre plugin
-            await loadScript(`${EXTENSION_PATH}/lib/cytoscape.min.js`);
-            await loadScript(`${EXTENSION_PATH}/lib/dagre.js`);
-            await loadScript(`${EXTENSION_PATH}/lib/cytoscape-dagre.min.js`);
-            cytoscapeLibsLoaded = true;
-            console.log(`[${MODULE_NAME}] Cytoscape libraries loaded.`);
-            return true;
-        } catch (err) {
-            console.error(`[${MODULE_NAME}] Failed to load Cytoscape libraries:`, err);
-            if (typeof toastr !== 'undefined') {
-                toastr.error('Failed to load timeline libraries.');
-            }
-            return false;
-        }
-    })().finally(() => {
-        cytoscapeLibsLoading = null;
-    });
-
-    return cytoscapeLibsLoading;
-}
-
-/**
- * Handle timeline toggle button click — lazy-loads libs on first use.
- */
-async function handleTimelineToggle(e) {
+function handleTimelineToggle(e) {
     e.stopPropagation();
-
-    const loaded = await ensureCytoscapeLibs();
-    if (!loaded) return;
-
     toggleTimeline();
 }
 

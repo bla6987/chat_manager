@@ -15,9 +15,9 @@ import {
     generateSummaryForActiveChat, generateSummaryForChat,
 } from './ai-features.js';
 import {
-    mountTimeline, unmountTimeline, updateTimelineData,
-    isTimelineMounted, setTimelineCallbacks,
-} from './timeline-view.js';
+    mountIcicle, unmountIcicle, updateIcicleData,
+    isIcicleMounted, setIcicleCallbacks,
+} from './icicle-view.js';
 
 const MODULE_NAME = 'chat_manager';
 
@@ -62,27 +62,27 @@ export function toggleTimeline() {
         if (searchWrapper) searchWrapper.style.display = 'none';
         if (content) content.classList.add('timeline-active');
 
-        // Set up callbacks so timeline-view can navigate
-        setTimelineCallbacks({
+        // Set up callbacks so icicle-view can navigate
+        setIcicleCallbacks({
             onJump: handleTimelineJumpToMessage,
             getActive: getActiveFilename,
         });
 
         // Show loading state immediately so the browser can paint before heavy work
-        if (content) content.innerHTML = '<div class="chat-manager-loading"><div class="chat-manager-spinner"></div> Building graph\u2026</div>';
+        if (content) content.innerHTML = '<div class="chat-manager-loading"><div class="chat-manager-spinner"></div> Building chart\u2026</div>';
         const status = document.getElementById('chat-manager-status');
         if (status) status.textContent = 'Loading timeline\u2026';
 
         // Defer mount to next frame
         requestAnimationFrame(() => {
             if (!timelineActive) return;
-            if (content) mountTimeline(content, 'mini');
+            if (content) mountIcicle(content, 'mini');
             if (status) status.textContent = 'Timeline view';
         });
     } else {
         // Dismiss modal if open, then tear down
         dismissTimelineModal();
-        unmountTimeline();
+        unmountIcicle();
 
         // Restore search and content
         if (searchWrapper) searchWrapper.style.display = '';
@@ -194,8 +194,8 @@ function scheduleTimelineRefresh() {
     refreshTimelineFromHydrationTimer = setTimeout(() => {
         refreshTimelineFromHydrationTimer = null;
         if (!panelOpen || !timelineActive) return;
-        if (isTimelineMounted()) {
-            updateTimelineData();
+        if (isIcicleMounted()) {
+            updateIcicleData();
         }
     }, 600);
 }
@@ -337,7 +337,7 @@ function deactivateTimeline() {
     if (!timelineActive) return;
     timelineActive = false;
     dismissTimelineModal();
-    unmountTimeline();
+    unmountIcicle();
 
     const btn = document.getElementById('chat-manager-timeline-toggle');
     if (btn) btn.classList.remove('active');
@@ -365,14 +365,14 @@ export async function refreshPanel() {
 
     // If timeline is active, rebuild timeline data instead of thread cards
     if (timelineActive) {
-        if (isTimelineMounted()) {
-            requestAnimationFrame(() => updateTimelineData());
+        if (isIcicleMounted()) {
+            requestAnimationFrame(() => updateIcicleData());
         } else {
             const content = document.getElementById('chat-manager-content');
             if (content) {
                 content.innerHTML = '<div class="chat-manager-loading"><div class="chat-manager-spinner"></div> Building graph\u2026</div>';
                 requestAnimationFrame(() => {
-                    if (content) mountTimeline(content, 'mini');
+                    if (content) mountIcicle(content, 'mini');
                 });
             }
         }
