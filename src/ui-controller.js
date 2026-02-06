@@ -16,7 +16,7 @@ import {
 } from './ai-features.js';
 import {
     mountIcicle, unmountIcicle, updateIcicleData,
-    isIcicleMounted, setIcicleCallbacks,
+    focusMessageInIcicle, isIcicleMounted, setIcicleCallbacks,
 } from './icicle-view.js';
 
 const MODULE_NAME = 'chat_manager';
@@ -474,14 +474,28 @@ function patchBranchIndicators() {
         const label = distance !== null ? `Branched ${distance} msgs ago` : `Branched at msg #${entry.branchPoint}`;
 
         if (existing) {
+            existing.className = 'chat-manager-branch chat-manager-branch-jump';
             existing.textContent = label;
+            existing.dataset.filename = entry.fileName;
+            existing.dataset.msgIndex = String(entry.branchPoint);
+            existing.title = 'Jump to this message in graph';
+            if (existing.tagName === 'BUTTON') {
+                existing.type = 'button';
+            }
+            existing.removeEventListener('click', handleJumpToGraphMessage);
+            existing.addEventListener('click', handleJumpToGraphMessage);
             continue;
         }
 
-        const span = document.createElement('span');
-        span.className = 'chat-manager-branch';
-        span.textContent = label;
-        meta.appendChild(span);
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.className = 'chat-manager-branch chat-manager-branch-jump';
+        button.textContent = label;
+        button.dataset.filename = entry.fileName;
+        button.dataset.msgIndex = String(entry.branchPoint);
+        button.title = 'Jump to this message in graph';
+        button.addEventListener('click', handleJumpToGraphMessage);
+        meta.appendChild(button);
     }
 }
 
@@ -592,7 +606,7 @@ export function renderThreadCards() {
         const branchDistance = (entry.isLoaded && entry.branchPoint !== null && activeEntry?.isLoaded)
             ? activeEntry.messageCount - entry.branchPoint : null;
         const branchInfo = (entry.isLoaded && entry.branchPoint !== null)
-            ? `<span class="chat-manager-branch">${branchDistance !== null ? `Branched ${branchDistance} msgs ago` : `Branched at msg #${entry.branchPoint}`}</span>`
+            ? `<button type="button" class="chat-manager-branch chat-manager-branch-jump" data-filename="${escapeAttr(entry.fileName)}" data-msg-index="${entry.branchPoint}" title="Jump to this message in graph">${branchDistance !== null ? `Branched ${branchDistance} msgs ago` : `Branched at msg #${entry.branchPoint}`}</button>`
             : '';
         const indexingInfo = entry.isLoaded ? '' : '<span>Indexing...</span>';
         const aiTitleClasses = `chat-manager-icon-btn chat-manager-ai-title-btn fa-fw fa-solid fa-robot${entry.isLoaded ? '' : ' disabled'}`;
@@ -732,7 +746,8 @@ function renderSearchPage(container, fromIndex) {
     if (!searchState) return;
 
     const { DOMPurify, moment } = SillyTavern.libs;
-    const prevButtonCount = container.querySelectorAll('.chat-manager-jump-btn').length;
+    const prevChatJumpButtonCount = container.querySelectorAll('.chat-manager-jump-btn').length;
+    const prevGraphJumpButtonCount = container.querySelectorAll('.chat-manager-graph-jump-btn').length;
     const end = Math.min(fromIndex + RESULTS_PAGE_SIZE, searchState.results.length);
     let html = '';
 
@@ -755,7 +770,10 @@ function renderSearchPage(container, fromIndex) {
                 Message #${item.index} (${roleLabel}${dateStr ? ', ' + dateStr : ''})
             </div>
             <div class="chat-manager-result-excerpt">${excerpt}</div>
-            <button class="chat-manager-btn chat-manager-jump-btn" data-filename="${escapeAttr(item.filename)}" data-msg-index="${item.index}">Jump to message</button>
+            <div class="chat-manager-result-actions">
+                <button class="chat-manager-btn chat-manager-jump-btn" data-filename="${escapeAttr(item.filename)}" data-msg-index="${item.index}">Jump to message</button>
+                <button class="chat-manager-btn chat-manager-graph-jump-btn" data-filename="${escapeAttr(item.filename)}" data-msg-index="${item.index}">Jump in graph</button>
+            </div>
         </div>`;
     }
 
@@ -806,9 +824,14 @@ function renderSearchPage(container, fromIndex) {
     }
 
     // Bind jump buttons (only newly added ones)
-    const allButtons = container.querySelectorAll('.chat-manager-jump-btn');
-    for (let i = prevButtonCount; i < allButtons.length; i++) {
-        allButtons[i].addEventListener('click', handleJumpToMessage);
+    const allChatJumpButtons = container.querySelectorAll('.chat-manager-jump-btn');
+    for (let i = prevChatJumpButtonCount; i < allChatJumpButtons.length; i++) {
+        allChatJumpButtons[i].addEventListener('click', handleJumpToMessage);
+    }
+
+    const allGraphJumpButtons = container.querySelectorAll('.chat-manager-graph-jump-btn');
+    for (let i = prevGraphJumpButtonCount; i < allGraphJumpButtons.length; i++) {
+        allGraphJumpButtons[i].addEventListener('click', handleJumpToGraphMessage);
     }
 }
 
@@ -872,6 +895,11 @@ function bindCardEvents(container) {
     // Regenerate summary
     container.querySelectorAll('.chat-manager-regen-summary-btn').forEach(btn => {
         btn.addEventListener('click', handleRegenSummary);
+    });
+
+    // Branch jump
+    container.querySelectorAll('.chat-manager-branch-jump').forEach(btn => {
+        btn.addEventListener('click', handleJumpToGraphMessage);
     });
 }
 
@@ -1192,6 +1220,32 @@ async function handleJumpToMessage(e) {
         messageEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
         messageEl.classList.add('chat-manager-flash');
         setTimeout(() => messageEl.classList.remove('chat-manager-flash'), 1500);
+    }
+}
+
+async function handleJumpToGraphMessage(e) {
+    e.stopPropagation();
+
+    const filename = e.currentTarget.dataset.filename;
+    const msgIndex = parseInt(e.currentTarget.dataset.msgIndex, 10);
+    if (!filename || isNaN(msgIndex)) return;
+
+    const index = getIndex();
+    const entry = index[filename];
+
+    const isLoaded = !!entry?.isLoaded;
+    focusMessageInIcicle(filename, msgIndex, {
+        openPopup: true,
+        persistIfMissing: !isLoaded,
+    });
+
+    if (!timelineActive) {
+        toggleTimeline();
+    }
+
+    if (!isLoaded) {
+        prioritizeInQueue(filename);
+        toastr.info('Loading thread into graph…');
     }
 }
 

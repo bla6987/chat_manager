@@ -5,6 +5,7 @@
  *   mountIcicle(container, mode) / unmountIcicle()
  *   updateIcicleData() / isIcicleMounted()
  *   setIcicleCallbacks({ onJump, getActive })
+ *   focusMessageInIcicle(filename, msgIndex, options)
  *   expandToFullScreen() / closeFullScreen()
  */
 
@@ -56,6 +57,7 @@ let viewAnimId = null;
 let viewAnimFrom = null;     // { x, y0, y1 }
 let viewAnimTo = null;       // { x, y0, y1 }
 let viewAnimStart = 0;
+let viewAnimOnComplete = null;
 
 // Drag state
 let isDragging = false;
@@ -73,6 +75,7 @@ let tooltipEl = null;
 let popupEl = null;
 let breadcrumbEl = null;
 let modalInjected = false;
+let pendingFocusRequest = null;
 
 // Callbacks
 let onJumpToChat = null;
@@ -89,6 +92,28 @@ export function setIcicleCallbacks(callbacks) {
 
 export function isIcicleMounted() {
     return mounted;
+}
+
+/**
+ * Focus a specific message node in the graph (thread + message index).
+ * If not currently resolvable, stores a pending focus request and retries after mount/data refresh.
+ *
+ * @param {string} filename
+ * @param {number} msgIndex
+ * @param {{ openPopup?: boolean, persistIfMissing?: boolean }} options
+ * @returns {boolean} true if focus was applied immediately
+ */
+export function focusMessageInIcicle(filename, msgIndex, options = {}) {
+    if (!filename || !Number.isInteger(msgIndex) || msgIndex < 0) return false;
+
+    pendingFocusRequest = {
+        filename,
+        msgIndex,
+        openPopup: options.openPopup !== false,
+        persistIfMissing: options.persistIfMissing !== false,
+    };
+
+    return tryApplyPendingFocus();
 }
 
 export function mountIcicle(containerEl, mode) {
@@ -158,6 +183,7 @@ export function mountIcicle(containerEl, mode) {
     }
 
     mounted = true;
+    tryApplyPendingFocus();
 }
 
 export function unmountIcicle() {
@@ -220,6 +246,7 @@ export function updateIcicleData() {
     render();
     updateBreadcrumbs();
     updateResetButton();
+    tryApplyPendingFocus();
 }
 
 export async function expandToFullScreen() {
@@ -402,11 +429,12 @@ function render() {
 
 // ── Viewport Animation ──
 
-function animateViewportTo(targetX, targetY0, targetY1) {
+function animateViewportTo(targetX, targetY0, targetY1, onComplete = null) {
     cancelViewportAnim();
     viewAnimFrom = { x: viewX, y0: viewY0, y1: viewY1 };
     viewAnimTo = { x: targetX, y0: targetY0, y1: targetY1 };
     viewAnimStart = performance.now();
+    viewAnimOnComplete = onComplete;
     viewAnimId = requestAnimationFrame(viewAnimFrame);
 }
 
@@ -425,6 +453,11 @@ function viewAnimFrame(timestamp) {
         viewAnimId = null;
         viewAnimFrom = null;
         viewAnimTo = null;
+        const complete = viewAnimOnComplete;
+        viewAnimOnComplete = null;
+        if (typeof complete === 'function') {
+            complete();
+        }
     } else {
         viewX = viewAnimFrom.x + (viewAnimTo.x - viewAnimFrom.x) * ease;
         viewY0 = viewAnimFrom.y0 + (viewAnimTo.y0 - viewAnimFrom.y0) * ease;
@@ -445,6 +478,7 @@ function cancelViewportAnim() {
     }
     viewAnimFrom = null;
     viewAnimTo = null;
+    viewAnimOnComplete = null;
 }
 
 // ──────────────────────────────────────────────
@@ -870,6 +904,59 @@ function removeTooltip() {
 // ──────────────────────────────────────────────
 //  Popup (click navigation)
 // ──────────────────────────────────────────────
+
+function findNodeForTarget(filename, msgIndex) {
+    for (const node of flatNodes) {
+        if (node.depth !== msgIndex) continue;
+        if (!node.chatFiles.includes(filename)) continue;
+        return node;
+    }
+    return null;
+}
+
+function focusNode(node, openPopup) {
+    zoomStack = [];
+    zoomRoot = node;
+    updateBreadcrumbs();
+
+    const targetX = Math.max(0, node.depth * COL_WIDTH - 20);
+    if (openPopup) {
+        animateViewportTo(targetX, node.y0, node.y1, () => {
+            if (!mounted || !canvas) return;
+            const rect = canvas.getBoundingClientRect();
+            const ySpan = viewY1 - viewY0;
+            if (ySpan <= 0) return;
+
+            const relY0 = (node.y0 - viewY0) / ySpan;
+            const relY1 = (node.y1 - viewY0) / ySpan;
+            const centerX = Math.max(0, Math.min(canvasWidth - 1, (node.depth * COL_WIDTH - viewX) + (COL_WIDTH / 2)));
+            const centerYNorm = (relY0 + relY1) / 2;
+            const centerY = Math.max(0, Math.min(canvasHeight - 1, centerYNorm * canvasHeight));
+
+            showNodePopup(rect.left + centerX, rect.top + centerY, node);
+        });
+    } else {
+        animateViewportTo(targetX, node.y0, node.y1);
+    }
+}
+
+function tryApplyPendingFocus() {
+    if (!pendingFocusRequest) return false;
+    if (!mounted || !canvas || flatNodes.length === 0) return false;
+
+    const node = findNodeForTarget(pendingFocusRequest.filename, pendingFocusRequest.msgIndex);
+    if (!node) {
+        if (!pendingFocusRequest.persistIfMissing) {
+            pendingFocusRequest = null;
+        }
+        return false;
+    }
+
+    const { openPopup } = pendingFocusRequest;
+    pendingFocusRequest = null;
+    focusNode(node, openPopup);
+    return true;
+}
 
 function showNodePopup(clientX, clientY, node) {
     removePopup();

@@ -173,6 +173,23 @@
     font-style: italic;
 }
 
+.chat-manager-branch-jump {
+    background: none;
+    border: none;
+    padding: 0;
+    color: rgba(255, 200, 50, 0.9);
+    font-style: italic;
+    font: inherit;
+    cursor: pointer;
+    text-decoration: underline;
+    text-decoration-style: dotted;
+    text-underline-offset: 2px;
+}
+
+.chat-manager-branch-jump:hover {
+    color: rgba(255, 220, 100, 0.95);
+}
+
 /* Card Summary */
 
 .chat-manager-card-summary {
@@ -335,6 +352,22 @@
 
 .chat-manager-jump-btn {
     font-size: 0.8em;
+}
+
+.chat-manager-result-actions {
+    display: flex;
+    gap: 6px;
+    flex-wrap: wrap;
+}
+
+.chat-manager-graph-jump-btn {
+    border-color: rgba(255, 200, 50, 0.35);
+    background: rgba(255, 200, 50, 0.08);
+}
+
+.chat-manager-graph-jump-btn:hover {
+    border-color: rgba(255, 215, 120, 0.55);
+    background: rgba(255, 200, 50, 0.16);
 }
 
 /* ── Search Highlight ── */
