@@ -103,12 +103,11 @@ export function toggleTimeline() {
  */
 async function handleTimelineJumpToMessage(filename, msgIndex) {
     const activeChatFile = getActiveFilename();
-    const context = SillyTavern.getContext();
 
     if (filename !== activeChatFile) {
-        await context.openCharacterChat(filename.replace(/\.jsonl$/i, ''));
-        // Wait for chat to render
-        await new Promise(r => setTimeout(r, 500));
+        const displayName = getDisplayName(filename) || filename;
+        const switched = await safeSwitchChatFromJump(filename, displayName);
+        if (!switched) return;
     }
 
     if (getDisplayMode() === 'popup') {
@@ -1205,9 +1204,8 @@ async function handleJumpToMessage(e) {
         const result = await popup.show();
         if (result !== POPUP_RESULT.AFFIRMATIVE) return;
 
-        await context.openCharacterChat(filename.replace(/\.jsonl$/i, ''));
-        // Wait a moment for chat to render
-        await new Promise(r => setTimeout(r, 500));
+        const switched = await safeSwitchChatFromJump(filename, displayName);
+        if (!switched) return;
     }
 
     if (getDisplayMode() === 'popup') {
@@ -1252,6 +1250,35 @@ async function handleJumpToGraphMessage(e) {
 // ──────────────────────────────────────────────
 //  Helpers
 // ──────────────────────────────────────────────
+
+/**
+ * Perform a guarded chat switch for jump actions:
+ * - pre-save current chat when possible
+ * - then switch chat only if precheck passes
+ */
+async function safeSwitchChatFromJump(filename, displayName = filename) {
+    const context = SillyTavern.getContext();
+    const target = filename.replace(/\.jsonl$/i, '');
+
+    try {
+        if (typeof context.saveChat === 'function') {
+            await context.saveChat();
+            // Allow any trailing async save state to settle before switching.
+            await new Promise(r => setTimeout(r, 200));
+        } else {
+            console.warn(`[${MODULE_NAME}] context.saveChat is unavailable; switching without precheck.`);
+        }
+
+        await context.openCharacterChat(target);
+        // Wait for chat to render after switching.
+        await new Promise(r => setTimeout(r, 500));
+        return true;
+    } catch (err) {
+        console.warn(`[${MODULE_NAME}] Safe jump switch failed for "${filename}".`, err);
+        toastr.warning(`Could not safely switch to "${displayName}". Please switch manually, then jump again.`);
+        return false;
+    }
+}
 
 /**
  * Get the currently active chat filename by matching against the index.
