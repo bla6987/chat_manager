@@ -1009,7 +1009,6 @@
     .chat-manager-content {
         -webkit-overflow-scrolling: touch;
         overscroll-behavior-y: contain;
-        scroll-behavior: smooth;
     }
 
     .chat-manager-popup .chat-manager-content {
