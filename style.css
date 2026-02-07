@@ -997,3 +997,174 @@
     color: rgba(100, 180, 255, 0.85);
     font-weight: 500;
 }
+
+/* ══════════════════════════════════════════════
+   Touch Device Overrides
+   Targets devices with coarse pointers (touchscreens)
+   ══════════════════════════════════════════════ */
+
+@media (pointer: coarse) {
+    /* ── Enable momentum scrolling on content areas ── */
+
+    .chat-manager-content {
+        -webkit-overflow-scrolling: touch;
+        overscroll-behavior-y: contain;
+        scroll-behavior: smooth;
+    }
+
+    .chat-manager-popup .chat-manager-content {
+        -webkit-overflow-scrolling: touch;
+        overscroll-behavior-y: contain;
+    }
+
+    .chat-manager-timeline-popup {
+        -webkit-overflow-scrolling: touch;
+    }
+
+    .chat-manager-timeline-tooltip {
+        -webkit-overflow-scrolling: touch;
+    }
+
+    /* ── Always show hover-dependent actions on touch ── */
+
+    .chat-manager-card-actions {
+        opacity: 1;
+    }
+
+    .chat-manager-summary-actions {
+        opacity: 1;
+    }
+
+    /* ── Increase touch target sizes (minimum 44x44px) ── */
+
+    .chat-manager-icon-btn {
+        font-size: calc(var(--mainFontSize, 14px) * 1.05);
+        padding: 10px;
+        min-width: 44px;
+        min-height: 44px;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
+    }
+
+    .chat-manager-close {
+        width: 44px;
+        height: 44px;
+    }
+
+    .chat-manager-timeline-toggle {
+        width: 44px;
+        height: 44px;
+    }
+
+    .chat-manager-icicle-focus-btn {
+        width: 44px;
+        height: 44px;
+    }
+
+    .chat-manager-icicle-reset-btn {
+        padding: 8px 16px;
+        font-size: 0.9em;
+        min-height: 44px;
+    }
+
+    .chat-manager-timeline-expand-btn {
+        width: 44px;
+        height: 44px;
+    }
+
+    .chat-manager-icicle-search-nav {
+        width: 44px;
+        height: 44px;
+        font-size: 0.85em;
+    }
+
+    .chat-manager-btn {
+        min-height: 44px;
+        padding: 8px 12px;
+    }
+
+    .chat-manager-icicle-crumb {
+        padding: 8px 10px;
+        min-height: 36px;
+        display: inline-flex;
+        align-items: center;
+    }
+
+    .chat-manager-icicle-crumb-explore-exit {
+        padding: 8px 10px;
+        min-height: 36px;
+        display: inline-flex;
+        align-items: center;
+    }
+
+    .chat-manager-branch-jump {
+        padding: 6px 8px;
+        min-height: 36px;
+    }
+
+    /* ── Prevent canvas from capturing pointer events it can't handle ── */
+
+    .chat-manager-icicle-canvas {
+        cursor: default;
+        touch-action: none;
+    }
+
+    /* ── Always show reset/focus buttons on touch (no hover needed) ── */
+
+    .chat-manager-icicle-reset-btn {
+        opacity: 0.8;
+    }
+
+    .chat-manager-icicle-focus-btn {
+        opacity: 0.8;
+    }
+
+    .chat-manager-timeline-expand-btn {
+        opacity: 0.8;
+    }
+
+    /* ── Increase spacing between card actions to prevent mis-taps ── */
+
+    .chat-manager-card-actions {
+        gap: 4px;
+    }
+
+    .chat-manager-summary-actions {
+        gap: 4px;
+    }
+
+    /* ── Make display name easier to tap ── */
+
+    .chat-manager-display-name {
+        padding: 4px 0;
+        min-height: 32px;
+        display: flex;
+        align-items: center;
+    }
+}
+
+/* ══════════════════════════════════════════════
+   Responsive Layout — Small Screens
+   ══════════════════════════════════════════════ */
+
+@media (max-width: 480px) {
+    .chat-manager-panel {
+        width: 100%;
+    }
+
+    .chat-manager-timeline-popup {
+        max-width: calc(100vw - 24px);
+        min-width: 160px;
+    }
+
+    .chat-manager-timeline-tooltip {
+        max-width: calc(100vw - 24px);
+    }
+}
+
+@media (max-width: 768px) {
+    .chat-manager-panel {
+        width: min(380px, 100%);
+    }
+}

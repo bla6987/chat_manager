@@ -26,6 +26,9 @@ const MIN_VIEW_SPAN = 0.001; // prevents infinite zoom
 const MAX_VIEW_SPAN = 1.0;   // full view
 const ZOOM_FACTOR = 0.1;     // fraction of span per wheel tick
 const DRAG_THRESHOLD = 4;    // pixels before drag activates
+const TOUCH_SPEED = 1.8;    // multiplier for touch drag panning (>1 = faster)
+const INERTIA_DECAY = 0.92; // velocity decay per frame during momentum scroll
+const MIN_INERTIA_V = 0.5;  // stop inertia below this velocity (pixels)
 
 // ── Module state ──
 let canvas = null;
@@ -72,6 +75,24 @@ let dragStartViewX = 0;
 let dragStartViewY0 = 0;
 let dragStartViewY1 = 0;
 let wasDragging = false;
+
+// Touch state
+let activeTouches = new Map(); // trackingId → {x, y}
+let pinchStartDist = 0;
+let pinchStartSpan = 0;
+let pinchMidY = 0;
+let isPinching = false;
+let touchTapCandidate = null; // {x, y, time} for tap detection
+const TAP_THRESHOLD = 10;    // max movement to count as tap
+const TAP_TIMEOUT = 300;     // max ms to count as tap
+
+// Momentum / inertia state
+let inertiaAnimId = null;
+let inertiaVx = 0;           // horizontal velocity (pixels/frame)
+let inertiaVy = 0;           // vertical velocity (normalized Y-space/frame)
+let lastTouchX = 0;
+let lastTouchY = 0;
+let lastTouchTime = 0;
 
 // Interaction state
 let hoveredNode = null;
@@ -178,6 +199,7 @@ export function mountIcicle(containerEl, mode) {
     // Create canvas
     canvas = document.createElement('canvas');
     canvas.className = 'chat-manager-icicle-canvas';
+    canvas.style.touchAction = 'none'; // prevent browser touch gestures on canvas
     container.appendChild(canvas);
 
     // Create breadcrumb bar
@@ -233,6 +255,7 @@ export function mountIcicle(containerEl, mode) {
 
 export function unmountIcicle() {
     cancelViewportAnim();
+    cancelInertia();
     unbindEvents();
     removeTooltip();
     removePopup();
@@ -270,6 +293,11 @@ export function unmountIcicle() {
     isDragging = false;
     wasDragging = false;
     hoveredNode = null;
+    activeTouches = new Map();
+    isPinching = false;
+    touchTapCandidate = null;
+    inertiaVx = 0;
+    inertiaVy = 0;
     mounted = false;
 }
 
@@ -441,6 +469,16 @@ function executeSearch(raw) {
     }
 
     searchMatches = flatNodes.filter(n => n.normalizedText && n.normalizedText.toLowerCase().includes(query));
+
+    // Sort by recency (newest messages first)
+    searchMatches.sort((a, b) => {
+        const aRaw = a.representative && a.representative.timestamp;
+        const bRaw = b.representative && b.representative.timestamp;
+        const aTime = aRaw ? new Date(aRaw).getTime() : 0;
+        const bTime = bRaw ? new Date(bRaw).getTime() : 0;
+        return (Number.isFinite(bTime) ? bTime : 0) - (Number.isFinite(aTime) ? aTime : 0);
+    });
+
     searchMatchSet = new Set(searchMatches);
 
     if (searchMatches.length > 0) {
@@ -769,12 +807,18 @@ function bindEvents() {
     boundHandlers.onClick = onClick;
     boundHandlers.onWheel = onWheel;
     boundHandlers.onResize = onResize;
+    boundHandlers.onTouchStart = onTouchStart;
+    boundHandlers.onTouchMove = onTouchMove;
+    boundHandlers.onTouchEnd = onTouchEnd;
 
     canvas.addEventListener('mousemove', boundHandlers.onMouseMove);
     canvas.addEventListener('mouseleave', boundHandlers.onMouseLeave);
     canvas.addEventListener('mousedown', boundHandlers.onMouseDown);
     canvas.addEventListener('click', boundHandlers.onClick);
     canvas.addEventListener('wheel', boundHandlers.onWheel, { passive: false });
+    canvas.addEventListener('touchstart', boundHandlers.onTouchStart, { passive: false });
+    canvas.addEventListener('touchmove', boundHandlers.onTouchMove, { passive: false });
+    canvas.addEventListener('touchend', boundHandlers.onTouchEnd, { passive: false });
     window.addEventListener('mouseup', boundHandlers.onMouseUp);
     window.addEventListener('resize', boundHandlers.onResize);
 }
@@ -786,6 +830,9 @@ function unbindEvents() {
         canvas.removeEventListener('mousedown', boundHandlers.onMouseDown);
         canvas.removeEventListener('click', boundHandlers.onClick);
         canvas.removeEventListener('wheel', boundHandlers.onWheel);
+        canvas.removeEventListener('touchstart', boundHandlers.onTouchStart);
+        canvas.removeEventListener('touchmove', boundHandlers.onTouchMove);
+        canvas.removeEventListener('touchend', boundHandlers.onTouchEnd);
     }
     window.removeEventListener('mouseup', boundHandlers.onMouseUp);
     window.removeEventListener('resize', boundHandlers.onResize);
@@ -959,6 +1006,253 @@ function onWheel(e) {
         clampViewport();
         render();
     }
+}
+
+// ── Touch Handlers ──
+
+function getTouchDistance(t1, t2) {
+    const dx = t1.clientX - t2.clientX;
+    const dy = t1.clientY - t2.clientY;
+    return Math.sqrt(dx * dx + dy * dy);
+}
+
+function onTouchStart(e) {
+    e.preventDefault();
+
+    for (const touch of e.changedTouches) {
+        activeTouches.set(touch.identifier, { x: touch.clientX, y: touch.clientY });
+    }
+
+    if (activeTouches.size === 1) {
+        // Single finger: start drag (same as mousedown)
+        const touch = e.changedTouches[0];
+        dragStartX = touch.clientX;
+        dragStartY = touch.clientY;
+        dragStartViewX = viewX;
+        dragStartViewY0 = viewY0;
+        dragStartViewY1 = viewY1;
+        isDragging = true;
+        wasDragging = false;
+        isPinching = false;
+        cancelViewportAnim();
+        cancelInertia();
+
+        // Initialize velocity tracking
+        lastTouchX = touch.clientX;
+        lastTouchY = touch.clientY;
+        lastTouchTime = performance.now();
+        inertiaVx = 0;
+        inertiaVy = 0;
+
+        // Track for tap detection
+        touchTapCandidate = { x: touch.clientX, y: touch.clientY, time: Date.now() };
+    } else if (activeTouches.size === 2) {
+        // Two fingers: start pinch-to-zoom
+        isPinching = true;
+        isDragging = false;
+        touchTapCandidate = null;
+        hideTooltip();
+
+        const touches = Array.from(activeTouches.values());
+        pinchStartDist = Math.sqrt(
+            (touches[0].x - touches[1].x) ** 2 +
+            (touches[0].y - touches[1].y) ** 2,
+        );
+        pinchStartSpan = viewY1 - viewY0;
+
+        // Midpoint in canvas-relative Y for zoom anchor
+        const rect = canvas.getBoundingClientRect();
+        const ids = Array.from(activeTouches.keys());
+        const t0 = findTouch(e.touches, ids[0]);
+        const t1 = findTouch(e.touches, ids[1]);
+        if (t0 && t1) {
+            pinchMidY = ((t0.clientY + t1.clientY) / 2) - rect.top;
+        }
+
+        cancelViewportAnim();
+    }
+}
+
+function onTouchMove(e) {
+    e.preventDefault();
+
+    // Update tracked positions
+    for (const touch of e.changedTouches) {
+        if (activeTouches.has(touch.identifier)) {
+            activeTouches.set(touch.identifier, { x: touch.clientX, y: touch.clientY });
+        }
+    }
+
+    if (isPinching && activeTouches.size >= 2) {
+        // Pinch-to-zoom
+        const touches = Array.from(activeTouches.values());
+        const dist = Math.sqrt(
+            (touches[0].x - touches[1].x) ** 2 +
+            (touches[0].y - touches[1].y) ** 2,
+        );
+
+        if (pinchStartDist > 0) {
+            const scale = pinchStartDist / dist; // pinch out = smaller scale = zoom in
+            let newSpan = pinchStartSpan * scale;
+            newSpan = Math.max(MIN_VIEW_SPAN, Math.min(MAX_VIEW_SPAN, newSpan));
+
+            // Zoom around the midpoint
+            const cursorY = viewY0 + (pinchMidY / canvasHeight) * (viewY1 - viewY0);
+            const ratio = pinchMidY / canvasHeight;
+            viewY0 = cursorY - ratio * newSpan;
+            viewY1 = cursorY + (1 - ratio) * newSpan;
+
+            clampViewport();
+            render();
+        }
+        return;
+    }
+
+    if (isDragging && activeTouches.size === 1) {
+        const touch = e.changedTouches[0];
+        const dx = touch.clientX - dragStartX;
+        const dy = touch.clientY - dragStartY;
+        const dist = Math.sqrt(dx * dx + dy * dy);
+
+        if (dist > DRAG_THRESHOLD) {
+            wasDragging = true;
+            touchTapCandidate = null;
+            hideTooltip();
+
+            // Pan horizontally (amplified by touch speed multiplier)
+            viewX = dragStartViewX - dx * TOUCH_SPEED;
+
+            // Pan vertically (amplified by touch speed multiplier)
+            const viewSpan = dragStartViewY1 - dragStartViewY0;
+            const yShift = -(dy / canvasHeight) * viewSpan * TOUCH_SPEED;
+            viewY0 = dragStartViewY0 + yShift;
+            viewY1 = dragStartViewY1 + yShift;
+
+            clampViewport();
+            render();
+
+            // Track velocity for momentum (use instantaneous movement)
+            const now = performance.now();
+            const dt = now - lastTouchTime;
+            if (dt > 0) {
+                const instantDx = touch.clientX - lastTouchX;
+                const instantDy = touch.clientY - lastTouchY;
+                // Blend with previous velocity to smooth out jitter
+                inertiaVx = 0.4 * inertiaVx + 0.6 * (instantDx / dt * 16) * TOUCH_SPEED;
+                inertiaVy = 0.4 * inertiaVy + 0.6 * (instantDy / dt * 16 / canvasHeight * viewSpan) * TOUCH_SPEED;
+            }
+            lastTouchX = touch.clientX;
+            lastTouchY = touch.clientY;
+            lastTouchTime = now;
+        }
+    }
+}
+
+function onTouchEnd(e) {
+    e.preventDefault();
+
+    for (const touch of e.changedTouches) {
+        activeTouches.delete(touch.identifier);
+    }
+
+    if (activeTouches.size < 2) {
+        isPinching = false;
+    }
+
+    if (activeTouches.size === 0) {
+        isDragging = false;
+
+        // Check for tap (single quick touch without much movement)
+        if (touchTapCandidate && !wasDragging) {
+            const elapsed = Date.now() - touchTapCandidate.time;
+            if (elapsed < TAP_TIMEOUT) {
+                const touch = e.changedTouches[0];
+                const dx = touch.clientX - touchTapCandidate.x;
+                const dy = touch.clientY - touchTapCandidate.y;
+                if (Math.sqrt(dx * dx + dy * dy) < TAP_THRESHOLD) {
+                    handleTouchTap(touch.clientX, touch.clientY);
+                }
+            }
+        }
+
+        // Start momentum scrolling if finger was still moving
+        if (wasDragging && (Math.abs(inertiaVx) > MIN_INERTIA_V || Math.abs(inertiaVy) > 0.0001)) {
+            const timeSinceLast = performance.now() - lastTouchTime;
+            // Only apply inertia if the last move event was recent (finger was still moving)
+            if (timeSinceLast < 100) {
+                startInertia();
+            }
+        }
+
+        touchTapCandidate = null;
+        wasDragging = false;
+    }
+}
+
+function handleTouchTap(clientX, clientY) {
+    if (!canvas) return;
+    const rect = canvas.getBoundingClientRect();
+    const px = clientX - rect.left;
+    const py = clientY - rect.top;
+
+    const node = hitTest(px, py);
+    if (!node) {
+        removePopup();
+        return;
+    }
+
+    // Zoom into node if it has children
+    if (node.children.size > 0) {
+        zoomTo(node);
+    }
+
+    // Show popup
+    showNodePopup(clientX, clientY, node);
+}
+
+function findTouch(touchList, id) {
+    for (let i = 0; i < touchList.length; i++) {
+        if (touchList[i].identifier === id) return touchList[i];
+    }
+    return null;
+}
+
+// ── Touch Momentum / Inertia ──
+
+function startInertia() {
+    cancelInertia();
+    inertiaAnimId = requestAnimationFrame(inertiaFrame);
+}
+
+function inertiaFrame() {
+    // Decay velocity
+    inertiaVx *= INERTIA_DECAY;
+    inertiaVy *= INERTIA_DECAY;
+
+    // Stop when velocity is negligible
+    if (Math.abs(inertiaVx) < MIN_INERTIA_V && Math.abs(inertiaVy) < 0.0001) {
+        cancelInertia();
+        return;
+    }
+
+    // Apply velocity (negative because dragging left should scroll right)
+    viewX -= inertiaVx;
+    viewY0 -= inertiaVy;
+    viewY1 -= inertiaVy;
+
+    clampViewport();
+    render();
+
+    inertiaAnimId = requestAnimationFrame(inertiaFrame);
+}
+
+function cancelInertia() {
+    if (inertiaAnimId) {
+        cancelAnimationFrame(inertiaAnimId);
+        inertiaAnimId = null;
+    }
+    inertiaVx = 0;
+    inertiaVy = 0;
 }
 
 /**

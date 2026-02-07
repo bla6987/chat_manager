@@ -868,6 +868,13 @@ export function getSearchableMessages() {
         }
     }
 
+    // Sort by recency (newest messages first)
+    messages.sort((a, b) => {
+        const aTime = a.timestamp ? new Date(a.timestamp).getTime() : 0;
+        const bTime = b.timestamp ? new Date(b.timestamp).getTime() : 0;
+        return (Number.isFinite(bTime) ? bTime : 0) - (Number.isFinite(aTime) ? aTime : 0);
+    });
+
     cachedSearchableMessages = messages;
     cachedSearchableVersion = indexVersion;
     return messages;
