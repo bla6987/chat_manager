@@ -469,6 +469,16 @@ function executeSearch(raw) {
     }
 
     searchMatches = flatNodes.filter(n => n.normalizedText && n.normalizedText.toLowerCase().includes(query));
+
+    // Sort by recency (newest messages first)
+    searchMatches.sort((a, b) => {
+        const aRaw = a.representative && a.representative.timestamp;
+        const bRaw = b.representative && b.representative.timestamp;
+        const aTime = aRaw ? new Date(aRaw).getTime() : 0;
+        const bTime = bRaw ? new Date(bRaw).getTime() : 0;
+        return (Number.isFinite(bTime) ? bTime : 0) - (Number.isFinite(aTime) ? aTime : 0);
+    });
+
     searchMatchSet = new Set(searchMatches);
 
     if (searchMatches.length > 0) {
