@@ -185,3 +185,22 @@ function flattenTrie(node, out) {
         flattenTrie(child, out);
     }
 }
+
+/**
+ * Re-layout a subtree so the given node spans [0,1] y-space.
+ * Returns new flatNodes, maxDepth, and depthOffset for rendering.
+ *
+ * @param {TrieNode} node - subtree root to explore
+ * @param {string|null} activeChatFile
+ * @returns {{ flatNodes: Array, maxDepth: number, depthOffset: number }}
+ */
+export function reLayoutSubtree(node, activeChatFile) {
+    computeLayout(node, 0, 1, activeChatFile);
+    const flatNodes = [];
+    flattenTrie(node, flatNodes);
+    let maxDepth = node.depth;
+    for (const n of flatNodes) {
+        if (n.depth > maxDepth) maxDepth = n.depth;
+    }
+    return { flatNodes, maxDepth, depthOffset: node.depth };
+}

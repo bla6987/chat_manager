@@ -9,7 +9,7 @@
  *   expandToFullScreen() / closeFullScreen()
  */
 
-import { buildIcicleData } from './icicle-data.js';
+import { buildIcicleData, reLayoutSubtree } from './icicle-data.js';
 import { getIndex } from './chat-reader.js';
 import { getDisplayName } from './metadata-store.js';
 
@@ -52,6 +52,10 @@ let dpr = 1;
 // Zoom stack for click-to-zoom (navigation bookmarks for breadcrumbs)
 let zoomStack = [];
 let zoomRoot = null;
+
+// Explore state (subtree re-rooting)
+let exploreRoot = null;       // node being explored (null = full view)
+let exploreDepthOffset = 0;   // shifts x-rendering so explore root is at column 0
 
 // Viewport animation
 let viewAnimId = null;
@@ -158,6 +162,8 @@ export function mountIcicle(containerEl, mode) {
     viewY1 = 1;
     zoomStack = [];
     zoomRoot = null;
+    exploreRoot = null;
+    exploreDepthOffset = 0;
     isDragging = false;
     wasDragging = false;
 
@@ -256,6 +262,8 @@ export function unmountIcicle() {
     flatNodes = [];
     zoomStack = [];
     zoomRoot = null;
+    exploreRoot = null;
+    exploreDepthOffset = 0;
     viewX = 0;
     viewY0 = 0;
     viewY1 = 1;
@@ -278,6 +286,8 @@ export function updateIcicleData() {
     loadedCount = data.loadedCount;
     zoomStack = [];
     zoomRoot = null;
+    exploreRoot = null;
+    exploreDepthOffset = 0;
     viewX = 0;
     viewY0 = 0;
     viewY1 = 1;
@@ -471,7 +481,7 @@ function panToMatch() {
     if (targetY0 < 0) { targetY0 = 0; targetY1 = viewSpan; }
     if (targetY1 > 1) { targetY1 = 1; targetY0 = 1 - viewSpan; }
 
-    const targetX = Math.max(0, node.depth * COL_WIDTH - canvasWidth / 2 + COL_WIDTH / 2);
+    const targetX = Math.max(0, (node.depth - exploreDepthOffset) * COL_WIDTH - canvasWidth / 2 + COL_WIDTH / 2);
 
     animateViewportTo(targetX, targetY0, targetY1);
 }
@@ -544,9 +554,9 @@ function render() {
 
     const activeChatFile = getActiveChatFile ? getActiveChatFile() : null;
 
-    // Determine visible depth range from viewX
-    const minVisibleDepth = Math.floor(viewX / COL_WIDTH);
-    const maxVisibleDepth = Math.ceil((viewX + canvasWidth) / COL_WIDTH);
+    // Determine visible depth range from viewX (offset for explore mode)
+    const minVisibleDepth = Math.floor(viewX / COL_WIDTH) + exploreDepthOffset;
+    const maxVisibleDepth = Math.ceil((viewX + canvasWidth) / COL_WIDTH) + exploreDepthOffset;
 
     // Y range from viewport state
     const yStart = viewY0;
@@ -563,7 +573,7 @@ function render() {
         const relY0 = (Math.max(node.y0, yStart) - yStart) / ySpan;
         const relY1 = (Math.min(node.y1, yEnd) - yStart) / ySpan;
 
-        const x = node.depth * COL_WIDTH - viewX;
+        const x = (node.depth - exploreDepthOffset) * COL_WIDTH - viewX;
         const y = relY0 * canvasHeight;
         const w = COL_WIDTH - 2;
         const h = Math.max((relY1 - relY0) * canvasHeight - GAP, MIN_BLOCK_HEIGHT);
@@ -644,9 +654,9 @@ function render() {
     ctx.font = '10px sans-serif';
     ctx.textBaseline = 'top';
     for (let d = minVisibleDepth; d <= maxVisibleDepth; d++) {
-        const x = d * COL_WIDTH - viewX;
+        const x = (d - exploreDepthOffset) * COL_WIDTH - viewX;
         if (x >= 0 && x < canvasWidth) {
-            ctx.fillText(`${d}`, x + 3, 3);
+            ctx.fillText(`${d - exploreDepthOffset}`, x + 3, 3);
         }
     }
 
@@ -716,8 +726,8 @@ function hitTest(px, py) {
     const yEnd = viewY1;
     const ySpan = yEnd - yStart;
 
-    // Determine depth column
-    const depth = Math.floor((px + viewX) / COL_WIDTH);
+    // Determine depth column (offset for explore mode)
+    const depth = Math.floor((px + viewX) / COL_WIDTH) + exploreDepthOffset;
 
     // Collect candidates at this depth
     for (const node of flatNodes) {
@@ -730,7 +740,7 @@ function hitTest(px, py) {
 
         const y = relY0 * canvasHeight;
         const h = Math.max((relY1 - relY0) * canvasHeight - GAP, MIN_BLOCK_HEIGHT);
-        const x = node.depth * COL_WIDTH - viewX;
+        const x = (node.depth - exploreDepthOffset) * COL_WIDTH - viewX;
         const w = COL_WIDTH - 2;
 
         if (px >= x && px <= x + w && py >= y && py <= y + h) {
@@ -912,9 +922,22 @@ function onWheel(e) {
         viewY0 = cursorY - ratio * newSpan;
         viewY1 = cursorY + (1 - ratio) * newSpan;
 
-        // Free zoom clears zoom context
+        // Free zoom clears zoom context and explore mode
         zoomStack = [];
         zoomRoot = null;
+        if (exploreRoot) {
+            exploreRoot = null;
+            exploreDepthOffset = 0;
+            // Rebuild full data in background, but keep current viewport
+            const activeChatFile = getActiveChatFile ? getActiveChatFile() : null;
+            const chatIndex = getIndex();
+            const data = buildIcicleData(chatIndex, activeChatFile, { threadFocus: threadFocusActive });
+            icicleRoot = data.root;
+            flatNodes = data.flatNodes;
+            maxDepth = data.maxDepth;
+            loadedCount = data.loadedCount;
+            if (searchQuery.length >= 2) executeSearch(searchQuery);
+        }
         updateBreadcrumbs();
 
         clampViewport();
@@ -953,12 +976,12 @@ function scrollToActiveLeaf(activeChatFile) {
     if (!deepest) return;
 
     // Position so the leaf column's right edge aligns with the canvas right edge
-    viewX = Math.max(0, (deepest.depth + 1) * COL_WIDTH - canvasWidth);
+    viewX = Math.max(0, ((deepest.depth - exploreDepthOffset) + 1) * COL_WIDTH - canvasWidth);
 }
 
 function clampViewport() {
-    // Clamp horizontal
-    const maxScrollX = Math.max(0, (maxDepth + 1) * COL_WIDTH - canvasWidth);
+    // Clamp horizontal (offset for explore mode)
+    const maxScrollX = Math.max(0, (maxDepth - exploreDepthOffset + 1) * COL_WIDTH - canvasWidth);
     viewX = Math.max(0, Math.min(viewX, maxScrollX));
 
     // Clamp vertical: keep view within [0, 1]
@@ -992,6 +1015,44 @@ function onResize() {
 //  Zoom
 // ──────────────────────────────────────────────
 
+// ──────────────────────────────────────────────
+//  Explore Thread (subtree re-rooting)
+// ──────────────────────────────────────────────
+
+function exploreThread(node) {
+    removePopup();
+
+    const activeChatFile = getActiveChatFile ? getActiveChatFile() : null;
+    const result = reLayoutSubtree(node, activeChatFile);
+
+    exploreRoot = node;
+    exploreDepthOffset = result.depthOffset;
+    flatNodes = result.flatNodes;
+    maxDepth = result.maxDepth;
+
+    // Reset zoom and viewport
+    zoomStack = [];
+    zoomRoot = null;
+    viewX = 0;
+    viewY0 = 0;
+    viewY1 = 1;
+    cancelViewportAnim();
+
+    // Re-run search if active
+    if (searchQuery.length >= 2) {
+        executeSearch(searchQuery);
+    }
+
+    updateBreadcrumbs();
+    render();
+}
+
+function exitExplore() {
+    exploreRoot = null;
+    exploreDepthOffset = 0;
+    updateIcicleData();
+}
+
 function zoomTo(node) {
     removePopup();
 
@@ -1002,7 +1063,7 @@ function zoomTo(node) {
     zoomRoot = node;
 
     // Animate viewport to the node's range
-    const targetX = Math.max(0, node.depth * COL_WIDTH - 20);
+    const targetX = Math.max(0, (node.depth - exploreDepthOffset) * COL_WIDTH - 20);
     animateViewportTo(targetX, node.y0, node.y1);
 
     updateBreadcrumbs();
@@ -1015,7 +1076,7 @@ function zoomOut() {
 
     const targetY0 = zoomRoot ? zoomRoot.y0 : 0;
     const targetY1 = zoomRoot ? zoomRoot.y1 : 1;
-    const targetX = zoomRoot ? Math.max(0, zoomRoot.depth * COL_WIDTH - 20) : 0;
+    const targetX = zoomRoot ? Math.max(0, (zoomRoot.depth - exploreDepthOffset) * COL_WIDTH - 20) : 0;
     animateViewportTo(targetX, targetY0, targetY1);
 
     updateBreadcrumbs();
@@ -1039,7 +1100,7 @@ function zoomToRoot() {
 function updateBreadcrumbs() {
     if (!breadcrumbEl) return;
 
-    if (!zoomRoot) {
+    if (!exploreRoot && !zoomRoot) {
         breadcrumbEl.innerHTML = '';
         breadcrumbEl.style.display = 'none';
         // Resize canvas to reclaim breadcrumb space
@@ -1050,28 +1111,46 @@ function updateBreadcrumbs() {
 
     breadcrumbEl.style.display = 'flex';
 
-    let html = '<span class="chat-manager-icicle-crumb chat-manager-icicle-crumb-root">Root</span>';
+    let html = '';
 
-    // Build path from zoom stack + current
-    const path = [...zoomStack, zoomRoot];
-    for (let i = 0; i < path.length; i++) {
-        const node = path[i];
-        const label = truncate(node.normalizedText || `depth ${node.depth}`, 20);
-        const isLast = i === path.length - 1;
-        html += '<span class="chat-manager-icicle-crumb-sep">\u203A</span>';
-        html += `<span class="chat-manager-icicle-crumb${isLast ? ' chat-manager-icicle-crumb-current' : ''}" data-idx="${i}">${escapeHtml(label)}</span>`;
+    // Explore context
+    if (exploreRoot) {
+        html += '<span class="chat-manager-icicle-crumb chat-manager-icicle-crumb-explore-exit">\u2716 Exit</span>';
+        const exploreLabel = truncate(exploreRoot.normalizedText || `msg #${exploreRoot.depth}`, 25);
+        html += '<span class="chat-manager-icicle-crumb-explore-label">Exploring: ' + escapeHtml(exploreLabel) + '</span>';
+
+        if (zoomRoot) {
+            html += '<span class="chat-manager-icicle-crumb-sep">\u203A</span>';
+        }
+    }
+
+    // Zoom breadcrumbs (shown even inside explore mode)
+    if (zoomRoot) {
+        html += '<span class="chat-manager-icicle-crumb chat-manager-icicle-crumb-root">Root</span>';
+
+        const path = [...zoomStack, zoomRoot];
+        for (let i = 0; i < path.length; i++) {
+            const node = path[i];
+            const label = truncate(node.normalizedText || `depth ${node.depth}`, 20);
+            const isLast = i === path.length - 1;
+            html += '<span class="chat-manager-icicle-crumb-sep">\u203A</span>';
+            html += `<span class="chat-manager-icicle-crumb${isLast ? ' chat-manager-icicle-crumb-current' : ''}" data-idx="${i}">${escapeHtml(label)}</span>`;
+        }
     }
 
     breadcrumbEl.innerHTML = html;
 
-    // Bind clicks
+    // Bind explore exit
+    breadcrumbEl.querySelector('.chat-manager-icicle-crumb-explore-exit')?.addEventListener('click', exitExplore);
+
+    // Bind zoom root click
     breadcrumbEl.querySelector('.chat-manager-icicle-crumb-root')?.addEventListener('click', zoomToRoot);
 
+    // Bind zoom crumb clicks
     breadcrumbEl.querySelectorAll('.chat-manager-icicle-crumb[data-idx]').forEach(el => {
         el.addEventListener('click', () => {
             const idx = parseInt(el.dataset.idx, 10);
             if (isNaN(idx)) return;
-            // Zoom to this level: pop stack down to idx
             const path = [...zoomStack, zoomRoot];
             const target = path[idx];
             zoomStack = path.slice(0, idx);
@@ -1166,7 +1245,7 @@ function focusNode(node, openPopup) {
     zoomRoot = node;
     updateBreadcrumbs();
 
-    const targetX = Math.max(0, node.depth * COL_WIDTH - 20);
+    const targetX = Math.max(0, (node.depth - exploreDepthOffset) * COL_WIDTH - 20);
     if (openPopup) {
         animateViewportTo(targetX, node.y0, node.y1, () => {
             if (!mounted || !canvas) return;
@@ -1176,7 +1255,7 @@ function focusNode(node, openPopup) {
 
             const relY0 = (node.y0 - viewY0) / ySpan;
             const relY1 = (node.y1 - viewY0) / ySpan;
-            const centerX = Math.max(0, Math.min(canvasWidth - 1, (node.depth * COL_WIDTH - viewX) + (COL_WIDTH / 2)));
+            const centerX = Math.max(0, Math.min(canvasWidth - 1, ((node.depth - exploreDepthOffset) * COL_WIDTH - viewX) + (COL_WIDTH / 2)));
             const centerYNorm = (relY0 + relY1) / 2;
             const centerY = Math.max(0, Math.min(canvasHeight - 1, centerYNorm * canvasHeight));
 
@@ -1216,6 +1295,12 @@ function showNodePopup(clientX, clientY, node) {
     let html = '<div class="chat-manager-timeline-popup-inner">';
     html += `<div class="chat-manager-timeline-popup-title">Message #${node.depth}</div>`;
     html += `<div class="chat-manager-timeline-popup-preview">${escapeHtml(truncateForTooltip(node.representative.text || node.normalizedText, 120))}</div>`;
+
+    // Explore Thread button — only when node has branches to explore
+    if (node.children.size > 0) {
+        html += '<button class="chat-manager-btn chat-manager-timeline-explore-btn">Explore Thread</button>';
+    }
+
     html += '<div class="chat-manager-timeline-popup-list">';
 
     // Deduplicate chat files
@@ -1258,6 +1343,12 @@ function showNodePopup(clientX, clientY, node) {
     popupEl.querySelectorAll('.chat-manager-timeline-jump-btn').forEach(btn => {
         btn.addEventListener('click', handleJump);
     });
+
+    // Bind explore thread button
+    const exploreBtn = popupEl.querySelector('.chat-manager-timeline-explore-btn');
+    if (exploreBtn) {
+        exploreBtn.addEventListener('click', () => exploreThread(node));
+    }
 }
 
 function handleJump(e) {
