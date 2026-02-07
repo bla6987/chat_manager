@@ -195,6 +195,7 @@ export function mountIcicle(containerEl, mode) {
 
     // Size and render
     resizeCanvas();
+    scrollToActiveLeaf(activeChatFile);
     render();
 
     // Bind events
@@ -270,6 +271,7 @@ export function updateIcicleData() {
 
     if (!icicleRoot || flatNodes.length === 0) return;
 
+    scrollToActiveLeaf(activeChatFile);
     render();
     updateBreadcrumbs();
     updateResetButton();
@@ -735,6 +737,26 @@ function onWheel(e) {
         clampViewport();
         render();
     }
+}
+
+/**
+ * Scroll viewport so the active chat's deepest node is visible on screen.
+ */
+function scrollToActiveLeaf(activeChatFile) {
+    if (!activeChatFile || flatNodes.length === 0) return;
+
+    let deepest = null;
+    for (const node of flatNodes) {
+        if (node.chatFiles.includes(activeChatFile)) {
+            if (!deepest || node.depth > deepest.depth) {
+                deepest = node;
+            }
+        }
+    }
+    if (!deepest) return;
+
+    // Position so the leaf column's right edge aligns with the canvas right edge
+    viewX = Math.max(0, (deepest.depth + 1) * COL_WIDTH - canvasWidth);
 }
 
 function clampViewport() {
