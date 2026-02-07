@@ -1,9 +1,19 @@
 /**
- * Metadata Store — Read/write display names, summaries, cached titles.
- * All data stored in extensionSettings.chat_manager.metadata keyed by character avatar.
+ * Metadata Store — Read/write display names, summaries, cached titles, tags, filter/sort state.
+ * All data stored in extensionSettings.chat_manager keyed by character avatar where appropriate.
  */
 
 const MODULE_NAME = 'chat_manager';
+
+const DEFAULT_TAG_DEFINITIONS = {
+    tag_canon: { id: 'tag_canon', name: 'Canon', color: '#4CAF50', textColor: '#FFFFFF' },
+    tag_experimental: { id: 'tag_experimental', name: 'Experimental', color: '#FF9800', textColor: '#FFFFFF' },
+    tag_favorite: { id: 'tag_favorite', name: 'Favorite', color: '#E91E63', textColor: '#FFFFFF' },
+    tag_archived: { id: 'tag_archived', name: 'Archived', color: '#9E9E9E', textColor: '#FFFFFF' },
+};
+
+const DEFAULT_FILTER_STATE = { tags: [], dateFrom: null, dateTo: null, messageCountMin: null, messageCountMax: null };
+const DEFAULT_SORT_STATE = { field: 'recency', direction: 'desc' };
 
 /**
  * Ensure the settings structure exists.
@@ -18,6 +28,15 @@ function ensureSettings() {
     }
     if (!extensionSettings[MODULE_NAME].displayMode) {
         extensionSettings[MODULE_NAME].displayMode = 'panel';
+    }
+    if (!extensionSettings[MODULE_NAME].tagDefinitions) {
+        extensionSettings[MODULE_NAME].tagDefinitions = { ...DEFAULT_TAG_DEFINITIONS };
+    }
+    if (!extensionSettings[MODULE_NAME].filterState) {
+        extensionSettings[MODULE_NAME].filterState = { ...DEFAULT_FILTER_STATE };
+    }
+    if (!extensionSettings[MODULE_NAME].sortState) {
+        extensionSettings[MODULE_NAME].sortState = { ...DEFAULT_SORT_STATE };
     }
 }
 
@@ -194,4 +213,183 @@ export function setThreadFocus(active) {
     const { extensionSettings, saveSettingsDebounced } = SillyTavern.getContext();
     extensionSettings[MODULE_NAME].threadFocus = active;
     saveSettingsDebounced();
+}
+
+// ──────────────────────────────────────────────
+//  Tag Definitions (global)
+// ──────────────────────────────────────────────
+
+function getSettings() {
+    ensureSettings();
+    return SillyTavern.getContext().extensionSettings[MODULE_NAME];
+}
+
+function save() {
+    SillyTavern.getContext().saveSettingsDebounced();
+}
+
+/**
+ * Generate a tag ID from a name.
+ * @param {string} name
+ * @returns {string}
+ */
+function makeTagId(name) {
+    return 'tag_' + name.toLowerCase().replace(/[^a-z0-9]/g, '_');
+}
+
+/**
+ * @returns {Object} Map of tagId -> { id, name, color, textColor }
+ */
+export function getTagDefinitions() {
+    return getSettings().tagDefinitions;
+}
+
+/**
+ * Create a new tag definition.
+ * @param {string} name
+ * @param {string} [color='#607D8B']
+ * @param {string} [textColor='#FFFFFF']
+ * @returns {{ id: string, name: string, color: string, textColor: string } | null} The created tag, or null if duplicate
+ */
+export function createTagDefinition(name, color = '#607D8B', textColor = '#FFFFFF') {
+    const settings = getSettings();
+    const id = makeTagId(name);
+    if (settings.tagDefinitions[id]) return null;
+    settings.tagDefinitions[id] = { id, name, color, textColor };
+    save();
+    return settings.tagDefinitions[id];
+}
+
+/**
+ * Update an existing tag definition.
+ * @param {string} tagId
+ * @param {Object} updates - Partial { name, color, textColor }
+ */
+export function updateTagDefinition(tagId, updates) {
+    const settings = getSettings();
+    if (!settings.tagDefinitions[tagId]) return;
+    Object.assign(settings.tagDefinitions[tagId], updates);
+    save();
+}
+
+/**
+ * Delete a tag definition. Cascades removal from all per-chat tags and active filter.
+ * @param {string} tagId
+ */
+export function deleteTagDefinition(tagId) {
+    const settings = getSettings();
+    delete settings.tagDefinitions[tagId];
+
+    // Cascade: remove from all per-chat metadata for all characters
+    for (const charMeta of Object.values(settings.metadata)) {
+        for (const fileMeta of Object.values(charMeta)) {
+            if (Array.isArray(fileMeta.tags)) {
+                const idx = fileMeta.tags.indexOf(tagId);
+                if (idx !== -1) fileMeta.tags.splice(idx, 1);
+            }
+        }
+    }
+
+    // Cascade: remove from active filter
+    if (Array.isArray(settings.filterState.tags)) {
+        const idx = settings.filterState.tags.indexOf(tagId);
+        if (idx !== -1) settings.filterState.tags.splice(idx, 1);
+    }
+
+    save();
+}
+
+// ──────────────────────────────────────────────
+//  Per-Chat Tags
+// ──────────────────────────────────────────────
+
+/**
+ * Get tags for a chat file.
+ * @param {string} fileName
+ * @returns {string[]}
+ */
+export function getChatTags(fileName) {
+    const meta = getChatMeta(fileName);
+    return Array.isArray(meta.tags) ? meta.tags : [];
+}
+
+/**
+ * Add a tag to a chat file.
+ * @param {string} fileName
+ * @param {string} tagId
+ */
+export function addChatTag(fileName, tagId) {
+    const tags = getChatTags(fileName);
+    if (tags.includes(tagId)) return;
+    tags.push(tagId);
+    setChatMeta(fileName, { tags });
+}
+
+/**
+ * Remove a tag from a chat file.
+ * @param {string} fileName
+ * @param {string} tagId
+ */
+export function removeChatTag(fileName, tagId) {
+    const tags = getChatTags(fileName);
+    const idx = tags.indexOf(tagId);
+    if (idx === -1) return;
+    tags.splice(idx, 1);
+    setChatMeta(fileName, { tags });
+}
+
+// ──────────────────────────────────────────────
+//  Filter & Sort State (global, persisted)
+// ──────────────────────────────────────────────
+
+/**
+ * @returns {{ tags: string[], dateFrom: string|null, dateTo: string|null, messageCountMin: number|null, messageCountMax: number|null }}
+ */
+export function getFilterState() {
+    return getSettings().filterState;
+}
+
+/**
+ * Merge partial filter updates into the current state.
+ * @param {Object} partial
+ */
+export function setFilterState(partial) {
+    const settings = getSettings();
+    Object.assign(settings.filterState, partial);
+    save();
+}
+
+/**
+ * Reset filter state to defaults.
+ */
+export function clearFilterState() {
+    const settings = getSettings();
+    settings.filterState = { ...DEFAULT_FILTER_STATE };
+    save();
+}
+
+/**
+ * Check if any filter is active.
+ * @returns {boolean}
+ */
+export function hasActiveFilter() {
+    const f = getFilterState();
+    return (f.tags.length > 0) || f.dateFrom || f.dateTo || f.messageCountMin != null || f.messageCountMax != null;
+}
+
+/**
+ * @returns {{ field: string, direction: string }}
+ */
+export function getSortState() {
+    return getSettings().sortState;
+}
+
+/**
+ * Merge partial sort updates.
+ * @param {Object} partial - { field?, direction? }
+ */
+export function setSortState(partial) {
+    const settings = getSettings();
+    Object.assign(settings.sortState, partial);
+    save();
 }

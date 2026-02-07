@@ -4,12 +4,17 @@
 
 import {
     buildIndex, getHydrationProgress, getIndex, getSearchableMessages, getSortedEntries,
+    getFilteredSortedEntries, getIndexVersion,
     isHydrationComplete, onHydrationUpdate, prioritizeInQueue, runDeferredBranchDetection,
 } from './chat-reader.js';
 import {
     getDisplayName, setDisplayName, getSummary, setSummary,
-    migrateFileKey, getDisplayMode,
+    migrateFileKey, getDisplayMode, getChatMeta,
     getThreadFocus, setThreadFocus as persistThreadFocus,
+    getTagDefinitions, createTagDefinition, updateTagDefinition, deleteTagDefinition,
+    getChatTags, addChatTag, removeChatTag,
+    getFilterState, setFilterState, clearFilterState, hasActiveFilter,
+    getSortState, setSortState,
 } from './metadata-store.js';
 import {
     generateTitleForActiveChat, generateTitleForChat,
@@ -20,16 +25,22 @@ import {
     focusMessageInIcicle, isIcicleMounted, setIcicleCallbacks,
     setThreadFocus as setIcicleThreadFocus,
 } from './icicle-view.js';
+import {
+    mountStatsView, unmountStatsView, updateStatsView,
+    isStatsMounted, setStatsCallbacks,
+} from './stats-view.js';
 
 const MODULE_NAME = 'chat_manager';
 
 let panelOpen = false;
 let timelineActive = false;
+let statsActive = false;
 const RESULTS_PAGE_SIZE = 50;
 let hydrationSubscriptionReady = false;
 let refreshFromHydrationTimer = null;
 let refreshSearchFromHydrationTimer = null;
 let refreshTimelineFromHydrationTimer = null;
+let refreshStatsFromHydrationTimer = null;
 
 /**
  * Streaming search state — allows early termination and "load more" resumption.
@@ -45,6 +56,10 @@ export function isTimelineActive() {
     return timelineActive;
 }
 
+export function isStatsActive() {
+    return statsActive;
+}
+
 /**
  * Toggle timeline view on/off. Called from index.js when the toggle button is clicked.
  * Expects Cytoscape libs to be loaded before this is called.
@@ -56,12 +71,20 @@ export function toggleTimeline() {
     const btn = document.getElementById('chat-manager-timeline-toggle');
     if (btn) btn.classList.toggle('active', timelineActive);
 
+    // Deactivate stats if active
+    if (timelineActive && statsActive) {
+        deactivateStats();
+    }
+
     const searchWrapper = document.querySelector('.chat-manager-search-wrapper');
     const content = document.getElementById('chat-manager-content');
 
     if (timelineActive) {
-        // Hide search, switch content to timeline
+        // Hide search and toolbar, switch content to timeline
         if (searchWrapper) searchWrapper.style.display = 'none';
+        const toolbar = document.querySelector('.chat-manager-filter-toolbar');
+        if (toolbar) toolbar.style.display = 'none';
+        dismissDropdown();
         if (content) content.classList.add('timeline-active');
 
         // Set up callbacks so icicle-view can navigate
@@ -90,8 +113,10 @@ export function toggleTimeline() {
         dismissTimelineModal();
         unmountIcicle();
 
-        // Restore search and content
+        // Restore search, toolbar, and content
         if (searchWrapper) searchWrapper.style.display = '';
+        const toolbar = document.querySelector('.chat-manager-filter-toolbar');
+        if (toolbar) toolbar.style.display = '';
         if (content) {
             content.classList.remove('timeline-active');
             content.innerHTML = '';
@@ -100,6 +125,121 @@ export function toggleTimeline() {
         // Re-render thread cards
         renderThreadCards();
     }
+}
+
+/**
+ * Toggle stats dashboard on/off. Mutually exclusive with timeline.
+ */
+export function toggleStats() {
+    statsActive = !statsActive;
+
+    const btn = document.getElementById('chat-manager-stats-toggle');
+    if (btn) btn.classList.toggle('active', statsActive);
+
+    const searchWrapper = document.querySelector('.chat-manager-search-wrapper');
+    const toolbar = document.querySelector('.chat-manager-filter-toolbar');
+    const content = document.getElementById('chat-manager-content');
+
+    if (statsActive) {
+        // Deactivate timeline if active
+        if (timelineActive) {
+            deactivateTimeline();
+        }
+
+        // Hide search and toolbar
+        if (searchWrapper) searchWrapper.style.display = 'none';
+        if (toolbar) toolbar.style.display = 'none';
+        dismissDropdown();
+        if (content) content.classList.remove('timeline-active');
+
+        // Set up callbacks
+        setStatsCallbacks({
+            onDayClick: handleHeatmapDayClick,
+            getActive: getActiveFilename,
+        });
+
+        // Mount stats view
+        if (content) {
+            content.innerHTML = '';
+            mountStatsView(content);
+        }
+
+        const status = document.getElementById('chat-manager-status');
+        if (status) status.textContent = 'Stats dashboard';
+    } else {
+        deactivateStats();
+        renderThreadCards();
+    }
+}
+
+/**
+ * Clean teardown of stats view.
+ */
+function deactivateStats() {
+    if (!statsActive && !isStatsMounted()) return;
+    statsActive = false;
+    unmountStatsView();
+
+    const btn = document.getElementById('chat-manager-stats-toggle');
+    if (btn) btn.classList.remove('active');
+
+    const searchWrapper = document.querySelector('.chat-manager-search-wrapper');
+    if (searchWrapper) searchWrapper.style.display = '';
+    const toolbar = document.querySelector('.chat-manager-filter-toolbar');
+    if (toolbar) toolbar.style.display = '';
+
+    const content = document.getElementById('chat-manager-content');
+    if (content) content.innerHTML = '';
+}
+
+/**
+ * Handle heatmap day click — exit stats, show filtered threads for that day.
+ */
+function handleHeatmapDayClick(dateKey, chatFileNames) {
+    deactivateStats();
+
+    const index = getIndex();
+    const entries = chatFileNames
+        .map(f => index[f])
+        .filter(Boolean);
+
+    const container = document.getElementById('chat-manager-content');
+    const status = document.getElementById('chat-manager-status');
+    if (!container) return;
+
+    if (entries.length === 0) {
+        container.innerHTML = '<div class="chat-manager-empty">No threads found for this day.</div>';
+        if (status) status.textContent = '';
+        return;
+    }
+
+    // Add a "back" button
+    const backBtn = document.createElement('button');
+    backBtn.className = 'chat-manager-btn';
+    backBtn.style.margin = '0 12px 8px';
+    backBtn.innerHTML = '<i class="fa-solid fa-arrow-left"></i> Back to threads';
+    backBtn.addEventListener('click', () => renderThreadCards());
+    container.appendChild(backBtn);
+
+    const { moment } = SillyTavern.libs;
+    const dateStr = moment(dateKey).format('ddd, MMM D, YYYY');
+    if (status) status.textContent = `${entries.length} thread${entries.length !== 1 ? 's' : ''} active on ${dateStr}`;
+
+    renderThreadCardsFromEntries(entries, container, null, Object.keys(index).length);
+    // Prepend back button before cards
+    container.prepend(backBtn);
+}
+
+function scheduleStatsRefresh() {
+    if (refreshStatsFromHydrationTimer) return;
+
+    refreshStatsFromHydrationTimer = setTimeout(() => {
+        refreshStatsFromHydrationTimer = null;
+        if (!panelOpen || !statsActive) return;
+        if (isStatsMounted()) {
+            updateStatsView();
+        }
+    }, 600);
 }
 
 /**
@@ -251,6 +391,11 @@ function ensureHydrationSubscription() {
     onHydrationUpdate(() => {
         if (!panelOpen) return;
 
+        if (statsActive) {
+            scheduleStatsRefresh();
+            return;
+        }
+
         if (timelineActive) {
             scheduleTimelineRefresh();
             return;
@@ -321,6 +466,8 @@ function closeSidePanel() {
     const panel = document.getElementById('chat-manager-panel');
     if (panel) panel.classList.remove('open');
     panelOpen = false;
+    dismissDropdown();
+    deactivateStats();
     deactivateTimeline();
 }
 
@@ -359,6 +506,8 @@ function closePopup() {
         }
     }, 300);
     panelOpen = false;
+    dismissDropdown();
+    deactivateStats();
     deactivateTimeline();
 }
 
@@ -405,6 +554,17 @@ export async function refreshPanel() {
     // Guard: no character selected or group chat
     if (context.characterId === undefined) {
         renderEmptyState('Select a character to manage chats.');
+        return;
+    }
+
+    // If stats is active, refresh stats and run index build in background
+    if (statsActive) {
+        if (isStatsMounted()) {
+            updateStatsView();
+        }
+        const activeFile = getActiveFilename();
+        if (activeFile) prioritizeInQueue(activeFile);
+        await buildIndex(null, null);
         return;
     }
 
@@ -632,17 +792,46 @@ export function renderThreadCards() {
     if (!container) return;
 
     const index = getIndex();
-    const entries = getSortedEntries();
+    const totalCount = Object.keys(index).length;
 
-    if (entries.length === 0) {
+    // Use filter/sort state
+    const filterState = getFilterState();
+    const sortState = getSortState();
+    const entries = getFilteredSortedEntries(filterState, sortState, getChatMeta);
+
+    // Ensure toolbar exists
+    ensureFilterToolbar();
+
+    if (totalCount === 0) {
         renderEmptyState('No chats found for this character.');
         return;
     }
 
+    if (entries.length === 0 && hasActiveFilter()) {
+        container.innerHTML = '<div class="chat-manager-no-filter-results"><p>No threads match current filters.</p><button class="chat-manager-btn chat-manager-clear-all-inline">Clear filters</button></div>';
+        const clearBtn = container.querySelector('.chat-manager-clear-all-inline');
+        if (clearBtn) clearBtn.addEventListener('click', () => { clearFilterState(); renderThreadCards(); });
+        if (status) status.textContent = withIndexingSuffix(`Showing 0 of ${totalCount} threads`);
+        return;
+    }
+
+    renderThreadCardsFromEntries(entries, container, status, totalCount);
+}
+
+/**
+ * Render thread cards from a given set of entries into a container.
+ * Extracted so heatmap day-click and other features can reuse it.
+ */
+export function renderThreadCardsFromEntries(entries, container, status, totalCount) {
+    if (!container) return;
+
+    const index = getIndex();
+    if (totalCount === undefined) totalCount = Object.keys(index).length;
+
     const { moment, DOMPurify } = SillyTavern.libs;
     const activeChatFile = getActiveFilename();
-
     const activeEntry = activeChatFile ? index[activeChatFile] : null;
+    const tagDefs = getTagDefinitions();
 
     let html = '';
     for (const entry of entries) {
@@ -669,16 +858,31 @@ export function renderThreadCards() {
             ? 'Generate/regenerate summary'
             : 'AI summary will be available once indexing finishes';
 
+        // Tag chips
+        const chatTags = getChatTags(entry.fileName);
+        let tagChipsHtml = '';
+        if (chatTags.length > 0) {
+            tagChipsHtml = '<div class="chat-manager-card-tags">';
+            for (const tagId of chatTags) {
+                const def = tagDefs[tagId];
+                if (!def) continue;
+                tagChipsHtml += `<span class="chat-manager-tag-chip" style="background:${escapeAttr(def.color)};color:${escapeAttr(def.textColor)}">${escapeHtml(def.name)}</span>`;
+            }
+            tagChipsHtml += '</div>';
+        }
+
         html += `
         <div class="chat-manager-card${isActive ? ' active' : ''}" data-filename="${escapeAttr(entry.fileName)}">
             <div class="chat-manager-card-header">
                 <span class="chat-manager-display-name" data-filename="${escapeAttr(entry.fileName)}" title="Click to switch thread">${escapeHtml(displayName)}</span>
                 <div class="chat-manager-card-actions">
+                    <i class="chat-manager-icon-btn chat-manager-tag-btn fa-fw fa-solid fa-tag" data-filename="${escapeAttr(entry.fileName)}" title="Manage tags" tabindex="0"></i>
                     <i class="chat-manager-icon-btn chat-manager-edit-name-btn fa-fw fa-solid fa-pen" data-filename="${escapeAttr(entry.fileName)}" title="Edit display name" tabindex="0"></i>
                     <i class="${aiTitleClasses}" data-filename="${escapeAttr(entry.fileName)}" title="${escapeAttr(aiTitle)}" tabindex="0"></i>
                     <i class="chat-manager-icon-btn chat-manager-rename-file-btn fa-fw fa-solid fa-file-pen" data-filename="${escapeAttr(entry.fileName)}" title="Rename original file" tabindex="0"></i>
                 </div>
             </div>
+            ${tagChipsHtml}
             <div class="chat-manager-card-meta">
                 <span>${entry.messageCount} messages</span>
                 <span>${firstDate} – ${lastDate}</span>
@@ -698,9 +902,436 @@ export function renderThreadCards() {
     }
 
     container.innerHTML = DOMPurify.sanitize(html);
-    if (status) status.textContent = withIndexingSuffix(`Showing ${entries.length} threads`);
+
+    const filtered = hasActiveFilter();
+    const statusText = filtered
+        ? `Showing ${entries.length} of ${totalCount} threads`
+        : `Showing ${entries.length} threads`;
+    if (status) status.textContent = withIndexingSuffix(statusText);
 
     bindCardEvents(container);
+}
+
+// ──────────────────────────────────────────────
+//  Filter Toolbar & Dropdowns
+// ──────────────────────────────────────────────
+
+let activeDropdown = null;
+
+function dismissDropdown() {
+    if (activeDropdown) {
+        activeDropdown.remove();
+        activeDropdown = null;
+    }
+    document.removeEventListener('click', handleDropdownOutsideClick, true);
+}
+
+function handleDropdownOutsideClick(e) {
+    if (activeDropdown && !activeDropdown.contains(e.target)) {
+        dismissDropdown();
+    }
+}
+
+function showDropdown(anchorEl, dropdown) {
+    dismissDropdown();
+    document.body.appendChild(dropdown);
+    activeDropdown = dropdown;
+
+    // Position below anchor
+    const rect = anchorEl.getBoundingClientRect();
+    dropdown.style.top = `${rect.bottom + 4}px`;
+    dropdown.style.right = `${window.innerWidth - rect.right}px`;
+    dropdown.style.left = 'auto';
+
+    // Ensure it doesn't overflow viewport
+    requestAnimationFrame(() => {
+        const dropRect = dropdown.getBoundingClientRect();
+        if (dropRect.bottom > window.innerHeight - 8) {
+            dropdown.style.top = `${rect.top - dropRect.height - 4}px`;
+        }
+        if (dropRect.left < 8) {
+            dropdown.style.left = '8px';
+            dropdown.style.right = 'auto';
+        }
+    });
+
+    setTimeout(() => document.addEventListener('click', handleDropdownOutsideClick, true), 0);
+}
+
+/**
+ * Ensure the filter/sort toolbar exists between search and status bar.
+ * Creates it once and updates active indicators.
+ */
+function ensureFilterToolbar() {
+    const searchWrapper = document.querySelector('.chat-manager-search-wrapper');
+    if (!searchWrapper) return;
+
+    let toolbar = document.querySelector('.chat-manager-filter-toolbar');
+    if (!toolbar) {
+        toolbar = document.createElement('div');
+        toolbar.className = 'chat-manager-filter-toolbar';
+
+        const sortState = getSortState();
+        const sortFieldLabels = { recency: 'Recent', alphabetical: 'A-Z', messageCount: 'Messages', created: 'Created' };
+
+        // Sort controls
+        const sortDiv = document.createElement('div');
+        sortDiv.className = 'chat-manager-sort-controls';
+
+        const select = document.createElement('select');
+        select.className = 'chat-manager-sort-select';
+        for (const [value, label] of Object.entries(sortFieldLabels)) {
+            const opt = document.createElement('option');
+            opt.value = value;
+            opt.textContent = label;
+            if (value === sortState.field) opt.selected = true;
+            select.appendChild(opt);
+        }
+        select.addEventListener('change', () => {
+            setSortState({ field: select.value });
+            renderThreadCards();
+        });
+
+        const dirBtn = document.createElement('button');
+        dirBtn.className = 'chat-manager-btn chat-manager-sort-dir-btn';
+        dirBtn.title = 'Toggle sort direction';
+        updateSortDirIcon(dirBtn, sortState.direction);
+        dirBtn.addEventListener('click', () => {
+            const current = getSortState();
+            const newDir = current.direction === 'desc' ? 'asc' : 'desc';
+            setSortState({ direction: newDir });
+            updateSortDirIcon(dirBtn, newDir);
+            renderThreadCards();
+        });
+
+        sortDiv.appendChild(select);
+        sortDiv.appendChild(dirBtn);
+
+        // Filter controls
+        const filterDiv = document.createElement('div');
+        filterDiv.className = 'chat-manager-filter-controls';
+
+        const tagFilterBtn = document.createElement('button');
+        tagFilterBtn.className = 'chat-manager-btn chat-manager-filter-btn chat-manager-tag-filter-btn';
+        tagFilterBtn.title = 'Filter by tags';
+        tagFilterBtn.innerHTML = '<i class="fa-solid fa-tags"></i>';
+        tagFilterBtn.addEventListener('click', (e) => { e.stopPropagation(); showTagFilterDropdown(tagFilterBtn); });
+
+        const advFilterBtn = document.createElement('button');
+        advFilterBtn.className = 'chat-manager-btn chat-manager-filter-btn chat-manager-adv-filter-btn';
+        advFilterBtn.title = 'Advanced filters';
+        advFilterBtn.innerHTML = '<i class="fa-solid fa-sliders"></i>';
+        advFilterBtn.addEventListener('click', (e) => { e.stopPropagation(); showAdvancedFilterDropdown(advFilterBtn); });
+
+        const clearBtn = document.createElement('button');
+        clearBtn.className = 'chat-manager-btn chat-manager-clear-filters-btn';
+        clearBtn.title = 'Clear all filters';
+        clearBtn.innerHTML = '<i class="fa-solid fa-filter-circle-xmark"></i>';
+        clearBtn.addEventListener('click', () => { clearFilterState(); renderThreadCards(); });
+
+        filterDiv.appendChild(tagFilterBtn);
+        filterDiv.appendChild(advFilterBtn);
+        filterDiv.appendChild(clearBtn);
+
+        toolbar.appendChild(sortDiv);
+        toolbar.appendChild(filterDiv);
+
+        searchWrapper.after(toolbar);
+    }
+
+    // Update active indicators
+    const tagFilterBtn = toolbar.querySelector('.chat-manager-tag-filter-btn');
+    const advFilterBtn = toolbar.querySelector('.chat-manager-adv-filter-btn');
+    const clearBtn = toolbar.querySelector('.chat-manager-clear-filters-btn');
+    const f = getFilterState();
+
+    if (tagFilterBtn) tagFilterBtn.classList.toggle('has-active', f.tags.length > 0);
+    if (advFilterBtn) advFilterBtn.classList.toggle('has-active', !!(f.dateFrom || f.dateTo || f.messageCountMin != null || f.messageCountMax != null));
+    if (clearBtn) clearBtn.style.display = hasActiveFilter() ? '' : 'none';
+
+    // Hide toolbar when search or timeline is active
+    const query = getCurrentSearchQuery();
+    toolbar.style.display = (query.length >= 2 || timelineActive) ? 'none' : '';
+}
+
+function updateSortDirIcon(btn, direction) {
+    btn.innerHTML = direction === 'desc'
+        ? '<i class="fa-solid fa-arrow-down-short-wide"></i>'
+        : '<i class="fa-solid fa-arrow-up-short-wide"></i>';
+}
+
+function showTagFilterDropdown(anchorEl) {
+    const dropdown = document.createElement('div');
+    dropdown.className = 'chat-manager-dropdown';
+
+    const tagDefs = getTagDefinitions();
+    const filterTags = getFilterState().tags;
+
+    for (const [tagId, def] of Object.entries(tagDefs)) {
+        const item = document.createElement('label');
+        item.className = 'chat-manager-dropdown-item';
+
+        const cb = document.createElement('input');
+        cb.type = 'checkbox';
+        cb.checked = filterTags.includes(tagId);
+        cb.addEventListener('change', () => {
+            const current = getFilterState().tags.slice();
+            if (cb.checked) {
+                if (!current.includes(tagId)) current.push(tagId);
+            } else {
+                const idx = current.indexOf(tagId);
+                if (idx !== -1) current.splice(idx, 1);
+            }
+            setFilterState({ tags: current });
+            renderThreadCards();
+        });
+
+        const dot = document.createElement('span');
+        dot.className = 'chat-manager-dropdown-color-dot';
+        dot.style.background = def.color;
+
+        const label = document.createElement('span');
+        label.textContent = def.name;
+
+        item.appendChild(cb);
+        item.appendChild(dot);
+        item.appendChild(label);
+        dropdown.appendChild(item);
+    }
+
+    showDropdown(anchorEl, dropdown);
+}
+
+function showAdvancedFilterDropdown(anchorEl) {
+    const dropdown = document.createElement('div');
+    dropdown.className = 'chat-manager-dropdown chat-manager-adv-filter';
+    const f = getFilterState();
+
+    dropdown.innerHTML = `
+        <label>Date from</label>
+        <input type="date" class="cm-af-date-from" value="${f.dateFrom || ''}">
+        <label>Date to</label>
+        <input type="date" class="cm-af-date-to" value="${f.dateTo || ''}">
+        <label>Min messages</label>
+        <input type="number" class="cm-af-count-min" min="0" value="${f.messageCountMin ?? ''}">
+        <label>Max messages</label>
+        <input type="number" class="cm-af-count-max" min="0" value="${f.messageCountMax ?? ''}">
+        <div class="chat-manager-adv-filter-actions">
+            <button class="chat-manager-btn cm-af-clear">Clear</button>
+            <button class="chat-manager-btn cm-af-apply">Apply</button>
+        </div>
+    `;
+
+    dropdown.querySelector('.cm-af-apply').addEventListener('click', () => {
+        const dateFrom = dropdown.querySelector('.cm-af-date-from').value || null;
+        const dateTo = dropdown.querySelector('.cm-af-date-to').value || null;
+        const minVal = dropdown.querySelector('.cm-af-count-min').value;
+        const maxVal = dropdown.querySelector('.cm-af-count-max').value;
+        setFilterState({
+            dateFrom,
+            dateTo,
+            messageCountMin: minVal !== '' ? parseInt(minVal, 10) : null,
+            messageCountMax: maxVal !== '' ? parseInt(maxVal, 10) : null,
+        });
+        dismissDropdown();
+        renderThreadCards();
+    });
+
+    dropdown.querySelector('.cm-af-clear').addEventListener('click', () => {
+        setFilterState({ dateFrom: null, dateTo: null, messageCountMin: null, messageCountMax: null });
+        dismissDropdown();
+        renderThreadCards();
+    });
+
+    // Prevent dropdown from closing when clicking inside form elements
+    dropdown.addEventListener('click', (e) => e.stopPropagation());
+
+    showDropdown(anchorEl, dropdown);
+}
+
+/**
+ * Show tag assignment dropdown for a specific card.
+ */
+function showTagAssignDropdown(anchorEl, fileName) {
+    const dropdown = document.createElement('div');
+    dropdown.className = 'chat-manager-dropdown';
+
+    const tagDefs = getTagDefinitions();
+    const chatTags = getChatTags(fileName);
+
+    for (const [tagId, def] of Object.entries(tagDefs)) {
+        const item = document.createElement('label');
+        item.className = 'chat-manager-dropdown-item';
+
+        const cb = document.createElement('input');
+        cb.type = 'checkbox';
+        cb.checked = chatTags.includes(tagId);
+        cb.addEventListener('change', () => {
+            if (cb.checked) {
+                addChatTag(fileName, tagId);
+            } else {
+                removeChatTag(fileName, tagId);
+            }
+            // Update tag chips on the card in-place
+            patchCardTags(fileName);
+        });
+
+        const dot = document.createElement('span');
+        dot.className = 'chat-manager-dropdown-color-dot';
+        dot.style.background = def.color;
+
+        const label = document.createElement('span');
+        label.textContent = def.name;
+
+        item.appendChild(cb);
+        item.appendChild(dot);
+        item.appendChild(label);
+        dropdown.appendChild(item);
+    }
+
+    const sep = document.createElement('hr');
+    sep.className = 'chat-manager-dropdown-sep';
+    dropdown.appendChild(sep);
+
+    const manageLink = document.createElement('div');
+    manageLink.className = 'chat-manager-dropdown-link';
+    manageLink.textContent = 'Manage tags\u2026';
+    manageLink.addEventListener('click', () => {
+        dismissDropdown();
+        openTagManagerDialog();
+    });
+    dropdown.appendChild(manageLink);
+
+    showDropdown(anchorEl, dropdown);
+}
+
+/**
+ * Update tag chips on a card after tag assignment changes.
+ */
+function patchCardTags(fileName) {
+    const card = document.querySelector(`.chat-manager-card[data-filename="${CSS.escape(fileName)}"]`);
+    if (!card) return;
+
+    const tagDefs = getTagDefinitions();
+    const chatTags = getChatTags(fileName);
+
+    let tagsRow = card.querySelector('.chat-manager-card-tags');
+    if (chatTags.length === 0) {
+        if (tagsRow) tagsRow.remove();
+        return;
+    }
+
+    if (!tagsRow) {
+        tagsRow = document.createElement('div');
+        tagsRow.className = 'chat-manager-card-tags';
+        const header = card.querySelector('.chat-manager-card-header');
+        if (header) header.after(tagsRow);
+    }
+
+    tagsRow.innerHTML = '';
+    for (const tagId of chatTags) {
+        const def = tagDefs[tagId];
+        if (!def) continue;
+        const chip = document.createElement('span');
+        chip.className = 'chat-manager-tag-chip';
+        chip.style.background = def.color;
+        chip.style.color = def.textColor;
+        chip.textContent = def.name;
+        tagsRow.appendChild(chip);
+    }
+}
+
+/**
+ * Open the tag management dialog using SillyTavern Popup API.
+ */
+function openTagManagerDialog() {
+    const context = SillyTavern.getContext();
+    const { Popup, POPUP_TYPE } = context;
+
+    const tagDefs = getTagDefinitions();
+
+    let listHtml = '';
+    for (const [tagId, def] of Object.entries(tagDefs)) {
+        listHtml += `
+        <div class="chat-manager-tag-manager-row" data-tag-id="${escapeAttr(tagId)}">
+            <input type="color" class="cm-tag-color" value="${escapeAttr(def.color)}">
+            <input type="text" class="cm-tag-name" value="${escapeAttr(def.name)}">
+            <button class="chat-manager-btn chat-manager-tag-manager-delete" title="Delete tag"><i class="fa-solid fa-trash"></i></button>
+        </div>`;
+    }
+
+    const html = `
+    <div class="chat-manager-tag-manager">
+        <h4 style="margin:0 0 10px">Manage Tags</h4>
+        <div class="chat-manager-tag-manager-list">${listHtml}</div>
+        <div class="chat-manager-tag-manager-add">
+            <input type="color" class="cm-new-tag-color" value="#607D8B">
+            <input type="text" class="cm-new-tag-name" placeholder="New tag name...">
+            <button class="chat-manager-btn cm-new-tag-add">Add</button>
+        </div>
+    </div>`;
+
+    const popup = new Popup(html, POPUP_TYPE.TEXT, '', { okButton: 'Done', wide: false, large: false });
+    popup.show();
+
+    // Wait for popup DOM
+    requestAnimationFrame(() => {
+        const popupEl = document.querySelector('.chat-manager-tag-manager');
+        if (!popupEl) return;
+
+        // Bind inline editing
+        popupEl.querySelectorAll('.chat-manager-tag-manager-row').forEach(row => {
+            const tagId = row.dataset.tagId;
+            const colorInput = row.querySelector('.cm-tag-color');
+            const nameInput = row.querySelector('.cm-tag-name');
+            const deleteBtn = row.querySelector('.chat-manager-tag-manager-delete');
+
+            colorInput.addEventListener('change', () => updateTagDefinition(tagId, { color: colorInput.value }));
+            nameInput.addEventListener('change', () => updateTagDefinition(tagId, { name: nameInput.value.trim() }));
+
+            deleteBtn.addEventListener('click', () => {
+                deleteTagDefinition(tagId);
+                row.remove();
+            });
+        });
+
+        // Add new tag
+        const addBtn = popupEl.querySelector('.cm-new-tag-add');
+        const newColor = popupEl.querySelector('.cm-new-tag-color');
+        const newName = popupEl.querySelector('.cm-new-tag-name');
+
+        addBtn.addEventListener('click', () => {
+            const name = newName.value.trim();
+            if (!name) return;
+            const created = createTagDefinition(name, newColor.value);
+            if (!created) {
+                toastr.warning('A tag with that name already exists.');
+                return;
+            }
+            // Add row to list
+            const list = popupEl.querySelector('.chat-manager-tag-manager-list');
+            const row = document.createElement('div');
+            row.className = 'chat-manager-tag-manager-row';
+            row.dataset.tagId = created.id;
+            row.innerHTML = `
+                <input type="color" class="cm-tag-color" value="${escapeAttr(created.color)}">
+                <input type="text" class="cm-tag-name" value="${escapeAttr(created.name)}">
+                <button class="chat-manager-btn chat-manager-tag-manager-delete" title="Delete tag"><i class="fa-solid fa-trash"></i></button>
+            `;
+            row.querySelector('.cm-tag-color').addEventListener('change', (e) => updateTagDefinition(created.id, { color: e.target.value }));
+            row.querySelector('.cm-tag-name').addEventListener('change', (e) => updateTagDefinition(created.id, { name: e.target.value.trim() }));
+            row.querySelector('.chat-manager-tag-manager-delete').addEventListener('click', () => { deleteTagDefinition(created.id); row.remove(); });
+            list.appendChild(row);
+            newName.value = '';
+        });
+
+        newName.addEventListener('keydown', (e) => {
+            if (e.key === 'Enter') {
+                e.preventDefault();
+                addBtn.click();
+            }
+        });
+    });
 }
 
 // ──────────────────────────────────────────────
@@ -925,6 +1556,11 @@ function bindCardEvents(container) {
         btn.addEventListener('click', handleEditDisplayName);
     });
 
+    // Tag assignment
+    container.querySelectorAll('.chat-manager-tag-btn').forEach(btn => {
+        btn.addEventListener('click', handleTagButton);
+    });
+
     // AI title
     container.querySelectorAll('.chat-manager-ai-title-btn').forEach(btn => {
         btn.addEventListener('click', handleAITitle);
@@ -949,6 +1585,13 @@ function bindCardEvents(container) {
     container.querySelectorAll('.chat-manager-branch-jump').forEach(btn => {
         btn.addEventListener('click', handleJumpToGraphMessage);
     });
+}
+
+function handleTagButton(e) {
+    e.stopPropagation();
+    const filename = e.currentTarget.dataset.filename;
+    if (!filename) return;
+    showTagAssignDropdown(e.currentTarget, filename);
 }
 
 async function handleSwitchThread(e) {
@@ -1379,9 +2022,13 @@ function escapeAttr(str) {
  * @param {string} query
  */
 export function onSearchInput(query) {
+    const toolbar = document.querySelector('.chat-manager-filter-toolbar');
     if (!query || query.trim().length < 2) {
+        if (toolbar) toolbar.style.display = '';
         renderThreadCards();
     } else {
+        if (toolbar) toolbar.style.display = 'none';
+        dismissDropdown();
         performSearch(query);
     }
 }

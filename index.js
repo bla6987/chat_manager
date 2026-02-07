@@ -4,7 +4,7 @@
  */
 
 import { clearIndex, getIndexCharacterAvatar, updateActiveChat } from './src/chat-reader.js';
-import { togglePanel, closePanel, refreshPanel, renderThreadCards, onSearchInput, isPanelOpen, resetSearchState, toggleTimeline, isTimelineActive } from './src/ui-controller.js';
+import { togglePanel, closePanel, refreshPanel, renderThreadCards, onSearchInput, isPanelOpen, resetSearchState, toggleTimeline, isTimelineActive, toggleStats, isStatsActive } from './src/ui-controller.js';
 import { getDisplayMode, setDisplayMode } from './src/metadata-store.js';
 import { attachMomentumScroll } from './src/momentum-scroll.js';
 
@@ -41,7 +41,7 @@ const onMessageUpdate = (() => {
 
             if (activeChatFile) {
                 const updated = await updateActiveChat(activeChatFile);
-                if (updated && !isTimelineActive()) {
+                if (updated && !isTimelineActive() && !isStatsActive()) {
                     renderThreadCards();
                 }
             }
@@ -486,6 +486,15 @@ function bindPanelEvents() {
 
         searchInput.addEventListener('input', (e) => {
             debouncedSearch(e.target.value);
+        });
+    }
+
+    // Stats toggle button
+    const statsToggleBtn = document.getElementById('chat-manager-stats-toggle');
+    if (statsToggleBtn) {
+        statsToggleBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            toggleStats();
         });
     }
 

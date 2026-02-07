@@ -849,6 +849,108 @@ export function onHydrationUpdate(callback) {
 }
 
 /**
+ * Get the current index version (bumped on every mutation).
+ * @returns {number}
+ */
+export function getIndexVersion() {
+    return indexVersion;
+}
+
+/**
+ * Get a filtered and sorted snapshot of entries.
+ * @param {{ tags: string[], dateFrom: string|null, dateTo: string|null, messageCountMin: number|null, messageCountMax: number|null }} filterState
+ * @param {{ field: string, direction: string }} sortState
+ * @param {(fileName: string) => Object} getChatMetaFn - function to retrieve per-chat metadata
+ * @returns {ChatIndexEntry[]}
+ */
+export function getFilteredSortedEntries(filterState, sortState, getChatMetaFn) {
+    let entries = Object.values(chatIndex);
+
+    // ── Filter: tags (OR logic) ──
+    if (filterState.tags && filterState.tags.length > 0) {
+        const filterTags = new Set(filterState.tags);
+        entries = entries.filter(entry => {
+            const meta = getChatMetaFn(entry.fileName);
+            const chatTags = Array.isArray(meta.tags) ? meta.tags : [];
+            return chatTags.some(t => filterTags.has(t));
+        });
+    }
+
+    // ── Filter: date range (AND with above) ──
+    if (filterState.dateFrom) {
+        const from = new Date(filterState.dateFrom).getTime();
+        if (Number.isFinite(from)) {
+            entries = entries.filter(entry => {
+                const ts = entry.lastMessageTimestamp ? new Date(entry.lastMessageTimestamp).getTime() : entry.sortTimestamp;
+                return Number.isFinite(ts) && ts >= from;
+            });
+        }
+    }
+    if (filterState.dateTo) {
+        // dateTo is inclusive — add one day
+        const to = new Date(filterState.dateTo).getTime() + 86400000;
+        if (Number.isFinite(to)) {
+            entries = entries.filter(entry => {
+                const ts = entry.firstMessageTimestamp ? new Date(entry.firstMessageTimestamp).getTime() : entry.sortTimestamp;
+                return Number.isFinite(ts) && ts <= to;
+            });
+        }
+    }
+
+    // ── Filter: message count range (AND) ──
+    if (filterState.messageCountMin != null) {
+        entries = entries.filter(entry => entry.messageCount >= filterState.messageCountMin);
+    }
+    if (filterState.messageCountMax != null) {
+        entries = entries.filter(entry => entry.messageCount <= filterState.messageCountMax);
+    }
+
+    // ── Sort ──
+    const dir = sortState.direction === 'asc' ? 1 : -1;
+    const field = sortState.field || 'recency';
+
+    entries.sort((a, b) => {
+        let cmp = 0;
+        switch (field) {
+            case 'recency': {
+                const aTime = Number.isFinite(a.sortTimestamp) ? a.sortTimestamp : FALLBACK_SORT_TIMESTAMP;
+                const bTime = Number.isFinite(b.sortTimestamp) ? b.sortTimestamp : FALLBACK_SORT_TIMESTAMP;
+                cmp = aTime - bTime;
+                break;
+            }
+            case 'alphabetical': {
+                const aName = (getChatMetaFn(a.fileName).displayName || a.fileName).toLowerCase();
+                const bName = (getChatMetaFn(b.fileName).displayName || b.fileName).toLowerCase();
+                cmp = aName.localeCompare(bName);
+                break;
+            }
+            case 'messageCount': {
+                cmp = a.messageCount - b.messageCount;
+                break;
+            }
+            case 'created': {
+                const aFirst = a.firstMessageTimestamp ? new Date(a.firstMessageTimestamp).getTime() : FALLBACK_SORT_TIMESTAMP;
+                const bFirst = b.firstMessageTimestamp ? new Date(b.firstMessageTimestamp).getTime() : FALLBACK_SORT_TIMESTAMP;
+                cmp = aFirst - bFirst;
+                break;
+            }
+            default:
+                cmp = 0;
+        }
+
+        if (cmp !== 0) return cmp * dir;
+
+        // Tie-breaker: initialOrder then fileName
+        const aOrder = Number.isFinite(a.initialOrder) ? a.initialOrder : Number.MAX_SAFE_INTEGER;
+        const bOrder = Number.isFinite(b.initialOrder) ? b.initialOrder : Number.MAX_SAFE_INTEGER;
+        if (aOrder !== bOrder) return aOrder - bOrder;
+        return a.fileName.localeCompare(b.fileName);
+    });
+
+    return entries;
+}
+
+/**
  * Build a flat array of loaded messages for search.
  * Returns a cached array if the index hasn't changed since the last call.
  * @returns {Array}

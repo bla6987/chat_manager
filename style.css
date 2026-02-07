@@ -1018,6 +1018,448 @@
 }
 
 /* ══════════════════════════════════════════════
+   Filter Toolbar
+   ══════════════════════════════════════════════ */
+
+.chat-manager-filter-toolbar {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 4px 12px 6px;
+    gap: 6px;
+    flex-shrink: 0;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.chat-manager-sort-controls {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    flex-shrink: 0;
+}
+
+.chat-manager-sort-select {
+    background: rgba(0, 0, 0, 0.2);
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    border-radius: 4px;
+    color: inherit;
+    font-size: 0.78em;
+    padding: 3px 6px;
+    outline: none;
+    cursor: pointer;
+}
+
+.chat-manager-sort-select:focus {
+    border-color: rgba(255, 255, 255, 0.25);
+}
+
+.chat-manager-sort-dir-btn {
+    width: 28px;
+    height: 28px;
+    padding: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 0.85em;
+}
+
+.chat-manager-filter-controls {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+}
+
+.chat-manager-filter-btn {
+    width: 28px;
+    height: 28px;
+    padding: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 0.85em;
+    position: relative;
+}
+
+.chat-manager-filter-btn.has-active {
+    background: rgba(70, 140, 220, 0.2);
+    border-color: rgba(70, 140, 220, 0.5);
+    color: rgba(100, 180, 255, 0.9);
+}
+
+.chat-manager-clear-filters-btn {
+    font-size: 0.85em;
+    width: 28px;
+    height: 28px;
+    padding: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    color: rgba(255, 120, 100, 0.8);
+}
+
+.chat-manager-clear-filters-btn:hover {
+    color: rgba(255, 140, 120, 1);
+    background: rgba(255, 80, 60, 0.12);
+}
+
+/* ── Tag Chips on Cards ── */
+
+.chat-manager-card-tags {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+    margin-bottom: 6px;
+}
+
+.chat-manager-tag-chip {
+    display: inline-flex;
+    align-items: center;
+    padding: 1px 8px;
+    border-radius: 10px;
+    font-size: 0.72em;
+    font-weight: 500;
+    line-height: 1.6;
+    white-space: nowrap;
+}
+
+/* ── Dropdowns (shared) ── */
+
+.chat-manager-dropdown {
+    position: fixed;
+    z-index: 6100;
+    background: var(--SmartThemeBlurTintColor, rgba(20, 20, 30, 0.97));
+    border: 1px solid rgba(255, 255, 255, 0.15);
+    border-radius: 8px;
+    padding: 8px 0;
+    min-width: 180px;
+    max-width: 280px;
+    max-height: 320px;
+    overflow-y: auto;
+    box-shadow: 0 6px 20px rgba(0, 0, 0, 0.5);
+    font-size: 0.85em;
+}
+
+.chat-manager-dropdown-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 12px;
+    cursor: pointer;
+    transition: background 0.1s;
+}
+
+.chat-manager-dropdown-item:hover {
+    background: rgba(255, 255, 255, 0.06);
+}
+
+.chat-manager-dropdown-item input[type="checkbox"] {
+    margin: 0;
+    flex-shrink: 0;
+}
+
+.chat-manager-dropdown-color-dot {
+    width: 10px;
+    height: 10px;
+    border-radius: 50%;
+    flex-shrink: 0;
+}
+
+.chat-manager-dropdown-sep {
+    border: none;
+    border-top: 1px solid rgba(255, 255, 255, 0.08);
+    margin: 4px 0;
+}
+
+.chat-manager-dropdown-link {
+    display: block;
+    padding: 6px 12px;
+    cursor: pointer;
+    color: rgba(100, 180, 255, 0.85);
+    font-size: 0.9em;
+    transition: background 0.1s;
+}
+
+.chat-manager-dropdown-link:hover {
+    background: rgba(255, 255, 255, 0.06);
+}
+
+/* ── Advanced Filter Dropdown ── */
+
+.chat-manager-adv-filter {
+    padding: 10px 12px;
+    min-width: 220px;
+}
+
+.chat-manager-adv-filter label {
+    display: block;
+    font-size: 0.82em;
+    opacity: 0.7;
+    margin-bottom: 3px;
+    margin-top: 8px;
+}
+
+.chat-manager-adv-filter label:first-child {
+    margin-top: 0;
+}
+
+.chat-manager-adv-filter input[type="date"],
+.chat-manager-adv-filter input[type="number"] {
+    width: 100%;
+    padding: 4px 8px;
+    border: 1px solid rgba(255, 255, 255, 0.15);
+    border-radius: 4px;
+    background: rgba(0, 0, 0, 0.2);
+    color: inherit;
+    font-size: 0.9em;
+    box-sizing: border-box;
+    outline: none;
+}
+
+.chat-manager-adv-filter input:focus {
+    border-color: rgba(255, 255, 255, 0.3);
+}
+
+.chat-manager-adv-filter-actions {
+    display: flex;
+    gap: 6px;
+    margin-top: 10px;
+}
+
+.chat-manager-adv-filter-actions .chat-manager-btn {
+    flex: 1;
+    text-align: center;
+}
+
+/* ── Tag Manager Dialog ── */
+
+.chat-manager-tag-manager {
+    max-width: 360px;
+}
+
+.chat-manager-tag-manager-list {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    margin-bottom: 12px;
+    max-height: 300px;
+    overflow-y: auto;
+}
+
+.chat-manager-tag-manager-row {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 4px 0;
+}
+
+.chat-manager-tag-manager-row input[type="color"] {
+    width: 28px;
+    height: 28px;
+    border: none;
+    border-radius: 4px;
+    padding: 0;
+    cursor: pointer;
+    background: transparent;
+    flex-shrink: 0;
+}
+
+.chat-manager-tag-manager-row input[type="text"] {
+    flex: 1;
+    padding: 4px 8px;
+    border: 1px solid rgba(255, 255, 255, 0.15);
+    border-radius: 4px;
+    background: rgba(0, 0, 0, 0.2);
+    color: inherit;
+    font-size: 0.9em;
+    outline: none;
+    min-width: 0;
+}
+
+.chat-manager-tag-manager-delete {
+    width: 28px;
+    height: 28px;
+    padding: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 0.85em;
+    color: rgba(255, 120, 100, 0.7);
+    flex-shrink: 0;
+}
+
+.chat-manager-tag-manager-delete:hover {
+    color: rgba(255, 120, 100, 1);
+    background: rgba(255, 80, 60, 0.12);
+}
+
+.chat-manager-tag-manager-add {
+    display: flex;
+    gap: 6px;
+    align-items: center;
+    padding-top: 8px;
+    border-top: 1px solid rgba(255, 255, 255, 0.08);
+}
+
+.chat-manager-tag-manager-add input[type="color"] {
+    width: 28px;
+    height: 28px;
+    border: none;
+    border-radius: 4px;
+    padding: 0;
+    cursor: pointer;
+    background: transparent;
+    flex-shrink: 0;
+}
+
+.chat-manager-tag-manager-add input[type="text"] {
+    flex: 1;
+    padding: 4px 8px;
+    border: 1px solid rgba(255, 255, 255, 0.15);
+    border-radius: 4px;
+    background: rgba(0, 0, 0, 0.2);
+    color: inherit;
+    font-size: 0.9em;
+    outline: none;
+    min-width: 0;
+}
+
+/* ── No Results with Filter ── */
+
+.chat-manager-no-filter-results {
+    text-align: center;
+    padding: 30px 20px;
+    opacity: 0.6;
+}
+
+.chat-manager-no-filter-results p {
+    margin: 0 0 12px;
+    font-style: italic;
+}
+
+/* ══════════════════════════════════════════════
+   Stats Dashboard
+   ══════════════════════════════════════════════ */
+
+/* ── Stats Toggle Button ── */
+
+.chat-manager-stats-toggle {
+    font-size: 1.1em;
+    line-height: 1;
+    width: 32px;
+    height: 32px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.chat-manager-stats-toggle.active {
+    background: rgba(100, 180, 255, 0.2);
+    border-color: rgba(100, 180, 255, 0.5);
+    color: rgba(100, 180, 255, 0.9);
+}
+
+/* ── Stats Container ── */
+
+.chat-manager-stats-container {
+    padding: 12px;
+}
+
+.chat-manager-stats-title {
+    font-size: 0.88em;
+    font-weight: 600;
+    margin: 0 0 10px;
+    opacity: 0.8;
+}
+
+.chat-manager-stats-progress {
+    font-size: 0.78em;
+    opacity: 0.5;
+    margin-bottom: 10px;
+    font-style: italic;
+}
+
+/* ── Stats Grid ── */
+
+.chat-manager-stats-grid {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 1px;
+    background: rgba(255, 255, 255, 0.06);
+    border-radius: 8px;
+    overflow: hidden;
+    margin-bottom: 16px;
+}
+
+.chat-manager-stat-cell {
+    background: var(--SmartThemeBlurTintColor, rgba(20, 20, 30, 0.95));
+    padding: 10px 12px;
+    display: flex;
+    flex-direction: column;
+    gap: 2px;
+}
+
+.chat-manager-stat-label {
+    font-size: 0.72em;
+    text-transform: uppercase;
+    letter-spacing: 0.04em;
+    opacity: 0.5;
+}
+
+.chat-manager-stat-value {
+    font-size: 1.3em;
+    font-weight: 700;
+}
+
+.chat-manager-stat-detail {
+    font-size: 0.78em;
+    opacity: 0.5;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+/* ── Heatmap ── */
+
+.chat-manager-heatmap-section {
+    border-top: 1px solid rgba(255, 255, 255, 0.08);
+    padding-top: 12px;
+}
+
+.chat-manager-heatmap-title {
+    font-size: 0.82em;
+    font-weight: 600;
+    margin: 0 0 8px;
+    opacity: 0.7;
+}
+
+.chat-manager-heatmap-wrapper {
+    overflow-x: auto;
+    overflow-y: hidden;
+    position: relative;
+}
+
+.chat-manager-heatmap-canvas {
+    display: block;
+    cursor: pointer;
+}
+
+/* ── Heatmap Tooltip ── */
+
+.chat-manager-heatmap-tooltip {
+    position: fixed;
+    z-index: 6200;
+    background: rgba(20, 20, 30, 0.95);
+    border: 1px solid rgba(255, 255, 255, 0.15);
+    border-radius: 6px;
+    padding: 6px 10px;
+    font-size: 0.8em;
+    color: var(--SmartThemeBodyColor, #ccc);
+    pointer-events: none;
+    box-shadow: 0 4px 12px rgba(0, 0, 0, 0.4);
+    white-space: nowrap;
+}
+
+/* ══════════════════════════════════════════════
    Touch Device Overrides
    Targets devices with coarse pointers (touchscreens)
    ══════════════════════════════════════════════ */
@@ -1169,6 +1611,32 @@
         min-height: 32px;
         display: flex;
         align-items: center;
+    }
+
+    /* ── Filter toolbar touch targets ── */
+
+    .chat-manager-sort-dir-btn,
+    .chat-manager-filter-btn,
+    .chat-manager-clear-filters-btn {
+        width: 44px;
+        height: 44px;
+    }
+
+    .chat-manager-stats-toggle {
+        width: 44px;
+        height: 44px;
+    }
+
+    .chat-manager-dropdown-item {
+        padding: 10px 12px;
+        min-height: 44px;
+    }
+
+    /* ── Heatmap horizontal scroll on touch ── */
+
+    .chat-manager-heatmap-wrapper {
+        touch-action: pan-x;
+        -webkit-overflow-scrolling: touch;
     }
 }
 
