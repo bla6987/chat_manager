@@ -31,13 +31,41 @@ function normalizeText(text) {
 }
 
 /**
+ * Filter loaded entries to only those sharing the active chat's thread.
+ * A chat is "on-thread" if it shares at least the first 2 messages with the active chat.
+ * @param {Array<{fileName: string, entry: Object}>} loadedEntries
+ * @param {string} activeChatFile
+ * @returns {Array<{fileName: string, entry: Object}>}
+ */
+function filterToThread(loadedEntries, activeChatFile) {
+    const activeEntry = loadedEntries.find(e => e.fileName === activeChatFile);
+    if (!activeEntry || activeEntry.entry.messages.length < 2) return loadedEntries;
+
+    const activeKeys = activeEntry.entry.messages.map(
+        msg => `${msg.role}:${normalizeText(msg.text)}`,
+    );
+
+    return loadedEntries.filter(({ fileName, entry }) => {
+        if (fileName === activeChatFile) return true;
+        if (entry.messages.length < 2) return false;
+
+        for (let i = 0; i < 2; i++) {
+            const key = `${entry.messages[i].role}:${normalizeText(entry.messages[i].text)}`;
+            if (key !== activeKeys[i]) return false;
+        }
+        return true;
+    });
+}
+
+/**
  * Build icicle data from chatIndex.
  *
  * @param {Object} chatIndex - keyed by fileName
  * @param {string|null} activeChatFile
+ * @param {{ threadFocus?: boolean }} [options]
  * @returns {{ root: TrieNode, flatNodes: Array, maxDepth: number, loadedCount: number }}
  */
-export function buildIcicleData(chatIndex, activeChatFile) {
+export function buildIcicleData(chatIndex, activeChatFile, options = {}) {
     const loadedEntries = [];
     for (const [fileName, entry] of Object.entries(chatIndex)) {
         if (entry.isLoaded && entry.messages && entry.messages.length > 0) {
@@ -49,12 +77,18 @@ export function buildIcicleData(chatIndex, activeChatFile) {
         return { root: null, flatNodes: [], maxDepth: 0, loadedCount: 0 };
     }
 
+    // Optional thread-focus filter
+    let entries = loadedEntries;
+    if (options.threadFocus && activeChatFile) {
+        entries = filterToThread(loadedEntries, activeChatFile);
+    }
+
     // ── Phase 1: Trie construction ──
     const root = makeNode('', '', -1);
-    root.chatFiles = loadedEntries.map(e => e.fileName);
+    root.chatFiles = entries.map(e => e.fileName);
     let maxDepth = 0;
 
-    for (const { fileName, entry } of loadedEntries) {
+    for (const { fileName, entry } of entries) {
         let current = root;
 
         for (let i = 0; i < entry.messages.length; i++) {
@@ -83,7 +117,7 @@ export function buildIcicleData(chatIndex, activeChatFile) {
     const flatNodes = [];
     flattenTrie(root, flatNodes);
 
-    return { root, flatNodes, maxDepth, loadedCount: loadedEntries.length };
+    return { root, flatNodes, maxDepth, loadedCount: entries.length };
 }
 
 /**

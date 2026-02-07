@@ -9,6 +9,7 @@ import {
 import {
     getDisplayName, setDisplayName, getSummary, setSummary,
     migrateFileKey, getDisplayMode,
+    getThreadFocus, setThreadFocus as persistThreadFocus,
 } from './metadata-store.js';
 import {
     generateTitleForActiveChat, generateTitleForChat,
@@ -17,6 +18,7 @@ import {
 import {
     mountIcicle, unmountIcicle, updateIcicleData,
     focusMessageInIcicle, isIcicleMounted, setIcicleCallbacks,
+    setThreadFocus as setIcicleThreadFocus,
 } from './icicle-view.js';
 
 const MODULE_NAME = 'chat_manager';
@@ -66,7 +68,11 @@ export function toggleTimeline() {
         setIcicleCallbacks({
             onJump: handleTimelineJumpToMessage,
             getActive: getActiveFilename,
+            onThreadFocusChanged: persistThreadFocus,
         });
+
+        // Initialize thread focus from persisted preference
+        setIcicleThreadFocus(getThreadFocus());
 
         // Show loading state immediately so the browser can paint before heavy work
         if (content) content.innerHTML = '<div class="chat-manager-loading"><div class="chat-manager-spinner"></div> Building chart\u2026</div>';
@@ -410,6 +416,7 @@ export async function refreshPanel() {
             const content = document.getElementById('chat-manager-content');
             if (content) {
                 content.innerHTML = '<div class="chat-manager-loading"><div class="chat-manager-spinner"></div> Building graph\u2026</div>';
+                setIcicleThreadFocus(getThreadFocus());
                 requestAnimationFrame(() => {
                     if (!timelineActive) return;
                     if (content) mountIcicle(content, 'mini');

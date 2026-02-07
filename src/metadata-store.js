@@ -174,3 +174,24 @@ export function setDisplayMode(mode) {
     extensionSettings[MODULE_NAME].displayMode = mode;
     saveSettingsDebounced();
 }
+
+/**
+ * Get the thread focus preference (defaults to true).
+ * @returns {boolean}
+ */
+export function getThreadFocus() {
+    ensureSettings();
+    const { extensionSettings } = SillyTavern.getContext();
+    return extensionSettings[MODULE_NAME].threadFocus !== false;
+}
+
+/**
+ * Set the thread focus preference.
+ * @param {boolean} active
+ */
+export function setThreadFocus(active) {
+    ensureSettings();
+    const { extensionSettings, saveSettingsDebounced } = SillyTavern.getContext();
+    extensionSettings[MODULE_NAME].threadFocus = active;
+    saveSettingsDebounced();
+}

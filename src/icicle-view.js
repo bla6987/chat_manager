@@ -33,6 +33,7 @@ let ctx = null;
 let container = null;
 let currentMode = null;       // 'mini' | 'full'
 let mounted = false;
+let threadFocusActive = true;
 
 // Data
 let icicleRoot = null;
@@ -71,6 +72,7 @@ let wasDragging = false;
 // Interaction state
 let hoveredNode = null;
 let resetBtnEl = null;
+let focusBtnEl = null;
 let tooltipEl = null;
 let popupEl = null;
 let breadcrumbEl = null;
@@ -80,6 +82,7 @@ let pendingFocusRequest = null;
 // Callbacks
 let onJumpToChat = null;
 let getActiveChatFile = null;
+let onThreadFocusChanged = null;
 
 // ──────────────────────────────────────────────
 //  Public API
@@ -88,6 +91,11 @@ let getActiveChatFile = null;
 export function setIcicleCallbacks(callbacks) {
     onJumpToChat = callbacks.onJump;
     getActiveChatFile = callbacks.getActive;
+    onThreadFocusChanged = callbacks.onThreadFocusChanged || null;
+}
+
+export function setThreadFocus(active) {
+    threadFocusActive = active;
 }
 
 export function isIcicleMounted() {
@@ -127,7 +135,7 @@ export function mountIcicle(containerEl, mode) {
     // Build data
     const activeChatFile = getActiveChatFile ? getActiveChatFile() : null;
     const chatIndex = getIndex();
-    const data = buildIcicleData(chatIndex, activeChatFile);
+    const data = buildIcicleData(chatIndex, activeChatFile, { threadFocus: threadFocusActive });
 
     icicleRoot = data.root;
     flatNodes = data.flatNodes;
@@ -167,6 +175,21 @@ export function mountIcicle(containerEl, mode) {
     });
     container.appendChild(resetBtnEl);
 
+    // Create focus toggle button
+    focusBtnEl = document.createElement('button');
+    focusBtnEl.className = 'chat-manager-btn chat-manager-icicle-focus-btn' + (threadFocusActive ? ' active' : '');
+    focusBtnEl.title = threadFocusActive ? 'Showing current thread — click for all chats' : 'Showing all chats — click for current thread';
+    focusBtnEl.innerHTML = '&#x1F500;';
+    focusBtnEl.addEventListener('click', (e) => {
+        e.stopPropagation();
+        threadFocusActive = !threadFocusActive;
+        focusBtnEl.classList.toggle('active', threadFocusActive);
+        focusBtnEl.title = threadFocusActive ? 'Showing current thread — click for all chats' : 'Showing all chats — click for current thread';
+        if (onThreadFocusChanged) onThreadFocusChanged(threadFocusActive);
+        updateIcicleData();
+    });
+    container.appendChild(focusBtnEl);
+
     // Create tooltip
     createTooltip();
 
@@ -205,6 +228,10 @@ export function unmountIcicle() {
         resetBtnEl.remove();
         resetBtnEl = null;
     }
+    if (focusBtnEl) {
+        focusBtnEl.remove();
+        focusBtnEl = null;
+    }
 
     container = null;
     currentMode = null;
@@ -226,7 +253,7 @@ export function updateIcicleData() {
 
     const activeChatFile = getActiveChatFile ? getActiveChatFile() : null;
     const chatIndex = getIndex();
-    const data = buildIcicleData(chatIndex, activeChatFile);
+    const data = buildIcicleData(chatIndex, activeChatFile, { threadFocus: threadFocusActive });
 
     icicleRoot = data.root;
     flatNodes = data.flatNodes;

@@ -652,6 +652,32 @@
     opacity: 1;
 }
 
+.chat-manager-icicle-focus-btn {
+    position: absolute;
+    bottom: 8px;
+    left: 8px;
+    z-index: 10;
+    font-size: 1em;
+    width: 28px;
+    height: 28px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    opacity: 0.6;
+    transition: opacity 0.15s, background 0.15s;
+}
+
+.chat-manager-icicle-focus-btn:hover {
+    opacity: 1;
+}
+
+.chat-manager-icicle-focus-btn.active {
+    background: rgba(100, 180, 255, 0.2);
+    border-color: rgba(100, 180, 255, 0.5);
+    color: rgba(100, 180, 255, 0.9);
+    opacity: 0.85;
+}
+
 .chat-manager-content.timeline-active {
     padding: 0;
     overflow: hidden;
