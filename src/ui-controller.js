@@ -152,6 +152,46 @@ function formatFromNowOrFallback(momentLib, value, fallback = 'unknown') {
     return parsed.isValid() ? parsed.fromNow() : fallback;
 }
 
+function getLastMessageFallback(entry) {
+    if (!entry || !entry.isLoaded || !Array.isArray(entry.messages) || entry.messages.length === 0) {
+        return '';
+    }
+
+    const lastMsg = entry.messages[entry.messages.length - 1];
+    return typeof lastMsg?.text === 'string' ? lastMsg.text.trim() : '';
+}
+
+function getSummaryDisplay(entry) {
+    const summary = (getSummary(entry.fileName) || '').trim();
+    if (summary) {
+        return {
+            className: 'chat-manager-summary-text',
+            text: summary,
+        };
+    }
+
+    const lastMessage = getLastMessageFallback(entry);
+    if (lastMessage) {
+        return {
+            className: 'chat-manager-summary-text chat-manager-last-message-fallback',
+            text: lastMessage,
+        };
+    }
+
+    return {
+        className: 'chat-manager-summary-text chat-manager-no-summary',
+        text: 'No summary yet',
+    };
+}
+
+function patchSummaryTextElement(textEl, entry) {
+    if (!textEl || !entry) return;
+
+    const summaryDisplay = getSummaryDisplay(entry);
+    textEl.className = summaryDisplay.className;
+    textEl.textContent = summaryDisplay.text;
+}
+
 function scheduleHydrationUIRefresh() {
     if (refreshFromHydrationTimer) return;
 
@@ -529,6 +569,11 @@ function patchCardData() {
         const lastActive = formatFromNowOrFallback(moment, entry.lastMessageTimestamp, 'unknown');
         if (spans[2]) spans[2].textContent = lastActive;
 
+        const summaryText = card.querySelector('.chat-manager-summary-text');
+        if (summaryText) {
+            patchSummaryTextElement(summaryText, entry);
+        }
+
         // Remove "Indexing..." span and enable AI buttons when loaded
         if (entry.isLoaded) {
             const indexingSpan = Array.from(meta.querySelectorAll('span'))
@@ -595,7 +640,7 @@ export function renderThreadCards() {
     let html = '';
     for (const entry of entries) {
         const displayName = getDisplayName(entry.fileName) || entry.fileName;
-        const summary = getSummary(entry.fileName);
+        const summaryDisplay = getSummaryDisplay(entry);
         const isActive = entry.fileName === activeChatFile;
 
         const firstDate = formatDateOrFallback(moment, entry.firstMessageTimestamp, '?');
@@ -635,10 +680,7 @@ export function renderThreadCards() {
                 ${branchInfo}
             </div>
             <div class="chat-manager-card-summary" data-filename="${escapeAttr(entry.fileName)}">
-                ${summary
-                    ? `<p class="chat-manager-summary-text">${escapeHtml(summary)}</p>`
-                    : '<p class="chat-manager-summary-text chat-manager-no-summary">No summary yet</p>'
-                }
+                <p class="${summaryDisplay.className}">${escapeHtml(summaryDisplay.text)}</p>
                 <div class="chat-manager-summary-actions">
                     <i class="chat-manager-icon-btn chat-manager-edit-summary-btn fa-fw fa-solid fa-pen" data-filename="${escapeAttr(entry.fileName)}" title="Edit summary" tabindex="0"></i>
                     <i class="${regenSummaryClasses}" data-filename="${escapeAttr(entry.fileName)}" title="${escapeAttr(summaryTitle)}" tabindex="0"></i>
@@ -1114,8 +1156,8 @@ function handleEditSummary(e) {
         setSummary(filename, newSummary, true);
 
         const p = document.createElement('p');
-        p.className = 'chat-manager-summary-text' + (newSummary ? '' : ' chat-manager-no-summary');
-        p.textContent = newSummary || 'No summary yet';
+        const entry = getIndex()[filename] || { fileName: filename, isLoaded: false, messages: [] };
+        patchSummaryTextElement(p, entry);
         textarea.replaceWith(p);
     };
 
@@ -1168,8 +1210,7 @@ async function handleRegenSummary(e) {
             if (card) {
                 const textEl = card.querySelector('.chat-manager-summary-text');
                 if (textEl) {
-                    textEl.textContent = summary;
-                    textEl.classList.remove('chat-manager-no-summary');
+                    patchSummaryTextElement(textEl, entry || { fileName: filename, isLoaded: false, messages: [] });
                 }
             }
             toastr.success('Summary generated!');

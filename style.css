@@ -208,6 +208,10 @@
     opacity: 0.4;
 }
 
+.chat-manager-last-message-fallback {
+    opacity: 0.62;
+}
+
 .chat-manager-summary-actions {
     display: flex;
     gap: 6px;
