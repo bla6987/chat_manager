@@ -79,6 +79,18 @@ let breadcrumbEl = null;
 let modalInjected = false;
 let pendingFocusRequest = null;
 
+// Search state
+let searchBarEl = null;
+let searchInputEl = null;
+let searchPrevBtn = null;
+let searchNextBtn = null;
+let searchCounterEl = null;
+let searchQuery = '';
+let searchMatches = [];
+let searchMatchSet = new Set();
+let searchMatchIndex = -1;
+let searchDebounceTimer = null;
+
 // Callbacks
 let onJumpToChat = null;
 let getActiveChatFile = null;
@@ -154,6 +166,9 @@ export function mountIcicle(containerEl, mode) {
         return;
     }
 
+    // Create search bar (inserted first so it sits above canvas)
+    createSearchBar();
+
     // Create canvas
     canvas = document.createElement('canvas');
     canvas.className = 'chat-manager-icicle-canvas';
@@ -215,6 +230,7 @@ export function unmountIcicle() {
     unbindEvents();
     removeTooltip();
     removePopup();
+    removeSearchBar();
 
     if (canvas) {
         canvas.remove();
@@ -270,6 +286,11 @@ export function updateIcicleData() {
     cancelViewportAnim();
 
     if (!icicleRoot || flatNodes.length === 0) return;
+
+    // Re-run search against new data if query is active
+    if (searchQuery.length >= 2) {
+        executeSearch(searchQuery);
+    }
 
     scrollToActiveLeaf(activeChatFile);
     render();
@@ -332,6 +353,162 @@ export function closeFullScreen() {
 }
 
 // ──────────────────────────────────────────────
+//  Search
+// ──────────────────────────────────────────────
+
+function createSearchBar() {
+    searchBarEl = document.createElement('div');
+    searchBarEl.className = 'chat-manager-icicle-search-bar';
+
+    searchInputEl = document.createElement('input');
+    searchInputEl.className = 'chat-manager-search-input chat-manager-icicle-search-input';
+    searchInputEl.type = 'text';
+    searchInputEl.placeholder = 'Search messages\u2026';
+
+    searchPrevBtn = document.createElement('button');
+    searchPrevBtn.className = 'chat-manager-btn chat-manager-icicle-search-nav';
+    searchPrevBtn.textContent = '\u25B2';
+    searchPrevBtn.title = 'Previous match (Shift+Enter)';
+    searchPrevBtn.disabled = true;
+
+    searchNextBtn = document.createElement('button');
+    searchNextBtn.className = 'chat-manager-btn chat-manager-icicle-search-nav';
+    searchNextBtn.textContent = '\u25BC';
+    searchNextBtn.title = 'Next match (Enter)';
+    searchNextBtn.disabled = true;
+
+    searchCounterEl = document.createElement('span');
+    searchCounterEl.className = 'chat-manager-icicle-search-counter';
+
+    searchBarEl.appendChild(searchInputEl);
+    searchBarEl.appendChild(searchPrevBtn);
+    searchBarEl.appendChild(searchNextBtn);
+    searchBarEl.appendChild(searchCounterEl);
+
+    // Insert as first child so it sits above the canvas
+    container.insertBefore(searchBarEl, container.firstChild);
+
+    // Events
+    searchInputEl.addEventListener('input', () => {
+        clearTimeout(searchDebounceTimer);
+        searchDebounceTimer = setTimeout(() => executeSearch(searchInputEl.value), 150);
+    });
+
+    searchInputEl.addEventListener('keydown', (e) => {
+        if (e.key === 'Enter') {
+            e.preventDefault();
+            navigateMatch(e.shiftKey ? -1 : 1);
+        } else if (e.key === 'Escape') {
+            e.stopPropagation();
+            searchInputEl.value = '';
+            executeSearch('');
+            searchInputEl.blur();
+        }
+    });
+
+    searchPrevBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        navigateMatch(-1);
+    });
+
+    searchNextBtn.addEventListener('click', (e) => {
+        e.stopPropagation();
+        navigateMatch(1);
+    });
+}
+
+function executeSearch(raw) {
+    const query = raw.toLowerCase().trim();
+    searchQuery = query;
+
+    if (query.length < 2) {
+        searchMatches = [];
+        searchMatchSet = new Set();
+        searchMatchIndex = -1;
+        updateSearchUI();
+        render();
+        return;
+    }
+
+    searchMatches = flatNodes.filter(n => n.normalizedText && n.normalizedText.toLowerCase().includes(query));
+    searchMatchSet = new Set(searchMatches);
+
+    if (searchMatches.length > 0) {
+        searchMatchIndex = 0;
+        panToMatch();
+    } else {
+        searchMatchIndex = -1;
+    }
+
+    updateSearchUI();
+    render();
+}
+
+function navigateMatch(direction) {
+    if (searchMatches.length === 0) return;
+
+    searchMatchIndex += direction;
+    if (searchMatchIndex >= searchMatches.length) searchMatchIndex = 0;
+    if (searchMatchIndex < 0) searchMatchIndex = searchMatches.length - 1;
+
+    panToMatch();
+    updateSearchUI();
+    render();
+}
+
+function panToMatch() {
+    if (searchMatchIndex < 0 || searchMatchIndex >= searchMatches.length) return;
+
+    const node = searchMatches[searchMatchIndex];
+    const viewSpan = viewY1 - viewY0;
+
+    // Center viewport on the node, preserving current zoom level
+    const nodeMidY = (node.y0 + node.y1) / 2;
+    let targetY0 = nodeMidY - viewSpan / 2;
+    let targetY1 = nodeMidY + viewSpan / 2;
+
+    // Clamp
+    if (targetY0 < 0) { targetY0 = 0; targetY1 = viewSpan; }
+    if (targetY1 > 1) { targetY1 = 1; targetY0 = 1 - viewSpan; }
+
+    const targetX = Math.max(0, node.depth * COL_WIDTH - canvasWidth / 2 + COL_WIDTH / 2);
+
+    animateViewportTo(targetX, targetY0, targetY1);
+}
+
+function updateSearchUI() {
+    if (!searchCounterEl || !searchPrevBtn || !searchNextBtn) return;
+
+    const hasMatches = searchMatches.length > 0;
+    searchPrevBtn.disabled = !hasMatches;
+    searchNextBtn.disabled = !hasMatches;
+
+    if (searchQuery.length < 2) {
+        searchCounterEl.textContent = '';
+    } else if (hasMatches) {
+        searchCounterEl.textContent = `${searchMatchIndex + 1} of ${searchMatches.length}`;
+    } else {
+        searchCounterEl.textContent = '0 of 0';
+    }
+}
+
+function removeSearchBar() {
+    clearTimeout(searchDebounceTimer);
+    if (searchBarEl) {
+        searchBarEl.remove();
+        searchBarEl = null;
+    }
+    searchInputEl = null;
+    searchPrevBtn = null;
+    searchNextBtn = null;
+    searchCounterEl = null;
+    searchQuery = '';
+    searchMatches = [];
+    searchMatchSet = new Set();
+    searchMatchIndex = -1;
+}
+
+// ──────────────────────────────────────────────
 //  Canvas Sizing
 // ──────────────────────────────────────────────
 
@@ -342,9 +519,10 @@ function resizeCanvas() {
     canvasWidth = container.clientWidth;
     canvasHeight = container.clientHeight;
 
-    // Reserve space for breadcrumbs
+    // Reserve space for search bar and breadcrumbs
+    const searchBarHeight = searchBarEl ? searchBarEl.offsetHeight : 0;
     const breadcrumbHeight = breadcrumbEl ? breadcrumbEl.offsetHeight : 0;
-    canvasHeight = Math.max(canvasHeight - breadcrumbHeight, 100);
+    canvasHeight = Math.max(canvasHeight - searchBarHeight - breadcrumbHeight, 100);
 
     canvas.style.width = canvasWidth + 'px';
     canvas.style.height = canvasHeight + 'px';
@@ -422,6 +600,14 @@ function render() {
         if (isActive && !isHovered) {
             ctx.strokeStyle = 'rgba(100, 180, 255, 0.8)';
             ctx.lineWidth = 1.5;
+            ctx.strokeRect(x + 0.5, y + 0.5, w - 1, h - 1);
+        }
+
+        // Search match highlight
+        if (searchMatchSet.has(node)) {
+            const isFocused = searchMatches[searchMatchIndex] === node;
+            ctx.strokeStyle = isFocused ? 'rgba(255, 180, 50, 1.0)' : 'rgba(255, 180, 50, 0.7)';
+            ctx.lineWidth = isFocused ? 3 : 1.5;
             ctx.strokeRect(x + 0.5, y + 0.5, w - 1, h - 1);
         }
 

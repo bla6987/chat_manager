@@ -724,6 +724,47 @@
     padding: 0 2px;
 }
 
+/* ── Icicle Search Bar ── */
+
+.chat-manager-icicle-search-bar {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    padding: 4px 8px;
+    background: rgba(0, 0, 0, 0.2);
+    border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.chat-manager-icicle-search-input {
+    flex: 1;
+    padding: 4px 8px;
+    font-size: 0.82em;
+    min-width: 0;
+}
+
+.chat-manager-icicle-search-nav {
+    width: 26px;
+    height: 26px;
+    padding: 0;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 0.72em;
+    flex-shrink: 0;
+}
+
+.chat-manager-icicle-search-nav:disabled {
+    opacity: 0.3;
+}
+
+.chat-manager-icicle-search-counter {
+    font-size: 0.75em;
+    opacity: 0.55;
+    white-space: nowrap;
+    min-width: 48px;
+    text-align: right;
+}
+
 /* ── Expand Button (overlay in panel minimap) ── */
 
 .chat-manager-timeline-expand-btn {
