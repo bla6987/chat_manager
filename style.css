@@ -1004,6 +1004,27 @@
    ══════════════════════════════════════════════ */
 
 @media (pointer: coarse) {
+    /* ── Enable momentum scrolling on content areas ── */
+
+    .chat-manager-content {
+        -webkit-overflow-scrolling: touch;
+        overscroll-behavior-y: contain;
+        scroll-behavior: smooth;
+    }
+
+    .chat-manager-popup .chat-manager-content {
+        -webkit-overflow-scrolling: touch;
+        overscroll-behavior-y: contain;
+    }
+
+    .chat-manager-timeline-popup {
+        -webkit-overflow-scrolling: touch;
+    }
+
+    .chat-manager-timeline-tooltip {
+        -webkit-overflow-scrolling: touch;
+    }
+
     /* ── Always show hover-dependent actions on touch ── */
 
     .chat-manager-card-actions {
