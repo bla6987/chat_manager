@@ -68,11 +68,25 @@ export async function generateTitleForChat(messages, characterName) {
         `${m.role === 'user' ? 'User' : characterName}: ${m.text}`,
     ).join('\n');
 
+    const prompt = `Given these recent roleplay messages:\n\n${messageContext}\n\nGenerate a short title (3-10 words) capturing the most recent key event. Output ONLY the title.`;
+    const systemPrompt = 'You are a concise title generator. Output only the requested title.';
+
     try {
-        const result = await context.generateRaw({
-            prompt: `Given these recent roleplay messages:\n\n${messageContext}\n\nGenerate a short title (3-10 words) capturing the most recent key event. Output ONLY the title.`,
-            systemPrompt: 'You are a concise title generator. Output only the requested title.',
-        });
+        const result = await context.generateRaw({ prompt, systemPrompt });
+
+        // Report token usage
+        try {
+            const tracker = window['TokenUsageTracker'];
+            if (tracker && result) {
+                const inputTokens = await tracker.countTokens(systemPrompt + '\n' + prompt);
+                const outputTokens = await tracker.countTokens(result);
+                const modelId = tracker.getCurrentModelId();
+                const sourceId = tracker.getCurrentSourceId();
+                tracker.recordUsage(inputTokens, outputTokens, null, modelId, sourceId, 0);
+            }
+        } catch (e) {
+            console.warn(`[${MODULE_NAME}] Token usage reporting failed:`, e);
+        }
 
         const title = cleanGeneratedText(result, 200);
         if (!title) {
@@ -131,11 +145,25 @@ export async function generateSummaryForChat(messages, characterName) {
         `${m.role === 'user' ? 'User' : characterName}: ${m.text}`,
     ).join('\n');
 
+    const prompt = `Given these recent roleplay messages:\n\n${messageContext}\n\nSummarize this roleplay conversation with emphasis on recent events. 2-4 sentences. Focus on what happened, key actions, and current situation. Output ONLY the summary.`;
+    const systemPrompt = 'You are a concise summarizer. Output only the requested summary.';
+
     try {
-        const result = await context.generateRaw({
-            prompt: `Given these recent roleplay messages:\n\n${messageContext}\n\nSummarize this roleplay conversation with emphasis on recent events. 2-4 sentences. Focus on what happened, key actions, and current situation. Output ONLY the summary.`,
-            systemPrompt: 'You are a concise summarizer. Output only the requested summary.',
-        });
+        const result = await context.generateRaw({ prompt, systemPrompt });
+
+        // Report token usage
+        try {
+            const tracker = window['TokenUsageTracker'];
+            if (tracker && result) {
+                const inputTokens = await tracker.countTokens(systemPrompt + '\n' + prompt);
+                const outputTokens = await tracker.countTokens(result);
+                const modelId = tracker.getCurrentModelId();
+                const sourceId = tracker.getCurrentSourceId();
+                tracker.recordUsage(inputTokens, outputTokens, null, modelId, sourceId, 0);
+            }
+        } catch (e) {
+            console.warn(`[${MODULE_NAME}] Token usage reporting failed:`, e);
+        }
 
         const summary = cleanGeneratedText(result, 1000);
         if (!summary) {
