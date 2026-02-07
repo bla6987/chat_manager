@@ -73,6 +73,16 @@ let dragStartViewY0 = 0;
 let dragStartViewY1 = 0;
 let wasDragging = false;
 
+// Touch state
+let activeTouches = new Map(); // trackingId → {x, y}
+let pinchStartDist = 0;
+let pinchStartSpan = 0;
+let pinchMidY = 0;
+let isPinching = false;
+let touchTapCandidate = null; // {x, y, time} for tap detection
+const TAP_THRESHOLD = 10;    // max movement to count as tap
+const TAP_TIMEOUT = 300;     // max ms to count as tap
+
 // Interaction state
 let hoveredNode = null;
 let resetBtnEl = null;
@@ -178,6 +188,7 @@ export function mountIcicle(containerEl, mode) {
     // Create canvas
     canvas = document.createElement('canvas');
     canvas.className = 'chat-manager-icicle-canvas';
+    canvas.style.touchAction = 'none'; // prevent browser touch gestures on canvas
     container.appendChild(canvas);
 
     // Create breadcrumb bar
@@ -270,6 +281,9 @@ export function unmountIcicle() {
     isDragging = false;
     wasDragging = false;
     hoveredNode = null;
+    activeTouches = new Map();
+    isPinching = false;
+    touchTapCandidate = null;
     mounted = false;
 }
 
@@ -769,12 +783,18 @@ function bindEvents() {
     boundHandlers.onClick = onClick;
     boundHandlers.onWheel = onWheel;
     boundHandlers.onResize = onResize;
+    boundHandlers.onTouchStart = onTouchStart;
+    boundHandlers.onTouchMove = onTouchMove;
+    boundHandlers.onTouchEnd = onTouchEnd;
 
     canvas.addEventListener('mousemove', boundHandlers.onMouseMove);
     canvas.addEventListener('mouseleave', boundHandlers.onMouseLeave);
     canvas.addEventListener('mousedown', boundHandlers.onMouseDown);
     canvas.addEventListener('click', boundHandlers.onClick);
     canvas.addEventListener('wheel', boundHandlers.onWheel, { passive: false });
+    canvas.addEventListener('touchstart', boundHandlers.onTouchStart, { passive: false });
+    canvas.addEventListener('touchmove', boundHandlers.onTouchMove, { passive: false });
+    canvas.addEventListener('touchend', boundHandlers.onTouchEnd, { passive: false });
     window.addEventListener('mouseup', boundHandlers.onMouseUp);
     window.addEventListener('resize', boundHandlers.onResize);
 }
@@ -786,6 +806,9 @@ function unbindEvents() {
         canvas.removeEventListener('mousedown', boundHandlers.onMouseDown);
         canvas.removeEventListener('click', boundHandlers.onClick);
         canvas.removeEventListener('wheel', boundHandlers.onWheel);
+        canvas.removeEventListener('touchstart', boundHandlers.onTouchStart);
+        canvas.removeEventListener('touchmove', boundHandlers.onTouchMove);
+        canvas.removeEventListener('touchend', boundHandlers.onTouchEnd);
     }
     window.removeEventListener('mouseup', boundHandlers.onMouseUp);
     window.removeEventListener('resize', boundHandlers.onResize);
@@ -959,6 +982,183 @@ function onWheel(e) {
         clampViewport();
         render();
     }
+}
+
+// ── Touch Handlers ──
+
+function getTouchDistance(t1, t2) {
+    const dx = t1.clientX - t2.clientX;
+    const dy = t1.clientY - t2.clientY;
+    return Math.sqrt(dx * dx + dy * dy);
+}
+
+function onTouchStart(e) {
+    e.preventDefault();
+
+    for (const touch of e.changedTouches) {
+        activeTouches.set(touch.identifier, { x: touch.clientX, y: touch.clientY });
+    }
+
+    if (activeTouches.size === 1) {
+        // Single finger: start drag (same as mousedown)
+        const touch = e.changedTouches[0];
+        dragStartX = touch.clientX;
+        dragStartY = touch.clientY;
+        dragStartViewX = viewX;
+        dragStartViewY0 = viewY0;
+        dragStartViewY1 = viewY1;
+        isDragging = true;
+        wasDragging = false;
+        isPinching = false;
+        cancelViewportAnim();
+
+        // Track for tap detection
+        touchTapCandidate = { x: touch.clientX, y: touch.clientY, time: Date.now() };
+    } else if (activeTouches.size === 2) {
+        // Two fingers: start pinch-to-zoom
+        isPinching = true;
+        isDragging = false;
+        touchTapCandidate = null;
+        hideTooltip();
+
+        const touches = Array.from(activeTouches.values());
+        pinchStartDist = Math.sqrt(
+            (touches[0].x - touches[1].x) ** 2 +
+            (touches[0].y - touches[1].y) ** 2,
+        );
+        pinchStartSpan = viewY1 - viewY0;
+
+        // Midpoint in canvas-relative Y for zoom anchor
+        const rect = canvas.getBoundingClientRect();
+        const ids = Array.from(activeTouches.keys());
+        const t0 = findTouch(e.touches, ids[0]);
+        const t1 = findTouch(e.touches, ids[1]);
+        if (t0 && t1) {
+            pinchMidY = ((t0.clientY + t1.clientY) / 2) - rect.top;
+        }
+
+        cancelViewportAnim();
+    }
+}
+
+function onTouchMove(e) {
+    e.preventDefault();
+
+    // Update tracked positions
+    for (const touch of e.changedTouches) {
+        if (activeTouches.has(touch.identifier)) {
+            activeTouches.set(touch.identifier, { x: touch.clientX, y: touch.clientY });
+        }
+    }
+
+    if (isPinching && activeTouches.size >= 2) {
+        // Pinch-to-zoom
+        const touches = Array.from(activeTouches.values());
+        const dist = Math.sqrt(
+            (touches[0].x - touches[1].x) ** 2 +
+            (touches[0].y - touches[1].y) ** 2,
+        );
+
+        if (pinchStartDist > 0) {
+            const scale = pinchStartDist / dist; // pinch out = smaller scale = zoom in
+            let newSpan = pinchStartSpan * scale;
+            newSpan = Math.max(MIN_VIEW_SPAN, Math.min(MAX_VIEW_SPAN, newSpan));
+
+            // Zoom around the midpoint
+            const cursorY = viewY0 + (pinchMidY / canvasHeight) * (viewY1 - viewY0);
+            const ratio = pinchMidY / canvasHeight;
+            viewY0 = cursorY - ratio * newSpan;
+            viewY1 = cursorY + (1 - ratio) * newSpan;
+
+            clampViewport();
+            render();
+        }
+        return;
+    }
+
+    if (isDragging && activeTouches.size === 1) {
+        const touch = e.changedTouches[0];
+        const dx = touch.clientX - dragStartX;
+        const dy = touch.clientY - dragStartY;
+        const dist = Math.sqrt(dx * dx + dy * dy);
+
+        if (dist > DRAG_THRESHOLD) {
+            wasDragging = true;
+            touchTapCandidate = null;
+            hideTooltip();
+
+            // Pan horizontally
+            viewX = dragStartViewX - dx;
+
+            // Pan vertically
+            const viewSpan = dragStartViewY1 - dragStartViewY0;
+            const yShift = -(dy / canvasHeight) * viewSpan;
+            viewY0 = dragStartViewY0 + yShift;
+            viewY1 = dragStartViewY1 + yShift;
+
+            clampViewport();
+            render();
+        }
+    }
+}
+
+function onTouchEnd(e) {
+    e.preventDefault();
+
+    for (const touch of e.changedTouches) {
+        activeTouches.delete(touch.identifier);
+    }
+
+    if (activeTouches.size < 2) {
+        isPinching = false;
+    }
+
+    if (activeTouches.size === 0) {
+        isDragging = false;
+
+        // Check for tap (single quick touch without much movement)
+        if (touchTapCandidate && !wasDragging) {
+            const elapsed = Date.now() - touchTapCandidate.time;
+            if (elapsed < TAP_TIMEOUT) {
+                const touch = e.changedTouches[0];
+                const dx = touch.clientX - touchTapCandidate.x;
+                const dy = touch.clientY - touchTapCandidate.y;
+                if (Math.sqrt(dx * dx + dy * dy) < TAP_THRESHOLD) {
+                    handleTouchTap(touch.clientX, touch.clientY);
+                }
+            }
+        }
+        touchTapCandidate = null;
+        wasDragging = false;
+    }
+}
+
+function handleTouchTap(clientX, clientY) {
+    if (!canvas) return;
+    const rect = canvas.getBoundingClientRect();
+    const px = clientX - rect.left;
+    const py = clientY - rect.top;
+
+    const node = hitTest(px, py);
+    if (!node) {
+        removePopup();
+        return;
+    }
+
+    // Zoom into node if it has children
+    if (node.children.size > 0) {
+        zoomTo(node);
+    }
+
+    // Show popup
+    showNodePopup(clientX, clientY, node);
+}
+
+function findTouch(touchList, id) {
+    for (let i = 0; i < touchList.length; i++) {
+        if (touchList[i].identifier === id) return touchList[i];
+    }
+    return null;
 }
 
 /**
