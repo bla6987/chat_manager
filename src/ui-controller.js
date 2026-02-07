@@ -1852,7 +1852,7 @@ async function handleRegenSummary(e) {
                 return;
             }
             const context = SillyTavern.getContext();
-            summary = await generateSummaryForChat(chatData.messages, context.name2);
+            summary = await generateSummaryForChat(chatData.messages, context.name2, chatData.branchPoint);
         }
 
         if (summary) {

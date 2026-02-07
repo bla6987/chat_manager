@@ -134,18 +134,42 @@ export async function generateSummaryForActiveChat() {
  * Generate a summary for a non-active chat using generateRaw.
  * @param {Array} messages - Array of {role, text} message objects
  * @param {string} characterName
+ * @param {number|null} branchPoint - Message index where this chat diverges from another
  * @returns {Promise<string|null>}
  */
-export async function generateSummaryForChat(messages, characterName) {
+export async function generateSummaryForChat(messages, characterName, branchPoint = null) {
     if (!requireLLM()) return null;
 
     const context = SillyTavern.getContext();
 
-    const messageContext = messages.slice(-30).map(m =>
-        `${m.role === 'user' ? 'User' : characterName}: ${m.text}`,
-    ).join('\n');
+    const windowSize = 30;
+    const windowStart = Math.max(0, messages.length - windowSize);
+    const recentMsgs = messages.slice(-windowSize);
 
-    const prompt = `Given these recent roleplay messages:\n\n${messageContext}\n\nSummarize this roleplay conversation with emphasis on recent events. 2-4 sentences. Focus on what happened, key actions, and current situation. Output ONLY the summary.`;
+    let messageContext;
+    let branchHint = '';
+
+    if (branchPoint != null && branchPoint >= windowStart) {
+        // Branch point falls within the window — insert a marker
+        const relPos = branchPoint - windowStart;
+        const before = recentMsgs.slice(0, relPos).map(m =>
+            `${m.role === 'user' ? 'User' : characterName}: ${m.text}`,
+        );
+        const after = recentMsgs.slice(relPos).map(m =>
+            `${m.role === 'user' ? 'User' : characterName}: ${m.text}`,
+        );
+        messageContext = [...before, '--- BRANCH POINT ---', ...after].join('\n');
+        branchHint = '\nThis conversation branches from another at the marked point. Emphasize what happens after the branch point — what makes this path distinct.';
+    } else {
+        messageContext = recentMsgs.map(m =>
+            `${m.role === 'user' ? 'User' : characterName}: ${m.text}`,
+        ).join('\n');
+        if (branchPoint != null) {
+            branchHint = '\nThis conversation is a branch that diverged early from another. Summarize its unique content.';
+        }
+    }
+
+    const prompt = `Given these recent roleplay messages:\n\n${messageContext}\n\nSummarize this roleplay conversation with emphasis on recent events. 2-4 sentences. Focus on what happened, key actions, and current situation.${branchHint} Output ONLY the summary.`;
     const systemPrompt = 'You are a concise summarizer. Output only the requested summary.';
 
     try {
