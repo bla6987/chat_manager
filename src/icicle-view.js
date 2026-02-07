@@ -440,8 +440,8 @@ function render() {
 
                 if (vertical) {
                     ctx.textBaseline = 'middle';
-                    ctx.translate(x + w / 2, y + 4);
-                    ctx.rotate(Math.PI / 2);
+                    ctx.translate(x + w / 2, y + h - 4);
+                    ctx.rotate(-Math.PI / 2);
                     ctx.fillText(label, 0, 0);
                 } else {
                     ctx.textBaseline = 'middle';
