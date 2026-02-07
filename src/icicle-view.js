@@ -26,6 +26,9 @@ const MIN_VIEW_SPAN = 0.001; // prevents infinite zoom
 const MAX_VIEW_SPAN = 1.0;   // full view
 const ZOOM_FACTOR = 0.1;     // fraction of span per wheel tick
 const DRAG_THRESHOLD = 4;    // pixels before drag activates
+const TOUCH_SPEED = 1.8;    // multiplier for touch drag panning (>1 = faster)
+const INERTIA_DECAY = 0.92; // velocity decay per frame during momentum scroll
+const MIN_INERTIA_V = 0.5;  // stop inertia below this velocity (pixels)
 
 // ── Module state ──
 let canvas = null;
@@ -82,6 +85,14 @@ let isPinching = false;
 let touchTapCandidate = null; // {x, y, time} for tap detection
 const TAP_THRESHOLD = 10;    // max movement to count as tap
 const TAP_TIMEOUT = 300;     // max ms to count as tap
+
+// Momentum / inertia state
+let inertiaAnimId = null;
+let inertiaVx = 0;           // horizontal velocity (pixels/frame)
+let inertiaVy = 0;           // vertical velocity (normalized Y-space/frame)
+let lastTouchX = 0;
+let lastTouchY = 0;
+let lastTouchTime = 0;
 
 // Interaction state
 let hoveredNode = null;
@@ -244,6 +255,7 @@ export function mountIcicle(containerEl, mode) {
 
 export function unmountIcicle() {
     cancelViewportAnim();
+    cancelInertia();
     unbindEvents();
     removeTooltip();
     removePopup();
@@ -284,6 +296,8 @@ export function unmountIcicle() {
     activeTouches = new Map();
     isPinching = false;
     touchTapCandidate = null;
+    inertiaVx = 0;
+    inertiaVy = 0;
     mounted = false;
 }
 
@@ -1011,6 +1025,14 @@ function onTouchStart(e) {
         wasDragging = false;
         isPinching = false;
         cancelViewportAnim();
+        cancelInertia();
+
+        // Initialize velocity tracking
+        lastTouchX = touch.clientX;
+        lastTouchY = touch.clientY;
+        lastTouchTime = performance.now();
+        inertiaVx = 0;
+        inertiaVy = 0;
 
         // Track for tap detection
         touchTapCandidate = { x: touch.clientX, y: touch.clientY, time: Date.now() };
@@ -1087,17 +1109,31 @@ function onTouchMove(e) {
             touchTapCandidate = null;
             hideTooltip();
 
-            // Pan horizontally
-            viewX = dragStartViewX - dx;
+            // Pan horizontally (amplified by touch speed multiplier)
+            viewX = dragStartViewX - dx * TOUCH_SPEED;
 
-            // Pan vertically
+            // Pan vertically (amplified by touch speed multiplier)
             const viewSpan = dragStartViewY1 - dragStartViewY0;
-            const yShift = -(dy / canvasHeight) * viewSpan;
+            const yShift = -(dy / canvasHeight) * viewSpan * TOUCH_SPEED;
             viewY0 = dragStartViewY0 + yShift;
             viewY1 = dragStartViewY1 + yShift;
 
             clampViewport();
             render();
+
+            // Track velocity for momentum (use instantaneous movement)
+            const now = performance.now();
+            const dt = now - lastTouchTime;
+            if (dt > 0) {
+                const instantDx = touch.clientX - lastTouchX;
+                const instantDy = touch.clientY - lastTouchY;
+                // Blend with previous velocity to smooth out jitter
+                inertiaVx = 0.4 * inertiaVx + 0.6 * (instantDx / dt * 16) * TOUCH_SPEED;
+                inertiaVy = 0.4 * inertiaVy + 0.6 * (instantDy / dt * 16 / canvasHeight * viewSpan) * TOUCH_SPEED;
+            }
+            lastTouchX = touch.clientX;
+            lastTouchY = touch.clientY;
+            lastTouchTime = now;
         }
     }
 }
@@ -1128,6 +1164,16 @@ function onTouchEnd(e) {
                 }
             }
         }
+
+        // Start momentum scrolling if finger was still moving
+        if (wasDragging && (Math.abs(inertiaVx) > MIN_INERTIA_V || Math.abs(inertiaVy) > 0.0001)) {
+            const timeSinceLast = performance.now() - lastTouchTime;
+            // Only apply inertia if the last move event was recent (finger was still moving)
+            if (timeSinceLast < 100) {
+                startInertia();
+            }
+        }
+
         touchTapCandidate = null;
         wasDragging = false;
     }
@@ -1159,6 +1205,44 @@ function findTouch(touchList, id) {
         if (touchList[i].identifier === id) return touchList[i];
     }
     return null;
+}
+
+// ── Touch Momentum / Inertia ──
+
+function startInertia() {
+    cancelInertia();
+    inertiaAnimId = requestAnimationFrame(inertiaFrame);
+}
+
+function inertiaFrame() {
+    // Decay velocity
+    inertiaVx *= INERTIA_DECAY;
+    inertiaVy *= INERTIA_DECAY;
+
+    // Stop when velocity is negligible
+    if (Math.abs(inertiaVx) < MIN_INERTIA_V && Math.abs(inertiaVy) < 0.0001) {
+        cancelInertia();
+        return;
+    }
+
+    // Apply velocity (negative because dragging left should scroll right)
+    viewX -= inertiaVx;
+    viewY0 -= inertiaVy;
+    viewY1 -= inertiaVy;
+
+    clampViewport();
+    render();
+
+    inertiaAnimId = requestAnimationFrame(inertiaFrame);
+}
+
+function cancelInertia() {
+    if (inertiaAnimId) {
+        cancelAnimationFrame(inertiaAnimId);
+        inertiaAnimId = null;
+    }
+    inertiaVx = 0;
+    inertiaVy = 0;
 }
 
 /**
