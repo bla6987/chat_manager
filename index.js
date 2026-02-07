@@ -6,6 +6,7 @@
 import { clearIndex, getIndexCharacterAvatar, updateActiveChat } from './src/chat-reader.js';
 import { togglePanel, closePanel, refreshPanel, renderThreadCards, onSearchInput, isPanelOpen, resetSearchState, toggleTimeline, isTimelineActive } from './src/ui-controller.js';
 import { getDisplayMode, setDisplayMode } from './src/metadata-store.js';
+import { attachMomentumScroll } from './src/momentum-scroll.js';
 
 const MODULE_NAME = 'chat_manager';
 const EXTENSION_PATH = '/scripts/extensions/third-party/chat_manager';
@@ -21,6 +22,7 @@ let currentInjectedMode = null;
 let pendingUIInjection = null;
 let slashCommandsRegistered = false;
 let topBarInterceptorBound = false;
+let cleanupMomentumScroll = null;
 
 /**
  * Handle MESSAGE_SENT / MESSAGE_RECEIVED — lightweight update for active chat only.
@@ -149,6 +151,11 @@ async function loadTemplate(templateFile) {
  * @returns {Promise<boolean>}
  */
 async function injectUI(mode) {
+    if (cleanupMomentumScroll) {
+        cleanupMomentumScroll();
+        cleanupMomentumScroll = null;
+    }
+
     // Remove existing UI elements
     const existingPanel = document.getElementById('chat-manager-panel');
     if (existingPanel) existingPanel.remove();
@@ -487,6 +494,15 @@ function bindPanelEvents() {
     if (timelineToggleBtn) {
         timelineToggleBtn.addEventListener('click', handleTimelineToggle);
     }
+
+    const content = document.getElementById('chat-manager-content');
+    if (cleanupMomentumScroll) {
+        cleanupMomentumScroll();
+        cleanupMomentumScroll = null;
+    }
+    if (content) {
+        cleanupMomentumScroll = attachMomentumScroll(content);
+    }
 }
 
 /**
@@ -517,4 +533,3 @@ async function onChatChanged() {
     const searchInput = document.getElementById('chat-manager-search');
     if (searchInput) searchInput.value = '';
 }
-
