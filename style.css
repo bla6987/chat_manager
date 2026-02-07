@@ -678,6 +678,25 @@
     opacity: 0.85;
 }
 
+.chat-manager-icicle-jump-current-btn {
+    position: absolute;
+    bottom: 8px;
+    left: 40px;
+    z-index: 10;
+    font-size: 1em;
+    width: 28px;
+    height: 28px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    opacity: 0.6;
+    transition: opacity 0.15s;
+}
+
+.chat-manager-icicle-jump-current-btn:hover {
+    opacity: 1;
+}
+
 .chat-manager-content.timeline-active {
     padding: 0;
     overflow: hidden;
@@ -1061,6 +1080,12 @@
         height: 44px;
     }
 
+    .chat-manager-icicle-jump-current-btn {
+        width: 44px;
+        height: 44px;
+        left: 56px;
+    }
+
     .chat-manager-icicle-reset-btn {
         padding: 8px 16px;
         font-size: 0.9em;
@@ -1116,6 +1141,10 @@
     }
 
     .chat-manager-icicle-focus-btn {
+        opacity: 0.8;
+    }
+
+    .chat-manager-icicle-jump-current-btn {
         opacity: 0.8;
     }
 

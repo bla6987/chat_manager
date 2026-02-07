@@ -98,6 +98,7 @@ let lastTouchTime = 0;
 let hoveredNode = null;
 let resetBtnEl = null;
 let focusBtnEl = null;
+let jumpToCurrentBtnEl = null;
 let tooltipEl = null;
 let popupEl = null;
 let breadcrumbEl = null;
@@ -233,6 +234,17 @@ export function mountIcicle(containerEl, mode) {
     });
     container.appendChild(focusBtnEl);
 
+    // Create jump-to-current button
+    jumpToCurrentBtnEl = document.createElement('button');
+    jumpToCurrentBtnEl.className = 'chat-manager-btn chat-manager-icicle-jump-current-btn';
+    jumpToCurrentBtnEl.title = 'Jump to current chat';
+    jumpToCurrentBtnEl.innerHTML = '&#x1F4CD;';
+    jumpToCurrentBtnEl.addEventListener('click', (e) => {
+        e.stopPropagation();
+        jumpToCurrentThread();
+    });
+    container.appendChild(jumpToCurrentBtnEl);
+
     // Create tooltip
     createTooltip();
 
@@ -277,6 +289,10 @@ export function unmountIcicle() {
     if (focusBtnEl) {
         focusBtnEl.remove();
         focusBtnEl = null;
+    }
+    if (jumpToCurrentBtnEl) {
+        jumpToCurrentBtnEl.remove();
+        jumpToCurrentBtnEl = null;
     }
 
     container = null;
@@ -1273,6 +1289,46 @@ function scrollToActiveLeaf(activeChatFile) {
 
     // Position so the leaf column's right edge aligns with the canvas right edge
     viewX = Math.max(0, ((deepest.depth - exploreDepthOffset) + 1) * COL_WIDTH - canvasWidth);
+}
+
+/**
+ * Animated jump to the current active chat's deepest node.
+ */
+function jumpToCurrentThread() {
+    const activeChatFile = getActiveChatFile ? getActiveChatFile() : null;
+    if (!activeChatFile || flatNodes.length === 0) return;
+
+    let deepest = null;
+    for (const node of flatNodes) {
+        if (node.chatFiles.includes(activeChatFile)) {
+            if (!deepest || node.depth > deepest.depth) {
+                deepest = node;
+            }
+        }
+    }
+    if (!deepest) return;
+
+    // Compute target viewport: center on the leaf node vertically, scroll to its column horizontally
+    const nodeSpan = deepest.y1 - deepest.y0;
+    const viewSpan = viewY1 - viewY0;
+    const nodeMidY = (deepest.y0 + deepest.y1) / 2;
+
+    let targetY0, targetY1;
+    if (nodeSpan >= viewSpan) {
+        // Node is bigger than the view — zoom to fit the node
+        targetY0 = deepest.y0;
+        targetY1 = deepest.y1;
+    } else {
+        // Center the node in the current zoom level
+        targetY0 = nodeMidY - viewSpan / 2;
+        targetY1 = nodeMidY + viewSpan / 2;
+        // Clamp to [0,1]
+        if (targetY0 < 0) { targetY1 -= targetY0; targetY0 = 0; }
+        if (targetY1 > 1) { targetY0 -= (targetY1 - 1); targetY1 = 1; }
+    }
+
+    const targetX = Math.max(0, ((deepest.depth - exploreDepthOffset) + 1) * COL_WIDTH - canvasWidth);
+    animateViewportTo(targetX, targetY0, targetY1);
 }
 
 function clampViewport() {
