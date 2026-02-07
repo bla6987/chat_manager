@@ -427,16 +427,27 @@ function render() {
 
         // Label
         if (h >= MIN_LABEL_HEIGHT && w > 20) {
-            const label = truncate(node.normalizedText, Math.floor(w / 6));
+            const vertical = h > w;
+            const maxChars = vertical ? Math.floor(h / 6) : Math.floor(w / 6);
+            const label = truncate(node.normalizedText, maxChars);
             if (label) {
                 ctx.fillStyle = 'rgba(255, 255, 255, 0.85)';
                 ctx.font = '11px sans-serif';
-                ctx.textBaseline = 'middle';
                 ctx.save();
                 ctx.beginPath();
                 ctx.rect(x, y, w, h);
                 ctx.clip();
-                ctx.fillText(label, x + 4, y + h / 2);
+
+                if (vertical) {
+                    ctx.textBaseline = 'middle';
+                    ctx.translate(x + w / 2, y + 4);
+                    ctx.rotate(Math.PI / 2);
+                    ctx.fillText(label, 0, 0);
+                } else {
+                    ctx.textBaseline = 'middle';
+                    ctx.fillText(label, x + 4, y + h / 2);
+                }
+
                 ctx.restore();
             }
         }
@@ -908,7 +919,8 @@ function showTooltip(clientX, clientY, node) {
     const time = node.representative.timestamp && moment
         ? moment(node.representative.timestamp).format('MMM D, h:mm A')
         : '';
-    const preview = truncateForTooltip(node.representative.text || node.normalizedText, 100);
+    const rawText = node.representative.text || node.normalizedText || '';
+    const preview = rawText.replace(/\s+/g, ' ').trim();
     const chatCount = node.chatFiles.length;
     const branchCount = node.children.size;
     const branchInfo = branchCount > 1
