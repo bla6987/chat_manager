@@ -2,6 +2,8 @@
  * AI Features — LLM wrappers for title and summary generation.
  */
 
+import { getAIConnectionProfile } from './metadata-store.js';
+
 const MODULE_NAME = 'chat_manager';
 
 /**
@@ -25,32 +27,114 @@ export function requireLLM() {
     return true;
 }
 
+// ── Profile-switching wrapper ──
+
+/** Serialization lock to prevent concurrent profile switches from colliding. */
+let profileLock = Promise.resolve();
+
+/**
+ * Execute `fn` under the configured AI connection profile.
+ * Switches to the target profile before calling fn, and restores the original afterward.
+ * If no AI profile is configured, or it's already active, calls fn directly.
+ * Uses a serialization lock to prevent concurrent profile switches.
+ * @param {() => Promise<T>} fn
+ * @returns {Promise<T>}
+ * @template T
+ */
+async function withAIProfile(fn) {
+    const targetId = getAIConnectionProfile();
+    if (!targetId) return fn();
+
+    const context = SillyTavern.getContext();
+    const cmProfiles = context.extensionSettings?.connectionManager?.profiles;
+    if (!Array.isArray(cmProfiles) || cmProfiles.length === 0) return fn();
+
+    const targetProfile = cmProfiles.find(p => p.id === targetId);
+    if (!targetProfile) {
+        console.warn(`[${MODULE_NAME}] AI profile "${targetId}" not found, using current connection`);
+        return fn();
+    }
+
+    // Check if target is already the selected profile
+    const selectedProfileId = context.extensionSettings?.connectionManager?.selectedProfile;
+    if (selectedProfileId === targetId) return fn();
+
+    // Serialize through the lock to prevent interleaving
+    const ticket = profileLock;
+    let release;
+    profileLock = new Promise(resolve => { release = resolve; });
+
+    try {
+        await ticket;
+        return await switchAndRun(targetProfile, selectedProfileId, cmProfiles, fn);
+    } finally {
+        release();
+    }
+}
+
+/**
+ * @param {Object} targetProfile
+ * @param {string|undefined} originalProfileId
+ * @param {Array} cmProfiles
+ * @param {() => Promise<T>} fn
+ * @returns {Promise<T>}
+ * @template T
+ */
+async function switchAndRun(targetProfile, originalProfileId, cmProfiles, fn) {
+    const context = SillyTavern.getContext();
+
+    // Switch to the AI profile
+    try {
+        await context.executeSlashCommandsWithOptions(`/profile ${targetProfile.name}`);
+    } catch (err) {
+        console.warn(`[${MODULE_NAME}] Failed to switch to AI profile "${targetProfile.name}", using current connection:`, err);
+        return fn();
+    }
+
+    try {
+        return await fn();
+    } finally {
+        // Restore the original profile
+        try {
+            const originalProfile = originalProfileId
+                ? cmProfiles.find(p => p.id === originalProfileId)
+                : null;
+            const restoreName = originalProfile ? originalProfile.name : 'None';
+            await context.executeSlashCommandsWithOptions(`/profile ${restoreName}`);
+        } catch (err) {
+            console.warn(`[${MODULE_NAME}] Failed to restore original profile:`, err);
+        }
+    }
+}
+
 /**
  * Generate a title for the currently active chat using generateQuietPrompt.
  * @returns {Promise<string|null>} The generated title, or null on failure
  */
 export async function generateTitleForActiveChat() {
-    if (!requireLLM()) return null;
+    return withAIProfile(async () => {
+        if (!requireLLM()) return null;
 
-    const context = SillyTavern.getContext();
+        const context = SillyTavern.getContext();
 
-    try {
-        const result = await context.generateQuietPrompt({
-            quietPrompt: 'Based on the recent messages, generate a short title (3-10 words) capturing the most recent key event or theme. Output ONLY the title text. No quotes, no explanation.',
-        });
+        try {
+            const result = await context.generateQuietPrompt({
+                quietPrompt: 'Based on the recent messages, generate a short title (3-10 words) capturing the most recent key event or theme. Output ONLY the title text. No quotes, no explanation.',
+            });
 
-        const title = cleanGeneratedText(result, 200);
-        if (!title) {
-            toastr.warning('AI returned an empty or invalid title.');
+            const title = cleanGeneratedText(result, 200);
+            if (!title) {
+                toastr.warning('AI returned an empty or invalid title.');
+                return null;
+            }
+
+            return title;
+        } catch (err) {
+            console.error(`[${MODULE_NAME}] Title generation failed:`, err);
+            toastr.error('Failed to generate title. Check API connection.');
             return null;
         }
-
-        return title;
-    } catch (err) {
-        console.error(`[${MODULE_NAME}] Title generation failed:`, err);
-        toastr.error('Failed to generate title. Check API connection.');
-        return null;
-    }
+    });
 }
 
 /**
@@ -60,46 +144,48 @@ export async function generateTitleForActiveChat() {
  * @returns {Promise<string|null>}
  */
 export async function generateTitleForChat(messages, characterName) {
-    if (!requireLLM()) return null;
+    return withAIProfile(async () => {
+        if (!requireLLM()) return null;
 
-    const context = SillyTavern.getContext();
+        const context = SillyTavern.getContext();
 
-    const messageContext = messages.slice(-15).map(m =>
-        `${m.role === 'user' ? 'User' : characterName}: ${m.text}`,
-    ).join('\n');
+        const messageContext = messages.slice(-15).map(m =>
+            `${m.role === 'user' ? 'User' : characterName}: ${m.text}`,
+        ).join('\n');
 
-    const prompt = `Given these recent roleplay messages:\n\n${messageContext}\n\nGenerate a short title (3-10 words) capturing the most recent key event. Output ONLY the title.`;
-    const systemPrompt = 'You are a concise title generator. Output only the requested title.';
+        const prompt = `Given these recent roleplay messages:\n\n${messageContext}\n\nGenerate a short title (3-10 words) capturing the most recent key event. Output ONLY the title.`;
+        const systemPrompt = 'You are a concise title generator. Output only the requested title.';
 
-    try {
-        const result = await context.generateRaw({ prompt, systemPrompt });
-
-        // Report token usage
         try {
-            const tracker = window['TokenUsageTracker'];
-            if (tracker && result) {
-                const inputTokens = await tracker.countTokens(systemPrompt + '\n' + prompt);
-                const outputTokens = await tracker.countTokens(result);
-                const modelId = tracker.getCurrentModelId();
-                const sourceId = tracker.getCurrentSourceId();
-                tracker.recordUsage(inputTokens, outputTokens, null, modelId, sourceId, 0);
-            }
-        } catch (e) {
-            console.warn(`[${MODULE_NAME}] Token usage reporting failed:`, e);
-        }
+            const result = await context.generateRaw({ prompt, systemPrompt });
 
-        const title = cleanGeneratedText(result, 200);
-        if (!title) {
-            toastr.warning('AI returned an empty or invalid title.');
+            // Report token usage
+            try {
+                const tracker = window['TokenUsageTracker'];
+                if (tracker && result) {
+                    const inputTokens = await tracker.countTokens(systemPrompt + '\n' + prompt);
+                    const outputTokens = await tracker.countTokens(result);
+                    const modelId = tracker.getCurrentModelId();
+                    const sourceId = tracker.getCurrentSourceId();
+                    tracker.recordUsage(inputTokens, outputTokens, null, modelId, sourceId, 0);
+                }
+            } catch (e) {
+                console.warn(`[${MODULE_NAME}] Token usage reporting failed:`, e);
+            }
+
+            const title = cleanGeneratedText(result, 200);
+            if (!title) {
+                toastr.warning('AI returned an empty or invalid title.');
+                return null;
+            }
+
+            return title;
+        } catch (err) {
+            console.error(`[${MODULE_NAME}] Title generation failed:`, err);
+            toastr.error('Failed to generate title. Check API connection.');
             return null;
         }
-
-        return title;
-    } catch (err) {
-        console.error(`[${MODULE_NAME}] Title generation failed:`, err);
-        toastr.error('Failed to generate title. Check API connection.');
-        return null;
-    }
+    });
 }
 
 /**
@@ -107,27 +193,29 @@ export async function generateTitleForChat(messages, characterName) {
  * @returns {Promise<string|null>}
  */
 export async function generateSummaryForActiveChat() {
-    if (!requireLLM()) return null;
+    return withAIProfile(async () => {
+        if (!requireLLM()) return null;
 
-    const context = SillyTavern.getContext();
+        const context = SillyTavern.getContext();
 
-    try {
-        const result = await context.generateQuietPrompt({
-            quietPrompt: 'Summarize this roleplay conversation with emphasis on recent events. 2-4 sentences. Focus on what happened, key actions, and current situation. Output ONLY the summary.',
-        });
+        try {
+            const result = await context.generateQuietPrompt({
+                quietPrompt: 'Summarize this roleplay conversation with emphasis on recent events. 2-4 sentences. Focus on what happened, key actions, and current situation. Output ONLY the summary.',
+            });
 
-        const summary = cleanGeneratedText(result, 1000);
-        if (!summary) {
-            toastr.warning('AI returned an empty or invalid summary.');
+            const summary = cleanGeneratedText(result, 1000);
+            if (!summary) {
+                toastr.warning('AI returned an empty or invalid summary.');
+                return null;
+            }
+
+            return summary;
+        } catch (err) {
+            console.error(`[${MODULE_NAME}] Summary generation failed:`, err);
+            toastr.error('Failed to generate summary. Check API connection.');
             return null;
         }
-
-        return summary;
-    } catch (err) {
-        console.error(`[${MODULE_NAME}] Summary generation failed:`, err);
-        toastr.error('Failed to generate summary. Check API connection.');
-        return null;
-    }
+    });
 }
 
 /**
@@ -138,69 +226,71 @@ export async function generateSummaryForActiveChat() {
  * @returns {Promise<string|null>}
  */
 export async function generateSummaryForChat(messages, characterName, branchPoint = null) {
-    if (!requireLLM()) return null;
+    return withAIProfile(async () => {
+        if (!requireLLM()) return null;
 
-    const context = SillyTavern.getContext();
+        const context = SillyTavern.getContext();
 
-    const windowSize = 30;
-    const windowStart = Math.max(0, messages.length - windowSize);
-    const recentMsgs = messages.slice(-windowSize);
+        const windowSize = 30;
+        const windowStart = Math.max(0, messages.length - windowSize);
+        const recentMsgs = messages.slice(-windowSize);
 
-    let messageContext;
-    let branchHint = '';
+        let messageContext;
+        let branchHint = '';
 
-    if (branchPoint != null && branchPoint >= windowStart) {
-        // Branch point falls within the window — insert a marker
-        const relPos = branchPoint - windowStart;
-        const before = recentMsgs.slice(0, relPos).map(m =>
-            `${m.role === 'user' ? 'User' : characterName}: ${m.text}`,
-        );
-        const after = recentMsgs.slice(relPos).map(m =>
-            `${m.role === 'user' ? 'User' : characterName}: ${m.text}`,
-        );
-        messageContext = [...before, '--- BRANCH POINT ---', ...after].join('\n');
-        branchHint = '\nThis conversation branches from another at the marked point. Emphasize what happens after the branch point — what makes this path distinct.';
-    } else {
-        messageContext = recentMsgs.map(m =>
-            `${m.role === 'user' ? 'User' : characterName}: ${m.text}`,
-        ).join('\n');
-        if (branchPoint != null) {
-            branchHint = '\nThis conversation is a branch that diverged early from another. Summarize its unique content.';
-        }
-    }
-
-    const prompt = `Given these recent roleplay messages:\n\n${messageContext}\n\nSummarize this roleplay conversation with emphasis on recent events. 2-4 sentences. Focus on what happened, key actions, and current situation.${branchHint} Output ONLY the summary.`;
-    const systemPrompt = 'You are a concise summarizer. Output only the requested summary.';
-
-    try {
-        const result = await context.generateRaw({ prompt, systemPrompt });
-
-        // Report token usage
-        try {
-            const tracker = window['TokenUsageTracker'];
-            if (tracker && result) {
-                const inputTokens = await tracker.countTokens(systemPrompt + '\n' + prompt);
-                const outputTokens = await tracker.countTokens(result);
-                const modelId = tracker.getCurrentModelId();
-                const sourceId = tracker.getCurrentSourceId();
-                tracker.recordUsage(inputTokens, outputTokens, null, modelId, sourceId, 0);
+        if (branchPoint != null && branchPoint >= windowStart) {
+            // Branch point falls within the window — insert a marker
+            const relPos = branchPoint - windowStart;
+            const before = recentMsgs.slice(0, relPos).map(m =>
+                `${m.role === 'user' ? 'User' : characterName}: ${m.text}`,
+            );
+            const after = recentMsgs.slice(relPos).map(m =>
+                `${m.role === 'user' ? 'User' : characterName}: ${m.text}`,
+            );
+            messageContext = [...before, '--- BRANCH POINT ---', ...after].join('\n');
+            branchHint = '\nThis conversation branches from another at the marked point. Emphasize what happens after the branch point — what makes this path distinct.';
+        } else {
+            messageContext = recentMsgs.map(m =>
+                `${m.role === 'user' ? 'User' : characterName}: ${m.text}`,
+            ).join('\n');
+            if (branchPoint != null) {
+                branchHint = '\nThis conversation is a branch that diverged early from another. Summarize its unique content.';
             }
-        } catch (e) {
-            console.warn(`[${MODULE_NAME}] Token usage reporting failed:`, e);
         }
 
-        const summary = cleanGeneratedText(result, 1000);
-        if (!summary) {
-            toastr.warning('AI returned an empty or invalid summary.');
+        const prompt = `Given these recent roleplay messages:\n\n${messageContext}\n\nSummarize this roleplay conversation with emphasis on recent events. 2-4 sentences. Focus on what happened, key actions, and current situation.${branchHint} Output ONLY the summary.`;
+        const systemPrompt = 'You are a concise summarizer. Output only the requested summary.';
+
+        try {
+            const result = await context.generateRaw({ prompt, systemPrompt });
+
+            // Report token usage
+            try {
+                const tracker = window['TokenUsageTracker'];
+                if (tracker && result) {
+                    const inputTokens = await tracker.countTokens(systemPrompt + '\n' + prompt);
+                    const outputTokens = await tracker.countTokens(result);
+                    const modelId = tracker.getCurrentModelId();
+                    const sourceId = tracker.getCurrentSourceId();
+                    tracker.recordUsage(inputTokens, outputTokens, null, modelId, sourceId, 0);
+                }
+            } catch (e) {
+                console.warn(`[${MODULE_NAME}] Token usage reporting failed:`, e);
+            }
+
+            const summary = cleanGeneratedText(result, 1000);
+            if (!summary) {
+                toastr.warning('AI returned an empty or invalid summary.');
+                return null;
+            }
+
+            return summary;
+        } catch (err) {
+            console.error(`[${MODULE_NAME}] Summary generation failed:`, err);
+            toastr.error('Failed to generate summary. Check API connection.');
             return null;
         }
-
-        return summary;
-    } catch (err) {
-        console.error(`[${MODULE_NAME}] Summary generation failed:`, err);
-        toastr.error('Failed to generate summary. Check API connection.');
-        return null;
-    }
+    });
 }
 
 /**

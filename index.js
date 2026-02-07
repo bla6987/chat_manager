@@ -5,7 +5,7 @@
 
 import { clearIndex, getIndexCharacterAvatar, updateActiveChat } from './src/chat-reader.js';
 import { togglePanel, closePanel, refreshPanel, renderThreadCards, onSearchInput, isPanelOpen, resetSearchState, toggleTimeline, isTimelineActive, toggleStats, isStatsActive, toggleBranchContext, isBranchContextActive } from './src/ui-controller.js';
-import { getDisplayMode, setDisplayMode, getBranchContextEnabled } from './src/metadata-store.js';
+import { getDisplayMode, setDisplayMode, getBranchContextEnabled, getAIConnectionProfile, setAIConnectionProfile } from './src/metadata-store.js';
 import { updateBranchContextInjection, clearBranchContextInjection } from './src/branch-context.js';
 import { attachMomentumScroll } from './src/momentum-scroll.js';
 
@@ -84,6 +84,17 @@ const onMessageUpdate = (() => {
         // Hijack TopInfoBar's chat manager button once all extensions are ready
         if (eventTypes.APP_READY) {
             eventSource.on(eventTypes.APP_READY, onAppReady);
+        }
+
+        // Re-populate AI profile dropdown when Connection Manager profiles change
+        const profileEvents = ['CONNECTION_PROFILE_CREATED', 'CONNECTION_PROFILE_UPDATED', 'CONNECTION_PROFILE_DELETED'];
+        for (const evtName of profileEvents) {
+            if (eventTypes[evtName]) {
+                eventSource.on(eventTypes[evtName], () => {
+                    const select = document.getElementById('chat-manager-ai-profile');
+                    if (select) populateAIProfileDropdown(select);
+                });
+            }
         }
     } else {
         console.warn(`[${MODULE_NAME}] Missing eventSource/eventTypes; startup listeners not attached.`);
@@ -325,6 +336,45 @@ function registerSlashCommands() {
 }
 
 /**
+ * Populate the AI connection profile dropdown from Connection Manager's profiles.
+ * @param {HTMLSelectElement} selectEl
+ */
+function populateAIProfileDropdown(selectEl) {
+    if (!selectEl) return;
+
+    const context = SillyTavern.getContext();
+    const cmProfiles = context.extensionSettings?.connectionManager?.profiles;
+    const savedId = getAIConnectionProfile();
+
+    // Clear all options except the first ("Current Connection")
+    while (selectEl.options.length > 1) {
+        selectEl.remove(1);
+    }
+
+    if (!Array.isArray(cmProfiles) || cmProfiles.length === 0) {
+        selectEl.value = '';
+        if (savedId) setAIConnectionProfile('');
+        return;
+    }
+
+    const sorted = [...cmProfiles].sort((a, b) => a.name.localeCompare(b.name));
+    for (const profile of sorted) {
+        const opt = document.createElement('option');
+        opt.value = profile.id;
+        opt.textContent = profile.name;
+        selectEl.appendChild(opt);
+    }
+
+    // Restore saved value, or reset if the saved profile was deleted
+    if (savedId && sorted.some(p => p.id === savedId)) {
+        selectEl.value = savedId;
+    } else {
+        selectEl.value = '';
+        if (savedId) setAIConnectionProfile('');
+    }
+}
+
+/**
  * Inject the settings panel into SillyTavern's Extensions settings area.
  */
 async function injectSettingsPanel() {
@@ -379,6 +429,15 @@ async function injectSettingsPanel() {
                 await switchDisplayMode(newMode);
             });
         });
+
+        // AI Connection Profile dropdown
+        const aiProfileSelect = container.querySelector('#chat-manager-ai-profile');
+        if (aiProfileSelect) {
+            populateAIProfileDropdown(aiProfileSelect);
+            aiProfileSelect.addEventListener('change', () => {
+                setAIConnectionProfile(aiProfileSelect.value);
+            });
+        }
     })().finally(() => {
         pendingSettingsInjection = null;
     });

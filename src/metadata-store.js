@@ -38,6 +38,9 @@ function ensureSettings() {
     if (!extensionSettings[MODULE_NAME].sortState) {
         extensionSettings[MODULE_NAME].sortState = { ...DEFAULT_SORT_STATE };
     }
+    if (extensionSettings[MODULE_NAME].aiConnectionProfile === undefined) {
+        extensionSettings[MODULE_NAME].aiConnectionProfile = '';
+    }
 }
 
 /**
@@ -212,6 +215,27 @@ export function setBranchContextEnabled(active) {
     ensureSettings();
     const { extensionSettings, saveSettingsDebounced } = SillyTavern.getContext();
     extensionSettings[MODULE_NAME].branchContextEnabled = active;
+    saveSettingsDebounced();
+}
+
+/**
+ * Get the AI connection profile ID (empty string = use current connection).
+ * @returns {string}
+ */
+export function getAIConnectionProfile() {
+    ensureSettings();
+    const { extensionSettings } = SillyTavern.getContext();
+    return extensionSettings[MODULE_NAME].aiConnectionProfile || '';
+}
+
+/**
+ * Set the AI connection profile ID.
+ * @param {string} profileId - Profile ID or empty string for current connection
+ */
+export function setAIConnectionProfile(profileId) {
+    ensureSettings();
+    const { extensionSettings, saveSettingsDebounced } = SillyTavern.getContext();
+    extensionSettings[MODULE_NAME].aiConnectionProfile = profileId || '';
     saveSettingsDebounced();
 }
 

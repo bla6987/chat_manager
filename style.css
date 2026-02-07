@@ -597,6 +597,24 @@
     font-size: 0.85em;
 }
 
+.chat-manager-settings-select {
+    width: 100%;
+    padding: 6px 10px;
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    border-radius: 6px;
+    background: rgba(0, 0, 0, 0.2);
+    color: inherit;
+    font-size: inherit;
+    outline: none;
+    box-sizing: border-box;
+    cursor: pointer;
+    margin-bottom: 4px;
+}
+
+.chat-manager-settings-select:focus {
+    border-color: rgba(255, 255, 255, 0.25);
+}
+
 /* ══════════════════════════════════════════════
    Timeline Visualization
    ══════════════════════════════════════════════ */
