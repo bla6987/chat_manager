@@ -158,6 +158,7 @@ function computeLayout(node, y0, y1, activeChatFile) {
     });
 
     const totalChats = children.reduce((sum, c) => sum + c.chatFiles.length, 0);
+    if (totalChats === 0) return;
     const span = y1 - y0;
     let cursor = y0;
 

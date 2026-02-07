@@ -562,6 +562,7 @@ function render() {
     const yStart = viewY0;
     const yEnd = viewY1;
     const ySpan = yEnd - yStart;
+    if (ySpan <= 0) return;
 
     for (const node of flatNodes) {
         if (node.depth < minVisibleDepth || node.depth > maxVisibleDepth) continue;
@@ -725,6 +726,7 @@ function hitTest(px, py) {
     const yStart = viewY0;
     const yEnd = viewY1;
     const ySpan = yEnd - yStart;
+    if (ySpan <= 0) return null;
 
     // Determine depth column (offset for explore mode)
     const depth = Math.floor((px + viewX) / COL_WIDTH) + exploreDepthOffset;

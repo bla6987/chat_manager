@@ -1032,7 +1032,8 @@ async function handleAITitle(e) {
     }
 
     btn.classList.add('disabled', 'fa-spin');
-    btn.classList.replace('fa-robot', 'fa-gear');
+    btn.classList.remove('fa-robot');
+    btn.classList.add('fa-gear');
 
     try {
         const activeChatFile = getActiveFilename();
@@ -1064,8 +1065,8 @@ async function handleAITitle(e) {
         console.error(`[${MODULE_NAME}] AI title generation failed:`, err);
         toastr.error('Failed to generate title.');
     } finally {
-        btn.classList.remove('disabled', 'fa-spin');
-        btn.classList.replace('fa-gear', 'fa-robot');
+        btn.classList.remove('disabled', 'fa-spin', 'fa-gear');
+        btn.classList.add('fa-robot');
     }
 }
 

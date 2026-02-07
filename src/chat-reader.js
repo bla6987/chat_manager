@@ -412,6 +412,8 @@ function startHydrationLoop() {
                 await Promise.all(batch.map(fileName => hydrateEntry(fileName, sessionId)));
                 emitHydrationUpdate();
             }
+        } catch (err) {
+            console.error('[chat_manager] Hydration loop error:', err);
         } finally {
             hydrationInProgress = false;
 

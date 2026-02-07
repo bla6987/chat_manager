@@ -9,6 +9,8 @@ const STORE_NAME = 'chats';
 
 /** @type {IDBDatabase|null} */
 let db = null;
+/** @type {Promise<IDBDatabase>|null} */
+let dbPromise = null;
 
 /**
  * Open (or reuse) the IndexedDB database.
@@ -16,8 +18,9 @@ let db = null;
  */
 function openDB() {
     if (db) return Promise.resolve(db);
+    if (dbPromise) return dbPromise;
 
-    return new Promise((resolve, reject) => {
+    dbPromise = new Promise((resolve, reject) => {
         const request = indexedDB.open(DB_NAME, DB_VERSION);
 
         request.onupgradeneeded = (event) => {
@@ -34,10 +37,13 @@ function openDB() {
         };
 
         request.onerror = (event) => {
+            dbPromise = null; // allow retry on failure
             console.error('[chat_manager] Failed to open IndexedDB:', event.target.error);
             reject(event.target.error);
         };
     });
+
+    return dbPromise;
 }
 
 /**
