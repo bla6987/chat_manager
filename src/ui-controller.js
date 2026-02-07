@@ -11,11 +11,15 @@ import {
     getDisplayName, setDisplayName, getSummary, setSummary,
     migrateFileKey, getDisplayMode, getChatMeta,
     getThreadFocus, setThreadFocus as persistThreadFocus,
+    getBranchContextEnabled, setBranchContextEnabled,
     getTagDefinitions, createTagDefinition, updateTagDefinition, deleteTagDefinition,
     getChatTags, addChatTag, removeChatTag,
     getFilterState, setFilterState, clearFilterState, hasActiveFilter,
     getSortState, setSortState,
 } from './metadata-store.js';
+import {
+    updateBranchContextInjection, clearBranchContextInjection,
+} from './branch-context.js';
 import {
     generateTitleForActiveChat, generateTitleForChat,
     generateSummaryForActiveChat, generateSummaryForChat,
@@ -35,6 +39,7 @@ const MODULE_NAME = 'chat_manager';
 let panelOpen = false;
 let timelineActive = false;
 let statsActive = false;
+let branchContextActive = false;
 const RESULTS_PAGE_SIZE = 50;
 let hydrationSubscriptionReady = false;
 let refreshFromHydrationTimer = null;
@@ -58,6 +63,10 @@ export function isTimelineActive() {
 
 export function isStatsActive() {
     return statsActive;
+}
+
+export function isBranchContextActive() {
+    return branchContextActive;
 }
 
 /**
@@ -169,6 +178,50 @@ export function toggleStats() {
     } else {
         deactivateStats();
         renderThreadCards();
+    }
+}
+
+/**
+ * Toggle branch context injection on/off.
+ */
+export function toggleBranchContext() {
+    branchContextActive = !branchContextActive;
+    setBranchContextEnabled(branchContextActive);
+
+    const btn = document.getElementById('chat-manager-branch-context-toggle');
+    if (btn) btn.classList.toggle('active', branchContextActive);
+
+    if (branchContextActive) {
+        const activeFile = getActiveFilename();
+        const result = updateBranchContextInjection(activeFile);
+        updateBranchContextStatusUI(result);
+    } else {
+        clearBranchContextInjection();
+        const indicator = document.getElementById('chat-manager-branch-context-indicator');
+        if (indicator) indicator.style.display = 'none';
+    }
+}
+
+/**
+ * Update the branch context status indicator UI.
+ * @param {{ branchCount: number, injected: boolean }} result
+ */
+function updateBranchContextStatusUI(result) {
+    const indicator = document.getElementById('chat-manager-branch-context-indicator');
+    if (!indicator) return;
+
+    if (!branchContextActive) {
+        indicator.style.display = 'none';
+        return;
+    }
+
+    indicator.style.display = '';
+    if (result.injected && result.branchCount > 0) {
+        indicator.className = 'chat-manager-branch-ctx-indicator';
+        indicator.textContent = `Branch context: ${result.branchCount} branch${result.branchCount !== 1 ? 'es' : ''} injected`;
+    } else {
+        indicator.className = 'chat-manager-branch-ctx-indicator empty';
+        indicator.textContent = 'Branch context: no sibling branches found';
     }
 }
 
@@ -354,6 +407,11 @@ function scheduleHydrationUIRefresh() {
             const activeFile = getActiveFilename();
             runDeferredBranchDetection(activeFile);
             patchBranchIndicators();
+
+            if (branchContextActive) {
+                const result = updateBranchContextInjection(activeFile);
+                updateBranchContextStatusUI(result);
+            }
         }
     }, 600);
 }
@@ -550,6 +608,11 @@ function deactivateTimeline() {
 export async function refreshPanel() {
     const context = SillyTavern.getContext();
     ensureHydrationSubscription();
+
+    // Restore branch context toggle state from persisted setting
+    branchContextActive = getBranchContextEnabled();
+    const branchCtxBtn = document.getElementById('chat-manager-branch-context-toggle');
+    if (branchCtxBtn) branchCtxBtn.classList.toggle('active', branchContextActive);
 
     // Guard: no character selected or group chat
     if (context.characterId === undefined) {

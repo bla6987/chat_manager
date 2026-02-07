@@ -756,6 +756,46 @@ function detectBranches(index, activeFilename) {
 }
 
 /**
+ * Get sibling branch context for the active chat.
+ * Returns post-divergence messages from sibling branches (chats that share a common prefix
+ * with the active chat but diverge at some point).
+ * @param {string} activeFilename - The currently active chat filename
+ * @param {number} [maxBranches=3] - Maximum number of sibling branches to return
+ * @returns {Array<{ fileName: string, branchPoint: number, messages: IndexMessage[] }>}
+ */
+export function getSiblingBranchContext(activeFilename, maxBranches = 3) {
+    if (!activeFilename) return [];
+
+    const siblings = [];
+
+    for (const entry of Object.values(chatIndex)) {
+        if (entry.fileName === activeFilename) continue;
+        if (!entry.isLoaded || entry.branchPoint === null) continue;
+
+        // Collect all messages after the branch point
+        const postBranchMessages = entry.messages.slice(entry.branchPoint);
+        if (postBranchMessages.length === 0) continue;
+
+        siblings.push({
+            fileName: entry.fileName,
+            branchPoint: entry.branchPoint,
+            messages: postBranchMessages,
+        });
+    }
+
+    // Sort by most recent activity (newest first), then cap
+    siblings.sort((a, b) => {
+        const aLast = a.messages[a.messages.length - 1];
+        const bLast = b.messages[b.messages.length - 1];
+        const aTime = aLast?.timestamp ? new Date(aLast.timestamp).getTime() : 0;
+        const bTime = bLast?.timestamp ? new Date(bLast.timestamp).getTime() : 0;
+        return (Number.isFinite(bTime) ? bTime : 0) - (Number.isFinite(aTime) ? aTime : 0);
+    });
+
+    return siblings.slice(0, maxBranches);
+}
+
+/**
  * Get the current chat index.
  * @returns {Object}
  */

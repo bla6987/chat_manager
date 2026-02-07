@@ -3,6 +3,7 @@
         <div class="chat-manager-popup-header">
             <h3 class="chat-manager-title">Chat Manager</h3>
             <div class="chat-manager-header-actions">
+                <button id="chat-manager-branch-context-toggle" class="chat-manager-btn chat-manager-branch-ctx-toggle" title="Inject sibling branch context into AI prompt"><i class="fa-solid fa-code-branch"></i></button>
                 <button id="chat-manager-stats-toggle" class="chat-manager-btn chat-manager-stats-toggle" title="Toggle stats dashboard"><i class="fa-solid fa-chart-bar"></i></button>
                 <button id="chat-manager-timeline-toggle" class="chat-manager-btn chat-manager-timeline-toggle" title="Toggle timeline view">&#x2441;</button>
                 <button id="chat-manager-popup-close" class="chat-manager-btn chat-manager-close" title="Close popup">&times;</button>
@@ -12,6 +13,7 @@
             <input type="text" id="chat-manager-search" class="chat-manager-search-input" placeholder="Search messages across all threads..." />
         </div>
         <div id="chat-manager-status" class="chat-manager-status">Showing summaries</div>
+        <div id="chat-manager-branch-context-indicator" class="chat-manager-branch-ctx-indicator" style="display:none;"></div>
         <div id="chat-manager-content" class="chat-manager-content">
             <!-- Thread cards or search results rendered here -->
         </div>

@@ -4,8 +4,9 @@
  */
 
 import { clearIndex, getIndexCharacterAvatar, updateActiveChat } from './src/chat-reader.js';
-import { togglePanel, closePanel, refreshPanel, renderThreadCards, onSearchInput, isPanelOpen, resetSearchState, toggleTimeline, isTimelineActive, toggleStats, isStatsActive } from './src/ui-controller.js';
-import { getDisplayMode, setDisplayMode } from './src/metadata-store.js';
+import { togglePanel, closePanel, refreshPanel, renderThreadCards, onSearchInput, isPanelOpen, resetSearchState, toggleTimeline, isTimelineActive, toggleStats, isStatsActive, toggleBranchContext, isBranchContextActive } from './src/ui-controller.js';
+import { getDisplayMode, setDisplayMode, getBranchContextEnabled } from './src/metadata-store.js';
+import { updateBranchContextInjection, clearBranchContextInjection } from './src/branch-context.js';
 import { attachMomentumScroll } from './src/momentum-scroll.js';
 
 const MODULE_NAME = 'chat_manager';
@@ -34,16 +35,20 @@ const onMessageUpdate = (() => {
         if (timer) clearTimeout(timer);
         timer = setTimeout(async () => {
             timer = null;
-            if (!isPanelOpen()) return;
 
             const context = SillyTavern.getContext();
             const activeChatFile = context.chatMetadata?.chat_file_name;
 
-            if (activeChatFile) {
+            if (isPanelOpen() && activeChatFile) {
                 const updated = await updateActiveChat(activeChatFile);
                 if (updated && !isTimelineActive() && !isStatsActive()) {
                     renderThreadCards();
                 }
+            }
+
+            // Branch context injection works even when panel is closed
+            if (isBranchContextActive() && activeChatFile) {
+                updateBranchContextInjection(activeChatFile);
             }
         }, 250);
     };
@@ -85,6 +90,17 @@ const onMessageUpdate = (() => {
     }
 
     registerSlashCommands();
+
+    // Restore branch context injection if it was enabled
+    if (getBranchContextEnabled()) {
+        setTimeout(() => {
+            const ctx = SillyTavern.getContext();
+            const activeFile = ctx.chatMetadata?.chat_file_name;
+            if (activeFile) {
+                updateBranchContextInjection(activeFile);
+            }
+        }, 2000);
+    }
 
     console.log(`[${MODULE_NAME}] Extension loaded.`);
 })();
@@ -489,6 +505,15 @@ function bindPanelEvents() {
         });
     }
 
+    // Branch context toggle button
+    const branchCtxToggleBtn = document.getElementById('chat-manager-branch-context-toggle');
+    if (branchCtxToggleBtn) {
+        branchCtxToggleBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            toggleBranchContext();
+        });
+    }
+
     // Stats toggle button
     const statsToggleBtn = document.getElementById('chat-manager-stats-toggle');
     if (statsToggleBtn) {
@@ -541,4 +566,18 @@ async function onChatChanged() {
     resetSearchState();
     const searchInput = document.getElementById('chat-manager-search');
     if (searchInput) searchInput.value = '';
+
+    // Re-evaluate branch context injection for the new chat
+    if (getBranchContextEnabled()) {
+        // Clear immediately, then defer re-injection to let index stabilize
+        clearBranchContextInjection();
+        setTimeout(() => {
+            if (!isBranchContextActive()) return;
+            const ctx = SillyTavern.getContext();
+            const activeFile = ctx.chatMetadata?.chat_file_name;
+            if (activeFile) {
+                updateBranchContextInjection(activeFile);
+            }
+        }, 1000);
+    }
 }

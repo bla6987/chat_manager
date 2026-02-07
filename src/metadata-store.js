@@ -195,6 +195,27 @@ export function setDisplayMode(mode) {
 }
 
 /**
+ * Get the branch context injection preference (defaults to false).
+ * @returns {boolean}
+ */
+export function getBranchContextEnabled() {
+    ensureSettings();
+    const { extensionSettings } = SillyTavern.getContext();
+    return extensionSettings[MODULE_NAME].branchContextEnabled === true;
+}
+
+/**
+ * Set the branch context injection preference.
+ * @param {boolean} active
+ */
+export function setBranchContextEnabled(active) {
+    ensureSettings();
+    const { extensionSettings, saveSettingsDebounced } = SillyTavern.getContext();
+    extensionSettings[MODULE_NAME].branchContextEnabled = active;
+    saveSettingsDebounced();
+}
+
+/**
  * Get the thread focus preference (defaults to true).
  * @returns {boolean}
  */

@@ -1340,6 +1340,36 @@
    Stats Dashboard
    ══════════════════════════════════════════════ */
 
+/* ── Branch Context Toggle ── */
+
+.chat-manager-branch-ctx-toggle {
+    font-size: 1.1em;
+    line-height: 1;
+    width: 32px;
+    height: 32px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.chat-manager-branch-ctx-toggle.active {
+    background: rgba(100, 220, 100, 0.2);
+    border-color: rgba(100, 220, 100, 0.5);
+    color: rgba(100, 220, 100, 0.9);
+}
+
+.chat-manager-branch-ctx-indicator {
+    padding: 2px 16px 4px;
+    font-size: 0.75em;
+    color: rgba(100, 220, 100, 0.8);
+    flex-shrink: 0;
+}
+
+.chat-manager-branch-ctx-indicator.empty {
+    color: rgba(255, 200, 50, 0.6);
+    font-style: italic;
+}
+
 /* ── Stats Toggle Button ── */
 
 .chat-manager-stats-toggle {
@@ -1623,6 +1653,11 @@
     }
 
     .chat-manager-stats-toggle {
+        width: 44px;
+        height: 44px;
+    }
+
+    .chat-manager-branch-ctx-toggle {
         width: 44px;
         height: 44px;
     }
