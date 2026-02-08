@@ -905,14 +905,14 @@ function render() {
             } else if (isHovered) {
                 fillColor = withAlpha(lightenColor(base, 15), 0.98);
             } else {
-                fillColor = withAlpha(base, isActive ? 0.95 : 0.55);
+                fillColor = withAlpha(base, isActive ? 0.95 : 0.65);
             }
         } else if (effectiveColorMode === 'gradient' && Array.isArray(node.pca3d)) {
             const base = gradientColor(node.pca3d, pcaRanges || undefined);
             if (isHovered) {
                 fillColor = withAlpha(lightenColor(base, 10), 0.98);
             } else {
-                fillColor = withAlpha(base, isActive ? 0.95 : 0.55);
+                fillColor = withAlpha(base, isActive ? 0.95 : 0.65);
             }
         } else {
             if (isHovered) {
@@ -935,47 +935,25 @@ function render() {
         ctx.fillStyle = fillColor;
         ctx.fillRect(x, y, w, h);
 
-        // Topic drift overlay (active chat path only).
+        // Topic drift overlay — fill tint only (active chat path).
         if (Number.isFinite(driftScore)) {
             if (driftScore > DRIFT_HIGH_THRESHOLD) {
-                ctx.save();
-                ctx.strokeStyle = 'rgba(255, 150, 66, 0.95)';
-                ctx.lineWidth = 2;
-                ctx.shadowColor = 'rgba(255, 150, 66, 0.65)';
-                ctx.shadowBlur = 7;
-                ctx.strokeRect(x + 1, y + 1, Math.max(0, w - 2), Math.max(0, h - 2));
-                ctx.restore();
+                ctx.fillStyle = 'rgba(255, 150, 66, 0.25)';
+                ctx.fillRect(x, y, w, h);
             } else if (driftScore >= DRIFT_MEDIUM_THRESHOLD) {
                 ctx.fillStyle = 'rgba(255, 176, 96, 0.16)';
                 ctx.fillRect(x, y, w, h);
-                ctx.strokeStyle = 'rgba(255, 176, 96, 0.62)';
-                ctx.lineWidth = 1;
-                ctx.strokeRect(x + 0.5, y + 0.5, w - 1, h - 1);
             }
         }
 
-        // Retain branch divergence marker regardless of color mode.
-        if (isDivergence) {
-            ctx.strokeStyle = 'rgba(232, 188, 98, 0.38)';
-            ctx.lineWidth = 1;
-            ctx.strokeRect(x + 0.5, y + 0.5, w - 1, h - 1);
-        }
-
-        // Embedded node outline
-        if (node.chatEmbedding) {
-            ctx.strokeStyle = 'rgba(130, 200, 160, 0.30)';
-            ctx.lineWidth = 1;
-            ctx.strokeRect(x + 0.5, y + 0.5, w - 1, h - 1);
-        }
-
-        // Active path stroke
+        // Active thread outline — the only outline indicator
         if (isActive && !isHovered) {
             ctx.strokeStyle = 'rgba(100, 180, 255, 0.8)';
             ctx.lineWidth = 1.5;
             ctx.strokeRect(x + 0.5, y + 0.5, w - 1, h - 1);
         }
 
-        // Search match highlight
+        // Search match highlight (outline, since it's a transient indicator)
         if (searchMatchSet.has(node)) {
             const isFocused = searchMatches[searchMatchIndex] === node;
             ctx.strokeStyle = isFocused ? 'rgba(255, 180, 50, 1.0)' : 'rgba(255, 180, 50, 0.7)';

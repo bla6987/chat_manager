@@ -76,6 +76,8 @@ const driftSummaryCache = new Map();
  * @type {{ query: string, lowerQuery: string, searchable: Array, position: number, results: Array, totalMatches: number, exhausted?: boolean, mode?: 'keyword'|'semantic' } | null}
  */
 let searchState = null;
+/** @type {null|'keyword'|'semantic'} — null = auto, otherwise forced mode */
+let searchModeOverride = null;
 
 export function resetSearchState() {
     latestSearchRequestId += 1;
@@ -95,6 +97,14 @@ export function isBranchContextActive() {
     return branchContextActive;
 }
 
+function canSemanticSearch() {
+    const settings = getEmbeddingSettings();
+    return isEmbeddingLevelOn(settings, 'message')
+        && isEmbeddingLevelOn(settings, 'query')
+        && isEmbeddingConfigured()
+        && hasMessageEmbeddings();
+}
+
 function ensureSearchModeBadge() {
     const wrapper = document.querySelector('.chat-manager-search-wrapper');
     if (!wrapper) return null;
@@ -104,17 +114,62 @@ function ensureSearchModeBadge() {
         badge = document.createElement('span');
         badge.className = 'chat-manager-search-mode-badge';
         badge.textContent = 'Keyword';
+        badge.addEventListener('click', onSearchModeBadgeClick);
         wrapper.appendChild(badge);
     }
     return badge;
 }
 
+function onSearchModeBadgeClick() {
+    if (!canSemanticSearch()) return;
+    // Cycle: null (auto) → 'keyword' → 'semantic' → null
+    if (searchModeOverride === null) searchModeOverride = 'keyword';
+    else if (searchModeOverride === 'keyword') searchModeOverride = 'semantic';
+    else searchModeOverride = null;
+
+    // Re-run current search with the new mode
+    const input = document.getElementById('chat-manager-search');
+    const query = input?.value?.trim() || '';
+    updateSearchModeBadgeDisplay();
+    if (query.length >= 2) performSearch(query);
+}
+
+function updateSearchModeBadgeDisplay() {
+    const badge = ensureSearchModeBadge();
+    if (!badge) return;
+    const available = canSemanticSearch();
+    badge.classList.toggle('clickable', available);
+
+    if (searchModeOverride === 'semantic') {
+        badge.textContent = 'Semantic';
+        badge.classList.add('semantic');
+        badge.classList.remove('forced-keyword');
+        badge.title = 'Forced semantic — click to cycle (Auto)';
+    } else if (searchModeOverride === 'keyword') {
+        badge.textContent = 'Keyword';
+        badge.classList.remove('semantic');
+        badge.classList.add('forced-keyword');
+        badge.title = 'Forced keyword — click to cycle (Semantic)';
+    } else {
+        // auto — show what would actually be used
+        badge.classList.remove('forced-keyword');
+        badge.title = available ? 'Auto — click to force Keyword' : 'Semantic search unavailable';
+    }
+}
+
 function setSearchModeBadge(mode) {
     const badge = ensureSearchModeBadge();
     if (!badge) return;
+    // If override is active, updateSearchModeBadgeDisplay handles text/style
+    if (searchModeOverride !== null) {
+        updateSearchModeBadgeDisplay();
+        return;
+    }
     const semantic = mode === 'semantic';
     badge.textContent = semantic ? 'Semantic' : 'Keyword';
     badge.classList.toggle('semantic', semantic);
+    badge.classList.remove('forced-keyword');
+    updateSearchModeBadgeDisplay();
 }
 
 function hasMessageEmbeddings() {
@@ -164,11 +219,13 @@ function updateEmbeddingSelectionControls(toolbar = null) {
 }
 
 function shouldUseSemanticSearch(query) {
+    if (searchModeOverride === 'keyword') return false;
+    if (searchModeOverride === 'semantic') {
+        return canSemanticSearch() && query && query.length >= HYBRID_SEARCH_MIN_CHARS;
+    }
+    // Auto mode
     if (!query || query.length < HYBRID_SEARCH_MIN_CHARS) return false;
-    const settings = getEmbeddingSettings();
-    if (!isEmbeddingLevelOn(settings, 'message') || !isEmbeddingLevelOn(settings, 'query')) return false;
-    if (!isEmbeddingConfigured()) return false;
-    return hasMessageEmbeddings();
+    return canSemanticSearch();
 }
 
 function getCurrentClusterCount() {
@@ -1262,6 +1319,7 @@ export async function refreshPanel() {
     const context = SillyTavern.getContext();
     ensureHydrationSubscription();
     ensureSearchModeBadge();
+    updateSearchModeBadgeDisplay();
     if (getEmbeddingSettings().enabled) {
         scheduleEmbeddingBootstrap();
     }
@@ -2187,6 +2245,7 @@ async function performSemanticSearch(trimmed, requestId) {
             item: msg,
             matchIndex: textLower.indexOf(lowerQuery),
             combinedScore,
+            semanticScore,
         });
     }
 
@@ -2310,6 +2369,18 @@ function renderSearchPage(container, fromIndex) {
     const end = Math.min(fromIndex + RESULTS_PAGE_SIZE, searchState.results.length);
     let html = '';
 
+    const isSemantic = searchState.mode === 'semantic';
+
+    // For semantic results, find min/max scores across ALL results for consistent coloring
+    let scoreMin = 1, scoreMax = 0;
+    if (isSemantic) {
+        for (const r of searchState.results) {
+            const s = r.semanticScore ?? 0;
+            if (s < scoreMin) scoreMin = s;
+            if (s > scoreMax) scoreMax = s;
+        }
+    }
+
     for (let i = fromIndex; i < end; i++) {
         const result = searchState.results[i];
         const item = result.item;
@@ -2320,13 +2391,20 @@ function renderSearchPage(container, fromIndex) {
         // Build highlighted excerpt
         const excerpt = buildHighlightedExcerpt(item.text, searchState.query);
 
+        let similarityPct = '';
+        let scoreAttr = '';
+        if (isSemantic && typeof result.semanticScore === 'number') {
+            scoreAttr = ` data-sim-score="${result.semanticScore.toFixed(4)}"`;
+            similarityPct = ` · ${Math.round(result.semanticScore * 100)}%`;
+        }
+
         html += `
-        <div class="chat-manager-search-result" data-filename="${escapeAttr(item.filename)}" data-msg-index="${item.index}">
+        <div class="chat-manager-search-result"${scoreAttr} data-filename="${escapeAttr(item.filename)}" data-msg-index="${item.index}">
             <div class="chat-manager-result-header">
                 <span class="chat-manager-result-thread">${escapeHtml(displayName)}</span>
             </div>
             <div class="chat-manager-result-meta">
-                Message #${item.index} (${roleLabel}${dateStr ? ', ' + dateStr : ''})
+                Message #${item.index} (${roleLabel}${dateStr ? ', ' + dateStr : ''}${similarityPct})
             </div>
             <div class="chat-manager-result-excerpt">${excerpt}</div>
             <div class="chat-manager-result-actions">
@@ -2341,6 +2419,20 @@ function renderSearchPage(container, fromIndex) {
     temp.innerHTML = DOMPurify.sanitize(html);
     while (temp.firstChild) {
         container.appendChild(temp.firstChild);
+    }
+
+    // Apply similarity coloring post-sanitization (DOMPurify strips inline styles)
+    if (isSemantic) {
+        for (const el of container.querySelectorAll('.chat-manager-search-result[data-sim-score]')) {
+            const score = parseFloat(el.dataset.simScore);
+            if (!Number.isFinite(score)) continue;
+            const t = scoreMax > scoreMin ? (score - scoreMin) / (scoreMax - scoreMin) : 1;
+            const hue = 200 + t * (140 - 200); // 200 (blue) → 140 (green)
+            const sat = 70 + t * 20;
+            const light = 50 + t * 10;
+            const alpha = 0.35 + t * 0.45;
+            el.style.borderLeft = `3px solid hsla(${hue}, ${sat}%, ${light}%, ${alpha})`;
+        }
     }
 
     // Remove any existing load-more button
