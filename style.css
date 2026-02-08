@@ -862,14 +862,29 @@
     cursor: grab;
 }
 
-.chat-manager-icicle-reset-btn {
+/* ── Icicle Bottom Toolbar ── */
+
+.chat-manager-icicle-toolbar {
     position: absolute;
-    bottom: 8px;
-    right: 8px;
+    bottom: 0;
+    left: 0;
+    right: 0;
     z-index: 10;
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    padding: 5px 8px;
+    background: rgba(20, 20, 24, 0.65);
+    backdrop-filter: blur(6px);
+    -webkit-backdrop-filter: blur(6px);
+    border-top: 1px solid rgba(255, 255, 255, 0.06);
+}
+
+.chat-manager-icicle-reset-btn {
+    margin-left: auto;
     font-size: 0.8em;
     padding: 3px 10px;
-    opacity: 0.6;
+    opacity: 0.85;
     transition: opacity 0.15s;
 }
 
@@ -878,17 +893,13 @@
 }
 
 .chat-manager-icicle-focus-btn {
-    position: absolute;
-    bottom: 8px;
-    left: 8px;
-    z-index: 10;
     font-size: 1em;
     width: 28px;
     height: 28px;
     display: flex;
     align-items: center;
     justify-content: center;
-    opacity: 0.6;
+    opacity: 0.85;
     transition: opacity 0.15s, background 0.15s;
 }
 
@@ -900,21 +911,17 @@
     background: rgba(100, 180, 255, 0.2);
     border-color: rgba(100, 180, 255, 0.5);
     color: rgba(100, 180, 255, 0.9);
-    opacity: 0.85;
+    opacity: 1;
 }
 
 .chat-manager-icicle-jump-current-btn {
-    position: absolute;
-    bottom: 8px;
-    left: 40px;
-    z-index: 10;
     font-size: 1em;
     width: 28px;
     height: 28px;
     display: flex;
     align-items: center;
     justify-content: center;
-    opacity: 0.6;
+    opacity: 0.85;
     transition: opacity 0.15s;
 }
 
@@ -923,14 +930,10 @@
 }
 
 .chat-manager-icicle-color-mode-btn {
-    position: absolute;
-    bottom: 8px;
-    left: 72px;
-    z-index: 10;
     font-size: 0.72em;
     padding: 3px 8px;
     min-height: 28px;
-    opacity: 0.72;
+    opacity: 0.85;
     transition: opacity 0.15s, background 0.15s;
 }
 
@@ -951,7 +954,7 @@
 .chat-manager-icicle-cluster-legend {
     position: absolute;
     right: 8px;
-    bottom: 42px;
+    bottom: 46px;
     z-index: 10;
     display: flex;
     align-items: center;
@@ -1272,10 +1275,19 @@
     padding: 2px 8px;
 }
 
-.chat-manager-timeline-embed-btn {
-    flex-shrink: 0;
-    font-size: 0.85em;
-    padding: 2px 8px;
+.chat-manager-timeline-embed-node-btn {
+    width: 100%;
+    padding: 5px 10px;
+    margin-bottom: 8px;
+    background: rgba(130, 200, 160, 0.15);
+    border-color: rgba(130, 200, 160, 0.4);
+    font-weight: 600;
+    font-size: 0.88em;
+}
+
+.chat-manager-timeline-embed-node-btn:hover {
+    background: rgba(130, 200, 160, 0.28);
+    border-color: rgba(130, 200, 160, 0.6);
 }
 
 .chat-manager-timeline-popup-actions {
@@ -1876,6 +1888,11 @@
         height: 44px;
     }
 
+    .chat-manager-icicle-toolbar {
+        padding: 6px 10px;
+        gap: 6px;
+    }
+
     .chat-manager-icicle-focus-btn {
         width: 44px;
         height: 44px;
@@ -1884,14 +1901,12 @@
     .chat-manager-icicle-jump-current-btn {
         width: 44px;
         height: 44px;
-        left: 56px;
     }
 
     .chat-manager-icicle-color-mode-btn {
         min-height: 44px;
         padding: 8px 12px;
         font-size: 0.85em;
-        left: 104px;
     }
 
     .chat-manager-icicle-reset-btn {
@@ -1940,24 +1955,6 @@
     .chat-manager-icicle-canvas {
         cursor: default;
         touch-action: none;
-    }
-
-    /* ── Always show reset/focus buttons on touch (no hover needed) ── */
-
-    .chat-manager-icicle-reset-btn {
-        opacity: 0.8;
-    }
-
-    .chat-manager-icicle-focus-btn {
-        opacity: 0.8;
-    }
-
-    .chat-manager-icicle-jump-current-btn {
-        opacity: 0.8;
-    }
-
-    .chat-manager-icicle-color-mode-btn {
-        opacity: 0.8;
     }
 
     .chat-manager-timeline-expand-btn {

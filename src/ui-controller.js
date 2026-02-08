@@ -676,14 +676,12 @@ export function scheduleIncrementalEmbedding(fileName) {
     }, EMBED_INCREMENTAL_DELAY_MS);
 }
 
-function canEmbedThreadFromTimeline(fileName) {
-    return threadNeedsEmbeddings(fileName);
+function canEmbedNodeFromTimeline(chatFiles) {
+    return Array.isArray(chatFiles) && chatFiles.some(f => threadNeedsEmbeddings(f));
 }
 
-async function handleTimelineEmbedThread(fileName) {
-    if (!fileName) return null;
-    const entry = getIndex()[fileName];
-    if (!entry) return null;
+async function handleTimelineEmbedNode(chatFiles) {
+    if (!Array.isArray(chatFiles) || chatFiles.length === 0) return null;
 
     const settings = getEmbeddingSettings();
     if (!settings.enabled) {
@@ -701,14 +699,14 @@ async function handleTimelineEmbedThread(fileName) {
         return null;
     }
 
-    if (!threadNeedsEmbeddings(fileName)) {
+    const filesToEmbed = chatFiles.filter(f => threadNeedsEmbeddings(f));
+    if (filesToEmbed.length === 0) {
         return { skipped: true, updated: 0, total: 0, clusters: getCurrentClusterCount(), messageVectors: 0 };
     }
 
-    const displayName = getDisplayName(fileName) || fileName;
-    toastr.info(`Generating embeddings for "${displayName}"…`);
+    toastr.info(`Generating embeddings for ${filesToEmbed.length} thread${filesToEmbed.length > 1 ? 's' : ''}…`);
 
-    const result = await queueEmbeddingRun(() => runEmbeddingGeneration([fileName], {
+    const result = await queueEmbeddingRun(() => runEmbeddingGeneration(filesToEmbed, {
         ensureIndex: false,
         rerender: true,
         silent: false,
@@ -718,7 +716,7 @@ async function handleTimelineEmbedThread(fileName) {
     const messagePart = Number.isFinite(result?.messageVectors) && result.messageVectors > 0
         ? `, ${result.messageVectors} messages`
         : '';
-    toastr.success(`Embeddings updated for "${displayName}"${messagePart} (${result.clusters} clusters).`);
+    toastr.success(`Embeddings updated for ${filesToEmbed.length} thread${filesToEmbed.length > 1 ? 's' : ''}${messagePart} (${result.clusters} clusters).`);
     return result;
 }
 
@@ -754,8 +752,8 @@ export function toggleTimeline() {
             onJump: handleTimelineJumpToMessage,
             getActive: getActiveFilename,
             onThreadFocusChanged: persistThreadFocus,
-            canEmbedThread: canEmbedThreadFromTimeline,
-            onEmbedThread: handleTimelineEmbedThread,
+            canEmbedNode: canEmbedNodeFromTimeline,
+            onEmbedNode: handleTimelineEmbedNode,
         });
 
         // Initialize thread focus from persisted preference

@@ -100,6 +100,7 @@ let lastTouchTime = 0;
 
 // Interaction state
 let hoveredNode = null;
+let toolbarEl = null;
 let resetBtnEl = null;
 let focusBtnEl = null;
 let jumpToCurrentBtnEl = null;
@@ -132,8 +133,8 @@ let searchDebounceTimer = null;
 let onJumpToChat = null;
 let getActiveChatFile = null;
 let onThreadFocusChanged = null;
-let canEmbedThread = null;
-let onEmbedThread = null;
+let canEmbedNode = null;
+let onEmbedNode = null;
 
 // ──────────────────────────────────────────────
 //  Public API
@@ -143,8 +144,8 @@ export function setIcicleCallbacks(callbacks) {
     onJumpToChat = callbacks.onJump;
     getActiveChatFile = callbacks.getActive;
     onThreadFocusChanged = callbacks.onThreadFocusChanged || null;
-    canEmbedThread = callbacks.canEmbedThread || null;
-    onEmbedThread = callbacks.onEmbedThread || null;
+    canEmbedNode = callbacks.canEmbedNode || null;
+    onEmbedNode = callbacks.onEmbedNode || null;
 }
 
 export function setThreadFocus(active) {
@@ -232,16 +233,10 @@ export function mountIcicle(containerEl, mode) {
     breadcrumbEl.className = 'chat-manager-icicle-breadcrumbs';
     container.appendChild(breadcrumbEl);
 
-    // Create reset button
-    resetBtnEl = document.createElement('button');
-    resetBtnEl.className = 'chat-manager-btn chat-manager-icicle-reset-btn';
-    resetBtnEl.textContent = 'Reset';
-    resetBtnEl.style.display = 'none';
-    resetBtnEl.addEventListener('click', (e) => {
-        e.stopPropagation();
-        zoomToRoot();
-    });
-    container.appendChild(resetBtnEl);
+    // Create bottom toolbar strip
+    toolbarEl = document.createElement('div');
+    toolbarEl.className = 'chat-manager-icicle-toolbar';
+    container.appendChild(toolbarEl);
 
     // Create focus toggle button
     focusBtnEl = document.createElement('button');
@@ -256,7 +251,7 @@ export function mountIcicle(containerEl, mode) {
         if (onThreadFocusChanged) onThreadFocusChanged(threadFocusActive);
         updateIcicleData();
     });
-    container.appendChild(focusBtnEl);
+    toolbarEl.appendChild(focusBtnEl);
 
     // Create jump-to-current button
     jumpToCurrentBtnEl = document.createElement('button');
@@ -267,7 +262,7 @@ export function mountIcicle(containerEl, mode) {
         e.stopPropagation();
         jumpToCurrentThread();
     });
-    container.appendChild(jumpToCurrentBtnEl);
+    toolbarEl.appendChild(jumpToCurrentBtnEl);
 
     // Create color mode toggle button
     colorModeBtnEl = document.createElement('button');
@@ -277,7 +272,18 @@ export function mountIcicle(containerEl, mode) {
         e.stopPropagation();
         cycleColorMode();
     });
-    container.appendChild(colorModeBtnEl);
+    toolbarEl.appendChild(colorModeBtnEl);
+
+    // Create reset button (right-aligned via margin-left: auto)
+    resetBtnEl = document.createElement('button');
+    resetBtnEl.className = 'chat-manager-btn chat-manager-icicle-reset-btn';
+    resetBtnEl.textContent = 'Reset';
+    resetBtnEl.style.display = 'none';
+    resetBtnEl.addEventListener('click', (e) => {
+        e.stopPropagation();
+        zoomToRoot();
+    });
+    toolbarEl.appendChild(resetBtnEl);
 
     // Floating cluster legend (visible in cluster mode with semantic data)
     clusterLegendEl = document.createElement('div');
@@ -324,22 +330,14 @@ export function unmountIcicle() {
         breadcrumbEl.remove();
         breadcrumbEl = null;
     }
-    if (resetBtnEl) {
-        resetBtnEl.remove();
-        resetBtnEl = null;
+    if (toolbarEl) {
+        toolbarEl.remove();
+        toolbarEl = null;
     }
-    if (focusBtnEl) {
-        focusBtnEl.remove();
-        focusBtnEl = null;
-    }
-    if (jumpToCurrentBtnEl) {
-        jumpToCurrentBtnEl.remove();
-        jumpToCurrentBtnEl = null;
-    }
-    if (colorModeBtnEl) {
-        colorModeBtnEl.remove();
-        colorModeBtnEl = null;
-    }
+    resetBtnEl = null;
+    focusBtnEl = null;
+    jumpToCurrentBtnEl = null;
+    colorModeBtnEl = null;
     if (clusterLegendEl) {
         clusterLegendEl.remove();
         clusterLegendEl = null;
@@ -959,6 +957,13 @@ function render() {
         // Retain branch divergence marker regardless of color mode.
         if (isDivergence) {
             ctx.strokeStyle = 'rgba(232, 188, 98, 0.38)';
+            ctx.lineWidth = 1;
+            ctx.strokeRect(x + 0.5, y + 0.5, w - 1, h - 1);
+        }
+
+        // Embedded node outline
+        if (node.chatEmbedding) {
+            ctx.strokeStyle = 'rgba(130, 200, 160, 0.30)';
             ctx.lineWidth = 1;
             ctx.strokeRect(x + 0.5, y + 0.5, w - 1, h - 1);
         }
@@ -1960,29 +1965,32 @@ function showNodePopup(clientX, clientY, node) {
     html += `<div class="chat-manager-timeline-popup-title">Message #${node.depth}</div>`;
     html += `<div class="chat-manager-timeline-popup-preview">${escapeHtml(truncateForTooltip(node.representative.text || node.normalizedText, 120))}</div>`;
 
+    // Deduplicate chat files
+    const uniqueFiles = [...new Set(chatFiles)];
+
     // Explore Thread button — only when node has branches to explore
     if (node.children.size > 0) {
         html += '<button class="chat-manager-btn chat-manager-timeline-explore-btn">Explore Thread</button>';
     }
 
-    html += '<div class="chat-manager-timeline-popup-list">';
+    // Node-level embed button — shown when any file through this node needs embeddings
+    const nodeNeedsEmbedding = typeof canEmbedNode === 'function' ? canEmbedNode(uniqueFiles) : false;
+    if (nodeNeedsEmbedding) {
+        const count = uniqueFiles.length;
+        html += `<button class="chat-manager-btn chat-manager-timeline-embed-node-btn" title="Generate embeddings for all threads through this node">Embed (${count})</button>`;
+    }
 
-    // Deduplicate chat files
-    const uniqueFiles = [...new Set(chatFiles)];
+    html += '<div class="chat-manager-timeline-popup-list">';
 
     for (const file of uniqueFiles) {
         const displayName = getDisplayName(file) || file;
         const isCurrentChat = file === activeChatFile;
         const activeTag = isCurrentChat ? ' <span class="chat-manager-timeline-popup-active">(current)</span>' : '';
         const label = isCurrentChat ? 'Scroll' : 'Jump';
-        const needsEmbedding = typeof canEmbedThread === 'function' ? canEmbedThread(file) : false;
 
         html += '<div class="chat-manager-timeline-popup-entry">';
         html += `<span class="chat-manager-timeline-popup-name">${escapeHtml(displayName)}${activeTag}</span>`;
         html += '<div class="chat-manager-timeline-popup-actions">';
-        if (needsEmbedding) {
-            html += `<button class="chat-manager-btn chat-manager-timeline-embed-btn" data-filename="${escapeAttr(file)}" title="Generate embeddings for this thread">Embed</button>`;
-        }
         html += `<button class="chat-manager-btn chat-manager-timeline-jump-btn" data-filename="${escapeAttr(file)}" data-msg-index="${node.depth}">${label}</button>`;
         html += '</div>';
         html += '</div>';
@@ -2013,9 +2021,13 @@ function showNodePopup(clientX, clientY, node) {
     popupEl.querySelectorAll('.chat-manager-timeline-jump-btn').forEach(btn => {
         btn.addEventListener('click', handleJump);
     });
-    popupEl.querySelectorAll('.chat-manager-timeline-embed-btn').forEach(btn => {
-        btn.addEventListener('click', handleEmbedFromPopup);
-    });
+    const embedNodeBtn = popupEl.querySelector('.chat-manager-timeline-embed-node-btn');
+    if (embedNodeBtn) {
+        embedNodeBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            handleEmbedNodeFromPopup(embedNodeBtn, uniqueFiles);
+        });
+    }
 
     // Bind explore thread button
     const exploreBtn = popupEl.querySelector('.chat-manager-timeline-explore-btn');
@@ -2034,18 +2046,15 @@ function handleJump(e) {
     }
 }
 
-async function handleEmbedFromPopup(e) {
-    e.stopPropagation();
-    const btn = e.currentTarget;
-    const fileName = btn?.dataset?.filename;
-    if (!fileName || typeof onEmbedThread !== 'function') return;
+async function handleEmbedNodeFromPopup(btn, chatFiles) {
+    if (!btn || !Array.isArray(chatFiles) || chatFiles.length === 0 || typeof onEmbedNode !== 'function') return;
 
     const prevText = btn.textContent;
     btn.disabled = true;
     btn.textContent = 'Embedding…';
 
     try {
-        const result = await onEmbedThread(fileName);
+        const result = await onEmbedNode(chatFiles);
         if (!result || result?.skipped) {
             btn.disabled = false;
             btn.textContent = prevText || 'Embed';
@@ -2053,7 +2062,7 @@ async function handleEmbedFromPopup(e) {
         }
         removePopup();
     } catch (err) {
-        console.error(`[${MODULE_NAME}] Failed to embed thread from graph popup:`, err);
+        console.error(`[${MODULE_NAME}] Failed to embed node from graph popup:`, err);
         btn.disabled = false;
         btn.textContent = prevText || 'Embed';
     }
