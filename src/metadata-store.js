@@ -14,6 +14,31 @@ const DEFAULT_TAG_DEFINITIONS = {
 
 const DEFAULT_FILTER_STATE = { tags: [], dateFrom: null, dateTo: null, messageCountMin: null, messageCountMax: null };
 const DEFAULT_SORT_STATE = { field: 'recency', direction: 'desc' };
+const DEFAULT_EMBEDDING_LEVELS = {
+    chat: false,
+    message: false,
+    query: false,
+};
+const DEFAULT_EMBEDDING_SETTINGS = {
+    enabled: false,
+    provider: 'openrouter',
+    apiKey: '',
+    ollamaUrl: 'http://localhost:11434',
+    model: '',
+    dimensions: null,
+    colorMode: 'cluster',
+    embeddingLevels: { ...DEFAULT_EMBEDDING_LEVELS },
+    scopeMode: 'all',
+    selectedChatsByAvatar: {},
+};
+
+function createDefaultEmbeddingSettings() {
+    return {
+        ...DEFAULT_EMBEDDING_SETTINGS,
+        embeddingLevels: { ...DEFAULT_EMBEDDING_SETTINGS.embeddingLevels },
+        selectedChatsByAvatar: {},
+    };
+}
 
 /**
  * Ensure the settings structure exists.
@@ -40,6 +65,59 @@ function ensureSettings() {
     }
     if (extensionSettings[MODULE_NAME].aiConnectionProfile === undefined) {
         extensionSettings[MODULE_NAME].aiConnectionProfile = '';
+    }
+    if (!extensionSettings[MODULE_NAME].embeddings || typeof extensionSettings[MODULE_NAME].embeddings !== 'object') {
+        extensionSettings[MODULE_NAME].embeddings = createDefaultEmbeddingSettings();
+    }
+    normalizeEmbeddingSettings(extensionSettings[MODULE_NAME].embeddings);
+}
+
+/**
+ * Normalize embedding settings in-place.
+ * @param {Object} embeddings
+ */
+function normalizeEmbeddingSettings(embeddings) {
+    if (!embeddings || typeof embeddings !== 'object') return;
+
+    const providers = new Set(['openrouter', 'openai', 'ollama']);
+    const colorModes = new Set(['structural', 'cluster', 'gradient']);
+    const scopeModes = new Set(['all', 'selected']);
+
+    if (typeof embeddings.enabled !== 'boolean') embeddings.enabled = !!embeddings.enabled;
+    if (!providers.has(embeddings.provider)) embeddings.provider = DEFAULT_EMBEDDING_SETTINGS.provider;
+    if (typeof embeddings.apiKey !== 'string') embeddings.apiKey = String(embeddings.apiKey ?? '');
+    if (typeof embeddings.ollamaUrl !== 'string' || !embeddings.ollamaUrl.trim()) {
+        embeddings.ollamaUrl = DEFAULT_EMBEDDING_SETTINGS.ollamaUrl;
+    }
+    if (typeof embeddings.model !== 'string') embeddings.model = String(embeddings.model ?? '');
+    if (!colorModes.has(embeddings.colorMode)) embeddings.colorMode = DEFAULT_EMBEDDING_SETTINGS.colorMode;
+    if (embeddings.dimensions != null) {
+        const dims = Number(embeddings.dimensions);
+        embeddings.dimensions = Number.isInteger(dims) && dims > 0 ? dims : null;
+    }
+    if (!embeddings.embeddingLevels || typeof embeddings.embeddingLevels !== 'object') {
+        embeddings.embeddingLevels = { ...DEFAULT_EMBEDDING_LEVELS };
+    }
+    for (const [key, defaultValue] of Object.entries(DEFAULT_EMBEDDING_LEVELS)) {
+        if (typeof embeddings.embeddingLevels[key] !== 'boolean') {
+            embeddings.embeddingLevels[key] = defaultValue;
+        }
+    }
+    if (!scopeModes.has(embeddings.scopeMode)) {
+        embeddings.scopeMode = DEFAULT_EMBEDDING_SETTINGS.scopeMode;
+    }
+    if (!embeddings.selectedChatsByAvatar || typeof embeddings.selectedChatsByAvatar !== 'object' || Array.isArray(embeddings.selectedChatsByAvatar)) {
+        embeddings.selectedChatsByAvatar = {};
+    }
+    for (const [avatar, value] of Object.entries(embeddings.selectedChatsByAvatar)) {
+        if (!Array.isArray(value)) {
+            delete embeddings.selectedChatsByAvatar[avatar];
+            continue;
+        }
+        const normalized = value
+            .filter(fileName => typeof fileName === 'string' && fileName.trim().length > 0)
+            .map(fileName => fileName.trim());
+        embeddings.selectedChatsByAvatar[avatar] = Array.from(new Set(normalized));
     }
 }
 
@@ -154,11 +232,29 @@ export function migrateFileKey(oldFileName, newFileName) {
 
     const { extensionSettings, saveSettingsDebounced } = SillyTavern.getContext();
     const charMeta = extensionSettings[MODULE_NAME].metadata[key];
-    if (!charMeta) return;
+    const embeddings = extensionSettings[MODULE_NAME].embeddings;
+    const selected = embeddings?.selectedChatsByAvatar?.[key];
+    let updatedSelection = false;
+
+    if (Array.isArray(selected)) {
+        const idx = selected.indexOf(oldFileName);
+        if (idx !== -1) {
+            selected[idx] = newFileName;
+            embeddings.selectedChatsByAvatar[key] = Array.from(new Set(selected));
+            updatedSelection = true;
+        }
+    }
+
+    if (!charMeta) {
+        if (updatedSelection) saveSettingsDebounced();
+        return;
+    }
 
     if (charMeta[oldFileName]) {
         charMeta[newFileName] = { ...charMeta[oldFileName] };
         delete charMeta[oldFileName];
+        saveSettingsDebounced();
+    } else if (updatedSelection) {
         saveSettingsDebounced();
     }
 }
@@ -437,4 +533,103 @@ export function setSortState(partial) {
     const settings = getSettings();
     Object.assign(settings.sortState, partial);
     save();
+}
+
+/**
+ * Get embedding settings (global, persisted).
+ * @returns {{ enabled: boolean, provider: string, apiKey: string, ollamaUrl: string, model: string, dimensions: number|null, colorMode: string, embeddingLevels: { chat: boolean, message: boolean, query: boolean }, scopeMode: string, selectedChatsByAvatar: Record<string, string[]> }}
+ */
+export function getEmbeddingSettings() {
+    const settings = getSettings();
+    if (!settings.embeddings || typeof settings.embeddings !== 'object') {
+        settings.embeddings = createDefaultEmbeddingSettings();
+        save();
+    } else {
+        for (const [key, value] of Object.entries(DEFAULT_EMBEDDING_SETTINGS)) {
+            if (settings.embeddings[key] === undefined) {
+                settings.embeddings[key] = (value && typeof value === 'object' && !Array.isArray(value))
+                    ? { ...value }
+                    : value;
+            }
+        }
+        normalizeEmbeddingSettings(settings.embeddings);
+    }
+    return settings.embeddings;
+}
+
+/**
+ * Merge and persist embedding settings.
+ * @param {Partial<{ enabled: boolean, provider: string, apiKey: string, ollamaUrl: string, model: string, dimensions: number|null, colorMode: string, embeddingLevels: { chat: boolean, message: boolean, query: boolean }, scopeMode: string, selectedChatsByAvatar: Record<string, string[]> }>} partial
+ */
+export function setEmbeddingSettings(partial) {
+    const settings = getSettings();
+    if (!settings.embeddings || typeof settings.embeddings !== 'object') {
+        settings.embeddings = createDefaultEmbeddingSettings();
+    }
+    Object.assign(settings.embeddings, partial || {});
+    normalizeEmbeddingSettings(settings.embeddings);
+    save();
+}
+
+/**
+ * Get selected chat filenames for embedding scope for a character.
+ * @param {string} [charKey]
+ * @returns {string[]}
+ */
+export function getSelectedEmbeddingChats(charKey) {
+    const settings = getEmbeddingSettings();
+    const key = charKey || getCharacterKey();
+    if (!key) return [];
+    const selected = settings.selectedChatsByAvatar?.[key];
+    return Array.isArray(selected) ? selected.slice() : [];
+}
+
+/**
+ * Persist selected chat filenames for embedding scope for a character.
+ * @param {string[]} fileNames
+ * @param {string} [charKey]
+ */
+export function setSelectedEmbeddingChats(fileNames, charKey) {
+    const settings = getEmbeddingSettings();
+    const key = charKey || getCharacterKey();
+    if (!key) return;
+
+    const normalized = Array.isArray(fileNames)
+        ? fileNames
+            .filter(fileName => typeof fileName === 'string' && fileName.trim().length > 0)
+            .map(fileName => fileName.trim())
+        : [];
+
+    settings.selectedChatsByAvatar[key] = Array.from(new Set(normalized));
+    save();
+}
+
+/**
+ * Check whether a chat is selected for embedding scope.
+ * @param {string} fileName
+ * @param {string} [charKey]
+ * @returns {boolean}
+ */
+export function isEmbeddingChatSelected(fileName, charKey) {
+    if (!fileName) return false;
+    const selected = getSelectedEmbeddingChats(charKey);
+    return selected.includes(fileName);
+}
+
+/**
+ * Add/remove a single chat from the embedding selection set.
+ * @param {string} fileName
+ * @param {boolean} selected
+ * @param {string} [charKey]
+ */
+export function setEmbeddingChatSelected(fileName, selected, charKey) {
+    if (!fileName) return;
+    const current = getSelectedEmbeddingChats(charKey);
+    const has = current.includes(fileName);
+    if (selected && !has) current.push(fileName);
+    if (!selected && has) {
+        const idx = current.indexOf(fileName);
+        if (idx !== -1) current.splice(idx, 1);
+    }
+    setSelectedEmbeddingChats(current, charKey);
 }

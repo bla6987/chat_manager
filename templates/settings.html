@@ -29,6 +29,91 @@
                 Which connection profile to use for AI title/summary generation.
                 The extension will temporarily switch to this profile for AI calls.
             </small>
+
+            <div class="chat-manager-settings-separator"></div>
+            <label class="chat-manager-settings-label">Embeddings</label>
+            <label class="chat-manager-settings-inline-check">
+                <input id="chat-manager-emb-enabled" type="checkbox" />
+                <span>Enable semantic embeddings</span>
+            </label>
+            <small class="chat-manager-settings-desc" style="padding-left: 0;">
+                Generates topic vectors for chat clustering, semantic search, and icicle color modes.
+            </small>
+
+            <label class="chat-manager-settings-label chat-manager-settings-sub-label">Outbound Levels (explicit opt-in)</label>
+            <label class="chat-manager-settings-inline-check">
+                <input id="chat-manager-emb-level-chat" type="checkbox" />
+                <span>Chat vectors</span>
+            </label>
+            <label class="chat-manager-settings-inline-check">
+                <input id="chat-manager-emb-level-message" type="checkbox" />
+                <span>Message vectors</span>
+            </label>
+            <label class="chat-manager-settings-inline-check">
+                <input id="chat-manager-emb-level-query" type="checkbox" />
+                <span>Query vectors (semantic search)</span>
+            </label>
+            <small class="chat-manager-settings-desc" style="padding-left: 0;">
+                A provider request is sent only for levels you enable here.
+            </small>
+
+            <label class="chat-manager-settings-label chat-manager-settings-sub-label">Provider</label>
+            <select id="chat-manager-emb-provider" class="chat-manager-settings-select">
+                <option value="openrouter">OpenRouter</option>
+                <option value="openai">OpenAI</option>
+                <option value="ollama">Ollama (Local)</option>
+            </select>
+
+            <div id="chat-manager-emb-api-key-wrap">
+                <label class="chat-manager-settings-label chat-manager-settings-sub-label">API Key</label>
+                <input id="chat-manager-emb-api-key" type="password" class="chat-manager-settings-input" placeholder="sk-..." />
+            </div>
+
+            <div id="chat-manager-emb-ollama-wrap">
+                <label class="chat-manager-settings-label chat-manager-settings-sub-label">Ollama URL</label>
+                <input id="chat-manager-emb-ollama-url" type="text" class="chat-manager-settings-input" placeholder="http://localhost:11434" />
+            </div>
+
+            <label class="chat-manager-settings-label chat-manager-settings-sub-label">Model</label>
+            <input id="chat-manager-emb-model" type="text" class="chat-manager-settings-input" placeholder="e.g. text-embedding-3-small" />
+            <div id="chat-manager-emb-model-tools" class="chat-manager-emb-model-tools">
+                <button id="chat-manager-emb-load-models" type="button" class="chat-manager-btn">Load Models</button>
+                <select id="chat-manager-emb-model-list" class="chat-manager-settings-select" disabled>
+                    <option value="">Select fetched model…</option>
+                </select>
+            </div>
+            <small id="chat-manager-emb-model-status" class="chat-manager-settings-desc chat-manager-emb-model-status" style="padding-left: 0;"></small>
+
+            <label class="chat-manager-settings-label chat-manager-settings-sub-label">Color Mode</label>
+            <select id="chat-manager-emb-color-mode" class="chat-manager-settings-select">
+                <option value="structural">Structural</option>
+                <option value="cluster">Cluster</option>
+                <option value="gradient">Gradient</option>
+            </select>
+
+            <label class="chat-manager-settings-label chat-manager-settings-sub-label">Embedding Scope</label>
+            <select id="chat-manager-emb-scope-mode" class="chat-manager-settings-select">
+                <option value="all">All chats</option>
+                <option value="selected">Selected chats only</option>
+            </select>
+            <small class="chat-manager-settings-desc" style="padding-left: 0;">
+                Selected mode uses per-chat checkboxes in Chat Manager plus "Select Visible/Clear Visible" toolbar buttons.
+            </small>
+
+            <div class="chat-manager-emb-actions">
+                <button id="chat-manager-emb-generate" type="button" class="chat-manager-btn">Generate Embeddings</button>
+                <button id="chat-manager-emb-clear-cache" type="button" class="chat-manager-btn">Clear Cache</button>
+                <button id="chat-manager-emb-clear-vectors" type="button" class="chat-manager-btn">Clear Vectors</button>
+            </div>
+
+            <div id="chat-manager-emb-progress" class="chat-manager-emb-progress" style="display: none;">
+                <div id="chat-manager-emb-progress-bar" class="chat-manager-emb-progress-bar"></div>
+                <span id="chat-manager-emb-progress-text" class="chat-manager-emb-progress-text"></span>
+            </div>
+
+            <div class="chat-manager-emb-cache">
+                Cache: <span id="chat-manager-emb-cache-stats">-</span>
+            </div>
         </div>
     </div>
 </div>

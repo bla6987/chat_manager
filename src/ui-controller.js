@@ -15,7 +15,9 @@ import {
     getTagDefinitions, createTagDefinition, updateTagDefinition, deleteTagDefinition,
     getChatTags, addChatTag, removeChatTag,
     getFilterState, setFilterState, clearFilterState, hasActiveFilter,
-    getSortState, setSortState,
+    getSortState, setSortState, getEmbeddingSettings,
+    getSelectedEmbeddingChats, setSelectedEmbeddingChats,
+    isEmbeddingChatSelected, setEmbeddingChatSelected,
 } from './metadata-store.js';
 import {
     updateBranchContextInjection, clearBranchContextInjection,
@@ -33,8 +35,17 @@ import {
     mountStatsView, unmountStatsView, updateStatsView,
     isStatsMounted, setStatsCallbacks,
 } from './stats-view.js';
+import {
+    embedText, embedTexts, getCachedEmbeddingForText, hashEmbeddingText, isEmbeddingConfigured,
+} from './embedding-service.js';
+import { clusterColor, cosineSimilarity, findOptimalK, kMeans, topicShiftScores } from './semantic-engine.js';
 
 const MODULE_NAME = 'chat_manager';
+const HYBRID_SEARCH_MIN_CHARS = 5;
+const HYBRID_SEARCH_LIMIT = 100;
+const RECLUSTER_IDLE_MS = 60000;
+const RECLUSTER_IMMEDIATE_THRESHOLD = 5;
+const RECLUSTER_CHAT_DELTA_RATIO = 0.2;
 
 let panelOpen = false;
 let timelineActive = false;
@@ -46,15 +57,30 @@ let refreshFromHydrationTimer = null;
 let refreshSearchFromHydrationTimer = null;
 let refreshTimelineFromHydrationTimer = null;
 let refreshStatsFromHydrationTimer = null;
+let embedBootstrapTimer = null;
+let embedIncrementalTimer = null;
+const EMBED_INCREMENTAL_DELAY_MS = 1200;
+const pendingIncrementalEmbedFiles = new Set();
+let embedRunPromise = null;
+let pendingClusterChanges = 0;
+let reclusterIdleTimer = null;
+let lastClusterK = null;
+let lastClusterChatCount = 0;
+let lastClusterResult = 0;
+let latestSearchRequestId = 0;
+const queryEmbeddingCache = new Map();
+const driftSummaryCache = new Map();
 
 /**
  * Streaming search state — allows early termination and "load more" resumption.
- * @type {{ query: string, lowerQuery: string, searchable: Array, position: number, results: Array, totalMatches: number } | null}
+ * @type {{ query: string, lowerQuery: string, searchable: Array, position: number, results: Array, totalMatches: number, exhausted?: boolean, mode?: 'keyword'|'semantic' } | null}
  */
 let searchState = null;
 
 export function resetSearchState() {
+    latestSearchRequestId += 1;
     searchState = null;
+    setSearchModeBadge('keyword');
 }
 
 export function isTimelineActive() {
@@ -67,6 +93,555 @@ export function isStatsActive() {
 
 export function isBranchContextActive() {
     return branchContextActive;
+}
+
+function ensureSearchModeBadge() {
+    const wrapper = document.querySelector('.chat-manager-search-wrapper');
+    if (!wrapper) return null;
+
+    let badge = wrapper.querySelector('.chat-manager-search-mode-badge');
+    if (!badge) {
+        badge = document.createElement('span');
+        badge.className = 'chat-manager-search-mode-badge';
+        badge.textContent = 'Keyword';
+        wrapper.appendChild(badge);
+    }
+    return badge;
+}
+
+function setSearchModeBadge(mode) {
+    const badge = ensureSearchModeBadge();
+    if (!badge) return;
+    const semantic = mode === 'semantic';
+    badge.textContent = semantic ? 'Semantic' : 'Keyword';
+    badge.classList.toggle('semantic', semantic);
+}
+
+function hasMessageEmbeddings() {
+    const entries = Object.values(getIndex());
+    return entries.some(entry => entry.messageEmbeddings instanceof Map && entry.messageEmbeddings.size > 0);
+}
+
+function isEmbeddingLevelOn(settings, level) {
+    return settings.enabled === true && settings.embeddingLevels?.[level] === true;
+}
+
+function getVisibleEntryFileNames() {
+    const filterState = getFilterState();
+    const sortState = getSortState();
+    return getFilteredSortedEntries(filterState, sortState, getChatMeta).map(entry => entry.fileName);
+}
+
+function getScopeFilteredEntries(entries, settings) {
+    if (!Array.isArray(entries) || entries.length === 0) return [];
+    if (settings.scopeMode !== 'selected') return entries;
+
+    const selected = new Set(getSelectedEmbeddingChats());
+    if (selected.size === 0) return [];
+    return entries.filter(entry => entry && selected.has(entry.fileName));
+}
+
+function updateEmbeddingSelectionControls(toolbar = null) {
+    const root = toolbar || document.querySelector('.chat-manager-filter-toolbar');
+    if (!root) return;
+
+    const selectVisibleBtn = root.querySelector('.chat-manager-emb-select-visible-btn');
+    const clearVisibleBtn = root.querySelector('.chat-manager-emb-clear-visible-btn');
+    if (!selectVisibleBtn || !clearVisibleBtn) return;
+
+    const settings = getEmbeddingSettings();
+    const selectedScope = settings.scopeMode === 'selected';
+    const visibleFiles = getVisibleEntryFileNames();
+    const selectedSet = new Set(getSelectedEmbeddingChats());
+    const selectedVisible = visibleFiles.filter(fileName => selectedSet.has(fileName)).length;
+
+    selectVisibleBtn.style.display = selectedScope ? '' : 'none';
+    clearVisibleBtn.style.display = selectedScope ? '' : 'none';
+    selectVisibleBtn.disabled = !selectedScope || visibleFiles.length === 0;
+    clearVisibleBtn.disabled = !selectedScope || selectedVisible === 0;
+    selectVisibleBtn.title = `Select ${visibleFiles.length} visible chat${visibleFiles.length !== 1 ? 's' : ''} for embedding scope`;
+    clearVisibleBtn.title = `Clear ${selectedVisible} selected visible chat${selectedVisible !== 1 ? 's' : ''}`;
+}
+
+function shouldUseSemanticSearch(query) {
+    if (!query || query.length < HYBRID_SEARCH_MIN_CHARS) return false;
+    const settings = getEmbeddingSettings();
+    if (!isEmbeddingLevelOn(settings, 'message') || !isEmbeddingLevelOn(settings, 'query')) return false;
+    if (!isEmbeddingConfigured()) return false;
+    return hasMessageEmbeddings();
+}
+
+function getCurrentClusterCount() {
+    const labels = new Set();
+    for (const entry of Object.values(getIndex())) {
+        if (Number.isFinite(entry.clusterLabel)) {
+            labels.add(Math.floor(entry.clusterLabel));
+        }
+    }
+    return labels.size;
+}
+
+function clearReclusterTimer() {
+    if (reclusterIdleTimer) {
+        clearTimeout(reclusterIdleTimer);
+        reclusterIdleTimer = null;
+    }
+}
+
+function shouldRedetectK(chatCount) {
+    if (!Number.isFinite(lastClusterK) || lastClusterK < 1) return true;
+    if (!Number.isFinite(lastClusterChatCount) || lastClusterChatCount < 1) return true;
+    const delta = Math.abs(chatCount - lastClusterChatCount) / Math.max(lastClusterChatCount, 1);
+    return delta > RECLUSTER_CHAT_DELTA_RATIO;
+}
+
+function runDebouncedRecluster() {
+    clearReclusterTimer();
+    const index = getIndex();
+    const chatCount = Object.values(index).filter(entry => Array.isArray(entry.chatEmbedding) && entry.chatEmbedding.length > 0).length;
+    const reuseK = !shouldRedetectK(chatCount);
+    const fixedK = reuseK ? lastClusterK : null;
+
+    const result = recomputeEmbeddingClusters({ fixedK });
+    pendingClusterChanges = 0;
+    lastClusterResult = result.clusterCount;
+    refreshAfterEmbeddingUpdate();
+}
+
+function scheduleDebouncedRecluster(changedCount) {
+    if (!Number.isFinite(changedCount) || changedCount <= 0) return false;
+    pendingClusterChanges += changedCount;
+
+    if (pendingClusterChanges >= RECLUSTER_IMMEDIATE_THRESHOLD) {
+        runDebouncedRecluster();
+        return true;
+    }
+
+    clearReclusterTimer();
+    reclusterIdleTimer = setTimeout(() => {
+        reclusterIdleTimer = null;
+        runDebouncedRecluster();
+    }, RECLUSTER_IDLE_MS);
+    return false;
+}
+
+function getDriftSummary(entry) {
+    if (!entry || !(entry.messageEmbeddings instanceof Map) || entry.messageEmbeddings.size < 2) return null;
+    if (!Array.isArray(entry.messages) || entry.messages.length < 2) return null;
+
+    const cacheKey = `${entry.fileName}:${entry.messages.length}:${entry.messageEmbeddings.size}`;
+    const cached = driftSummaryCache.get(cacheKey);
+    if (cached) return cached;
+
+    const vectors = [];
+    const msgIndices = [];
+    for (const msg of entry.messages) {
+        const vector = entry.messageEmbeddings.get(msg.index);
+        if (!Array.isArray(vector) || vector.length === 0) continue;
+        vectors.push(vector);
+        msgIndices.push(msg.index);
+    }
+
+    if (vectors.length < 2) return null;
+
+    const scores = topicShiftScores(vectors);
+    const majorPositions = [];
+    const moderatePositions = [];
+
+    for (let i = 0; i < scores.length; i++) {
+        const score = scores[i];
+        const transitionMsg = msgIndices[i + 1] ?? msgIndices[i];
+        if (score > 0.4) {
+            majorPositions.push(transitionMsg);
+        } else if (score > 0.3) {
+            moderatePositions.push(transitionMsg);
+        }
+    }
+
+    const all = [...majorPositions, ...moderatePositions];
+    if (all.length === 0) return null;
+
+    const summary = {
+        count: all.length,
+        majorCount: majorPositions.length,
+        positions: all.slice(0, 5),
+        firstMsgIndex: all[0],
+    };
+    driftSummaryCache.set(cacheKey, summary);
+    return summary;
+}
+
+function queueEmbeddingRun(task) {
+    const previous = embedRunPromise || Promise.resolve();
+    const next = previous
+        .catch(() => {})
+        .then(task);
+
+    embedRunPromise = next.finally(() => {
+        if (embedRunPromise === next) {
+            embedRunPromise = null;
+        }
+    });
+
+    return embedRunPromise;
+}
+
+function getRepresentativeEmbeddingText(entry) {
+    if (!entry) return '';
+
+    const summary = (getSummary(entry.fileName) || '').trim();
+    if (summary) {
+        return summary.slice(0, 2000);
+    }
+
+    if (!entry.isLoaded || !Array.isArray(entry.messages) || entry.messages.length === 0) {
+        return '';
+    }
+
+    const tail = entry.messages.length > 10 ? entry.messages.slice(-10) : entry.messages;
+    const text = tail
+        .map(msg => (typeof msg?.text === 'string' ? msg.text.trim() : ''))
+        .filter(Boolean)
+        .join('\n');
+
+    return text.slice(0, 2000).trim();
+}
+
+function getMessageEmbeddingCandidates(entries) {
+    const candidates = [];
+    for (const entry of entries) {
+        if (!entry?.isLoaded || !Array.isArray(entry.messages) || entry.messages.length === 0) continue;
+
+        if (!(entry.messageEmbeddings instanceof Map)) {
+            entry.messageEmbeddings = new Map();
+        } else {
+            entry.messageEmbeddings.clear();
+        }
+
+        for (const msg of entry.messages) {
+            const text = typeof msg?.text === 'string' ? msg.text.trim() : '';
+            if (!text) continue;
+            candidates.push({
+                entry,
+                msgIndex: msg.index,
+                text,
+                hash: hashEmbeddingText(text),
+            });
+        }
+    }
+    return candidates;
+}
+
+function recomputeEmbeddingClusters(options = {}) {
+    const index = getIndex();
+    const entries = Object.values(index);
+    const embeddedEntries = entries.filter(entry => Array.isArray(entry.chatEmbedding) && entry.chatEmbedding.length > 0);
+
+    for (const entry of entries) {
+        entry.clusterLabel = null;
+    }
+
+    if (embeddedEntries.length === 0) {
+        lastClusterK = null;
+        lastClusterChatCount = 0;
+        return { clusterCount: 0, k: null, embeddedCount: 0 };
+    }
+    if (embeddedEntries.length === 1) {
+        embeddedEntries[0].clusterLabel = 0;
+        lastClusterK = 1;
+        lastClusterChatCount = 1;
+        return { clusterCount: 1, k: 1, embeddedCount: 1 };
+    }
+
+    const vectors = embeddedEntries.map(entry => entry.chatEmbedding);
+    let k = Number.isFinite(options.fixedK) && options.fixedK > 0
+        ? Math.floor(options.fixedK)
+        : findOptimalK(vectors, 8);
+    if (!Number.isFinite(k) || k < 1) {
+        k = Math.min(5, Math.ceil(embeddedEntries.length / 3));
+    }
+    k = Math.max(1, Math.min(Math.floor(k), embeddedEntries.length));
+
+    const { labels } = kMeans(vectors, k, 50);
+    for (let i = 0; i < embeddedEntries.length; i++) {
+        embeddedEntries[i].clusterLabel = labels[i] ?? 0;
+    }
+
+    const clusterCount = new Set(labels).size;
+    lastClusterK = k;
+    lastClusterChatCount = embeddedEntries.length;
+    return { clusterCount, k, embeddedCount: embeddedEntries.length };
+}
+
+function refreshAfterEmbeddingUpdate() {
+    if (!panelOpen) return;
+
+    if (statsActive) {
+        if (isStatsMounted()) updateStatsView();
+        return;
+    }
+
+    if (timelineActive) {
+        if (isIcicleMounted()) {
+            updateIcicleData();
+        }
+        return;
+    }
+
+    const query = getCurrentSearchQuery();
+    if (query.length >= 2) {
+        performSearch(query);
+    } else {
+        renderThreadCards();
+    }
+}
+
+async function runEmbeddingGeneration(targetFileNames = null, options = {}) {
+    const settings = getEmbeddingSettings();
+    if (!settings.enabled) {
+        return { updated: 0, total: 0, clusters: 0, skipped: true };
+    }
+    const chatLevelEnabled = isEmbeddingLevelOn(settings, 'chat');
+    const messageLevelEnabled = isEmbeddingLevelOn(settings, 'message');
+    if (!chatLevelEnabled && !messageLevelEnabled) {
+        return { updated: 0, total: 0, clusters: getCurrentClusterCount(), skipped: true };
+    }
+
+    if (!isEmbeddingConfigured()) {
+        if (!options.silent) {
+            throw new Error('Embeddings are not fully configured. Set provider, model, and API key if required.');
+        }
+        return { updated: 0, total: 0, clusters: 0, skipped: true };
+    }
+
+    if (options.ensureIndex && Object.keys(getIndex()).length === 0) {
+        await buildIndex(null, null);
+    }
+
+    const index = getIndex();
+    const sourceEntries = Array.isArray(targetFileNames) && targetFileNames.length > 0
+        ? targetFileNames.map(fileName => index[fileName]).filter(Boolean)
+        : Object.values(index);
+    const scopedEntries = getScopeFilteredEntries(sourceEntries, settings);
+
+    const chatCandidates = chatLevelEnabled
+        ? scopedEntries
+            .map(entry => {
+                const text = getRepresentativeEmbeddingText(entry);
+                return {
+                    entry,
+                    text,
+                    hash: text ? hashEmbeddingText(text) : null,
+                };
+            })
+            .filter(item => item.text.length > 0)
+        : [];
+
+    const messageCandidates = messageLevelEnabled
+        ? getMessageEmbeddingCandidates(scopedEntries)
+        : [];
+    const totalWork = chatCandidates.length + messageCandidates.length;
+    if (totalWork === 0) {
+        let clusters = getCurrentClusterCount();
+        if (!options.incremental) {
+            const clusterResult = recomputeEmbeddingClusters();
+            clusters = clusterResult.clusterCount;
+            lastClusterResult = clusters;
+        }
+        if (options.rerender !== false) refreshAfterEmbeddingUpdate();
+        return { updated: 0, total: 0, clusters, skipped: true };
+    }
+
+    const onProgress = typeof options.onProgress === 'function' ? options.onProgress : null;
+    const cacheOnly = options.cacheOnly === true;
+    let completed = 0;
+    let changedChatEmbeddings = 0;
+    if (onProgress) onProgress(0, totalWork);
+
+    const pendingChats = [];
+    for (const item of chatCandidates) {
+        const previousHash = item.entry.chatEmbeddingHash || null;
+        const cached = await getCachedEmbeddingForText(item.text);
+        if (cached) {
+            item.entry.chatEmbedding = cached;
+            item.entry.chatEmbeddingHash = item.hash;
+            if (previousHash !== item.hash) {
+                changedChatEmbeddings += 1;
+            }
+            completed += 1;
+            if (onProgress) onProgress(completed, totalWork);
+        } else {
+            pendingChats.push(item);
+        }
+    }
+
+    if (pendingChats.length > 0 && !cacheOnly) {
+        const vectors = await embedTexts(
+            pendingChats.map(item => item.text),
+            {
+                level: 'chat',
+                onProgress: (done, pendingTotal) => {
+                    if (!onProgress) return;
+                    onProgress(completed + done, completed + pendingTotal + messageCandidates.length);
+                },
+            },
+        );
+
+        for (let i = 0; i < pendingChats.length; i++) {
+            const item = pendingChats[i];
+            const previousHash = item.entry.chatEmbeddingHash || null;
+            item.entry.chatEmbedding = vectors[i];
+            item.entry.chatEmbeddingHash = item.hash;
+            if (previousHash !== item.hash) {
+                changedChatEmbeddings += 1;
+            }
+        }
+        completed += pendingChats.length;
+        if (onProgress) onProgress(completed, totalWork);
+    }
+
+    const pendingMessages = [];
+    for (const item of messageCandidates) {
+        const cached = await getCachedEmbeddingForText(item.text);
+        if (cached) {
+            item.entry.messageEmbeddings.set(item.msgIndex, cached);
+            completed += 1;
+            if (onProgress) onProgress(completed, totalWork);
+        } else {
+            pendingMessages.push(item);
+        }
+    }
+
+    if (pendingMessages.length > 0 && !cacheOnly) {
+        const vectors = await embedTexts(
+            pendingMessages.map(item => item.text),
+            {
+                level: 'message',
+                onProgress: (done) => {
+                    if (!onProgress) return;
+                    onProgress(completed + done, totalWork);
+                },
+            },
+        );
+
+        for (let i = 0; i < pendingMessages.length; i++) {
+            const item = pendingMessages[i];
+            item.entry.messageEmbeddings.set(item.msgIndex, vectors[i]);
+        }
+        completed += pendingMessages.length;
+        if (onProgress) onProgress(completed, totalWork);
+    }
+
+    driftSummaryCache.clear();
+    queryEmbeddingCache.clear();
+
+    let clusters = getCurrentClusterCount();
+    let reclusterTriggered = false;
+    if (options.incremental) {
+        reclusterTriggered = scheduleDebouncedRecluster(changedChatEmbeddings);
+        clusters = reclusterTriggered ? lastClusterResult : getCurrentClusterCount();
+    } else {
+        clearReclusterTimer();
+        pendingClusterChanges = 0;
+        const clusterResult = recomputeEmbeddingClusters();
+        clusters = clusterResult.clusterCount;
+        lastClusterResult = clusters;
+    }
+
+    if (options.rerender !== false && !reclusterTriggered) {
+        refreshAfterEmbeddingUpdate();
+    }
+
+    return {
+        updated: chatCandidates.length,
+        total: chatCandidates.length,
+        clusters,
+        changedEmbeddings: changedChatEmbeddings,
+        messageVectors: messageCandidates.length,
+    };
+}
+
+export async function generateEmbeddingsForCurrentIndex(options = {}) {
+    return queueEmbeddingRun(() => runEmbeddingGeneration(null, {
+        ensureIndex: true,
+        rerender: true,
+        silent: false,
+        ...options,
+    }));
+}
+
+export function clearInMemoryEmbeddings(options = {}) {
+    const rerender = options.rerender !== false;
+    clearReclusterTimer();
+    pendingClusterChanges = 0;
+    lastClusterK = null;
+    lastClusterChatCount = 0;
+    lastClusterResult = 0;
+    queryEmbeddingCache.clear();
+    driftSummaryCache.clear();
+
+    const index = getIndex();
+    for (const entry of Object.values(index)) {
+        entry.chatEmbedding = null;
+        entry.chatEmbeddingHash = null;
+        entry.clusterLabel = null;
+        entry.messageEmbeddings = null;
+    }
+
+    if (rerender) {
+        refreshAfterEmbeddingUpdate();
+    }
+}
+
+export function scheduleEmbeddingBootstrap() {
+    const settings = getEmbeddingSettings();
+    if (!isEmbeddingLevelOn(settings, 'chat') && !isEmbeddingLevelOn(settings, 'message')) return;
+    if (settings.scopeMode === 'selected' && getSelectedEmbeddingChats().length === 0) return;
+
+    if (embedBootstrapTimer) {
+        clearTimeout(embedBootstrapTimer);
+    }
+
+    embedBootstrapTimer = setTimeout(() => {
+        embedBootstrapTimer = null;
+        void queueEmbeddingRun(() => runEmbeddingGeneration(null, {
+            ensureIndex: true,
+            rerender: true,
+            silent: true,
+            // Startup optimization: load compatible vectors from cache only.
+            cacheOnly: true,
+        })).catch((err) => {
+            console.warn(`[${MODULE_NAME}] Embedding bootstrap failed:`, err);
+        });
+    }, 900);
+}
+
+export function scheduleIncrementalEmbedding(fileName) {
+    const settings = getEmbeddingSettings();
+    if (!isEmbeddingLevelOn(settings, 'chat') && !isEmbeddingLevelOn(settings, 'message')) return;
+    if (!fileName) return;
+    if (settings.scopeMode === 'selected' && !isEmbeddingChatSelected(fileName)) return;
+
+    pendingIncrementalEmbedFiles.add(fileName);
+    if (embedIncrementalTimer) {
+        clearTimeout(embedIncrementalTimer);
+    }
+
+    embedIncrementalTimer = setTimeout(() => {
+        embedIncrementalTimer = null;
+        const files = Array.from(pendingIncrementalEmbedFiles);
+        pendingIncrementalEmbedFiles.clear();
+        if (files.length === 0) return;
+
+        void queueEmbeddingRun(() => runEmbeddingGeneration(files, {
+            ensureIndex: false,
+            rerender: true,
+            silent: true,
+            incremental: true,
+        })).catch((err) => {
+            console.warn(`[${MODULE_NAME}] Incremental embedding update failed:`, err);
+        });
+    }, EMBED_INCREMENTAL_DELAY_MS);
 }
 
 /**
@@ -608,6 +1183,10 @@ function deactivateTimeline() {
 export async function refreshPanel() {
     const context = SillyTavern.getContext();
     ensureHydrationSubscription();
+    ensureSearchModeBadge();
+    if (getEmbeddingSettings().enabled) {
+        scheduleEmbeddingBootstrap();
+    }
 
     // Restore branch context toggle state from persisted setting
     branchContextActive = getBranchContextEnabled();
@@ -864,6 +1443,7 @@ export function renderThreadCards() {
 
     // Ensure toolbar exists
     ensureFilterToolbar();
+    setSearchModeBadge('keyword');
 
     if (totalCount === 0) {
         renderEmptyState('No chats found for this character.');
@@ -895,12 +1475,39 @@ export function renderThreadCardsFromEntries(entries, container, status, totalCo
     const activeChatFile = getActiveFilename();
     const activeEntry = activeChatFile ? index[activeChatFile] : null;
     const tagDefs = getTagDefinitions();
+    const sortState = getSortState();
+    const embeddingSettings = getEmbeddingSettings();
+    const selectedScope = embeddingSettings.scopeMode === 'selected';
+    const isClusterSorted = sortState.field === 'cluster';
+    let previousClusterGroup = null;
+    let hasRenderedClusterGroup = false;
 
     let html = '';
     for (const entry of entries) {
+        const currentClusterGroup = entry.clusterLabel ?? 999;
+        if (isClusterSorted && hasRenderedClusterGroup && currentClusterGroup !== previousClusterGroup) {
+            const dividerColor = entry.clusterLabel != null
+                ? clusterColor(entry.clusterLabel)
+                : 'rgba(180, 180, 180, 0.45)';
+            html += `<div class="chat-manager-cluster-divider" style="--chat-manager-cluster-color:${escapeAttr(dividerColor)}"></div>`;
+        }
+        if (isClusterSorted) {
+            previousClusterGroup = currentClusterGroup;
+            hasRenderedClusterGroup = true;
+        }
+
         const displayName = getDisplayName(entry.fileName) || entry.fileName;
         const summaryDisplay = getSummaryDisplay(entry);
         const isActive = entry.fileName === activeChatFile;
+        const isSelectedForEmbedding = isEmbeddingChatSelected(entry.fileName);
+        const embeddingSelectControl = `
+            <label class="chat-manager-emb-select${selectedScope ? ' scope-selected' : ''}" title="Include this chat when embedding scope is set to selected chats">
+                <input type="checkbox" class="chat-manager-emb-select-cb" data-filename="${escapeAttr(entry.fileName)}" ${isSelectedForEmbedding ? 'checked' : ''}>
+                <span>Emb</span>
+            </label>`;
+        const clusterDot = entry.clusterLabel != null
+            ? `<span class="chat-manager-cluster-dot" style="background:${escapeAttr(clusterColor(entry.clusterLabel))}" title="Cluster ${entry.clusterLabel + 1}"></span>`
+            : '';
 
         const firstDate = formatDateOrFallback(moment, entry.firstMessageTimestamp, '?');
         const lastDate = formatDateOrFallback(moment, entry.lastMessageTimestamp, '?');
@@ -910,6 +1517,10 @@ export function renderThreadCardsFromEntries(entries, container, status, totalCo
             ? activeEntry.messageCount - entry.branchPoint : null;
         const branchInfo = (entry.isLoaded && entry.branchPoint !== null)
             ? `<button type="button" class="chat-manager-branch chat-manager-branch-jump" data-filename="${escapeAttr(entry.fileName)}" data-msg-index="${entry.branchPoint}" title="Jump to this message in graph">${branchDistance !== null ? `Branched ${branchDistance} msgs ago` : `Branched at msg #${entry.branchPoint}`}</button>`
+            : '';
+        const driftSummary = getDriftSummary(entry);
+        const driftInfo = driftSummary
+            ? `<button type="button" class="chat-manager-drift-jump" data-filename="${escapeAttr(entry.fileName)}" data-msg-index="${driftSummary.firstMsgIndex}" title="Topic shifts near messages: ${escapeAttr(driftSummary.positions.join(', '))}">${driftSummary.count} topic shift${driftSummary.count !== 1 ? 's' : ''}</button>`
             : '';
         const indexingInfo = entry.isLoaded ? '' : '<span>Indexing...</span>';
         const aiTitleClasses = `chat-manager-icon-btn chat-manager-ai-title-btn fa-fw fa-solid fa-robot${entry.isLoaded ? '' : ' disabled'}`;
@@ -937,7 +1548,11 @@ export function renderThreadCardsFromEntries(entries, container, status, totalCo
         html += `
         <div class="chat-manager-card${isActive ? ' active' : ''}" data-filename="${escapeAttr(entry.fileName)}">
             <div class="chat-manager-card-header">
-                <span class="chat-manager-display-name" data-filename="${escapeAttr(entry.fileName)}" title="Click to switch thread">${escapeHtml(displayName)}</span>
+                <div class="chat-manager-card-title-row">
+                    ${embeddingSelectControl}
+                    ${clusterDot}
+                    <span class="chat-manager-display-name" data-filename="${escapeAttr(entry.fileName)}" title="Click to switch thread">${escapeHtml(displayName)}</span>
+                </div>
                 <div class="chat-manager-card-actions">
                     <i class="chat-manager-icon-btn chat-manager-tag-btn fa-fw fa-solid fa-tag" data-filename="${escapeAttr(entry.fileName)}" title="Manage tags" tabindex="0"></i>
                     <i class="chat-manager-icon-btn chat-manager-edit-name-btn fa-fw fa-solid fa-pen" data-filename="${escapeAttr(entry.fileName)}" title="Edit display name" tabindex="0"></i>
@@ -951,6 +1566,7 @@ export function renderThreadCardsFromEntries(entries, container, status, totalCo
                 <span>${firstDate} – ${lastDate}</span>
                 <span>${lastActive}</span>
                 ${indexingInfo}
+                ${driftInfo}
                 ${branchInfo}
             </div>
             <div class="chat-manager-card-summary" data-filename="${escapeAttr(entry.fileName)}">
@@ -1035,7 +1651,7 @@ function ensureFilterToolbar() {
         toolbar.className = 'chat-manager-filter-toolbar';
 
         const sortState = getSortState();
-        const sortFieldLabels = { recency: 'Recent', alphabetical: 'A-Z', messageCount: 'Messages', created: 'Created' };
+        const sortFieldLabels = { recency: 'Recent', alphabetical: 'A-Z', messageCount: 'Messages', created: 'Created', cluster: 'Cluster' };
 
         // Sort controls
         const sortDiv = document.createElement('div');
@@ -1051,7 +1667,16 @@ function ensureFilterToolbar() {
             select.appendChild(opt);
         }
         select.addEventListener('change', () => {
-            setSortState({ field: select.value });
+            const current = getSortState();
+            const nextField = select.value;
+            if (nextField === 'cluster') {
+                const secondaryField = current.field && current.field !== 'cluster'
+                    ? current.field
+                    : (current.secondaryField && current.secondaryField !== 'cluster' ? current.secondaryField : 'recency');
+                setSortState({ field: nextField, secondaryField });
+            } else {
+                setSortState({ field: nextField, secondaryField: nextField });
+            }
             renderThreadCards();
         });
 
@@ -1092,9 +1717,36 @@ function ensureFilterToolbar() {
         clearBtn.innerHTML = '<i class="fa-solid fa-filter-circle-xmark"></i>';
         clearBtn.addEventListener('click', () => { clearFilterState(); renderThreadCards(); });
 
+        const selectVisibleEmbBtn = document.createElement('button');
+        selectVisibleEmbBtn.className = 'chat-manager-btn chat-manager-emb-scope-btn chat-manager-emb-select-visible-btn';
+        selectVisibleEmbBtn.textContent = 'Select Visible';
+        selectVisibleEmbBtn.addEventListener('click', () => {
+            const visibleFiles = getVisibleEntryFileNames();
+            if (visibleFiles.length === 0) return;
+            const selected = new Set(getSelectedEmbeddingChats());
+            for (const fileName of visibleFiles) {
+                selected.add(fileName);
+            }
+            setSelectedEmbeddingChats(Array.from(selected));
+            renderThreadCards();
+        });
+
+        const clearVisibleEmbBtn = document.createElement('button');
+        clearVisibleEmbBtn.className = 'chat-manager-btn chat-manager-emb-scope-btn chat-manager-emb-clear-visible-btn';
+        clearVisibleEmbBtn.textContent = 'Clear Visible';
+        clearVisibleEmbBtn.addEventListener('click', () => {
+            const visibleSet = new Set(getVisibleEntryFileNames());
+            if (visibleSet.size === 0) return;
+            const retained = getSelectedEmbeddingChats().filter(fileName => !visibleSet.has(fileName));
+            setSelectedEmbeddingChats(retained);
+            renderThreadCards();
+        });
+
         filterDiv.appendChild(tagFilterBtn);
         filterDiv.appendChild(advFilterBtn);
         filterDiv.appendChild(clearBtn);
+        filterDiv.appendChild(selectVisibleEmbBtn);
+        filterDiv.appendChild(clearVisibleEmbBtn);
 
         toolbar.appendChild(sortDiv);
         toolbar.appendChild(filterDiv);
@@ -1111,6 +1763,7 @@ function ensureFilterToolbar() {
     if (tagFilterBtn) tagFilterBtn.classList.toggle('has-active', f.tags.length > 0);
     if (advFilterBtn) advFilterBtn.classList.toggle('has-active', !!(f.dateFrom || f.dateTo || f.messageCountMin != null || f.messageCountMax != null));
     if (clearBtn) clearBtn.style.display = hasActiveFilter() ? '' : 'none';
+    updateEmbeddingSelectionControls(toolbar);
 
     // Hide toolbar when search or timeline is active
     const query = getCurrentSearchQuery();
@@ -1401,34 +2054,9 @@ function openTagManagerDialog() {
 //  Rendering: Search Results
 // ──────────────────────────────────────────────
 
-export function performSearch(query) {
-    const container = document.getElementById('chat-manager-content');
-    const status = document.getElementById('chat-manager-status');
-    if (!container) return;
-
-    if (!query || query.trim().length < 2) {
-        renderThreadCards();
-        return;
-    }
-
-    const trimmed = query.trim();
-    const lowerQuery = trimmed.toLowerCase();
-
-    // Initialize streaming search state
-    searchState = {
-        query: trimmed,
-        lowerQuery,
-        searchable: getSearchableMessages(),
-        position: 0,
-        results: [],
-        totalMatches: 0,
-        exhausted: false,
-    };
-
-    // Find the first page of results
-    searchMoreResults(RESULTS_PAGE_SIZE);
-
-    if (status) setSearchStatus(trimmed);
+function renderSearchState(container, status, queryText) {
+    if (!searchState) return;
+    if (status) setSearchStatus(queryText);
 
     if (searchState.results.length === 0) {
         container.innerHTML = '<div class="chat-manager-empty">No results found.</div>';
@@ -1437,6 +2065,117 @@ export function performSearch(query) {
 
     container.innerHTML = '';
     renderSearchPage(container, 0);
+}
+
+async function performSemanticSearch(trimmed, requestId) {
+    const container = document.getElementById('chat-manager-content');
+    const status = document.getElementById('chat-manager-status');
+    if (!container) return;
+
+    const lowerQuery = trimmed.toLowerCase();
+    const searchable = getSearchableMessages();
+    let queryVector = queryEmbeddingCache.get(trimmed);
+    if (!queryVector) {
+        queryVector = await embedText(trimmed, { level: 'query' });
+        queryEmbeddingCache.set(trimmed, queryVector);
+        if (queryEmbeddingCache.size > 32) {
+            const firstKey = queryEmbeddingCache.keys().next().value;
+            queryEmbeddingCache.delete(firstKey);
+        }
+    }
+
+    if (requestId !== latestSearchRequestId) return;
+
+    const index = getIndex();
+    const scored = [];
+    for (const msg of searchable) {
+        const entry = index[msg.filename];
+        if (!entry || !(entry.messageEmbeddings instanceof Map)) continue;
+
+        const msgVector = entry.messageEmbeddings.get(msg.index);
+        if (!Array.isArray(msgVector) || msgVector.length === 0) continue;
+
+        const textLower = msg.textLower || (msg.textLower = msg.text.toLowerCase());
+        const keywordScore = textLower.includes(lowerQuery) ? 1.0 : 0.0;
+
+        let semanticScore = 0;
+        try {
+            semanticScore = cosineSimilarity(queryVector, msgVector);
+        } catch {
+            semanticScore = 0;
+        }
+        const combinedScore = (0.7 * semanticScore) + (0.3 * keywordScore);
+        scored.push({
+            item: msg,
+            matchIndex: textLower.indexOf(lowerQuery),
+            combinedScore,
+        });
+    }
+
+    scored.sort((a, b) => b.combinedScore - a.combinedScore);
+    const limited = scored.slice(0, HYBRID_SEARCH_LIMIT);
+
+    searchState = {
+        query: trimmed,
+        lowerQuery,
+        searchable,
+        position: searchable.length,
+        results: limited,
+        totalMatches: scored.length,
+        exhausted: true,
+        mode: 'semantic',
+    };
+
+    setSearchModeBadge('semantic');
+    renderSearchState(container, status, trimmed);
+}
+
+function performKeywordSearch(trimmed) {
+    const container = document.getElementById('chat-manager-content');
+    const status = document.getElementById('chat-manager-status');
+    if (!container) return;
+
+    const lowerQuery = trimmed.toLowerCase();
+    searchState = {
+        query: trimmed,
+        lowerQuery,
+        searchable: getSearchableMessages(),
+        position: 0,
+        results: [],
+        totalMatches: 0,
+        exhausted: false,
+        mode: 'keyword',
+    };
+
+    searchMoreResults(RESULTS_PAGE_SIZE);
+    setSearchModeBadge('keyword');
+    renderSearchState(container, status, trimmed);
+}
+
+export async function performSearch(query) {
+    const container = document.getElementById('chat-manager-content');
+    if (!container) return;
+
+    if (!query || query.trim().length < 2) {
+        setSearchModeBadge('keyword');
+        renderThreadCards();
+        return;
+    }
+
+    const trimmed = query.trim();
+    const requestId = ++latestSearchRequestId;
+
+    if (shouldUseSemanticSearch(trimmed)) {
+        try {
+            await performSemanticSearch(trimmed, requestId);
+            return;
+        } catch (err) {
+            console.warn(`[${MODULE_NAME}] Semantic search failed, falling back to keyword:`, err);
+        }
+    }
+
+    if (requestId !== latestSearchRequestId) return;
+    performKeywordSearch(trimmed);
 }
 
 function setSearchStatus(queryText) {
@@ -1609,6 +2348,12 @@ function buildHighlightedExcerpt(text, query) {
 // ──────────────────────────────────────────────
 
 function bindCardEvents(container) {
+    // Embedding selection scope toggles
+    container.querySelectorAll('.chat-manager-emb-select-cb').forEach(cb => {
+        cb.addEventListener('click', (e) => e.stopPropagation());
+        cb.addEventListener('change', handleEmbeddingSelectionToggle);
+    });
+
     // Click on card to switch thread
     container.querySelectorAll('.chat-manager-display-name').forEach(el => {
         el.addEventListener('click', handleSwitchThread);
@@ -1648,6 +2393,20 @@ function bindCardEvents(container) {
     container.querySelectorAll('.chat-manager-branch-jump').forEach(btn => {
         btn.addEventListener('click', handleJumpToGraphMessage);
     });
+
+    // Drift jump
+    container.querySelectorAll('.chat-manager-drift-jump').forEach(btn => {
+        btn.addEventListener('click', handleJumpToGraphMessage);
+    });
+}
+
+function handleEmbeddingSelectionToggle(e) {
+    e.stopPropagation();
+    const input = e.currentTarget;
+    const filename = input?.dataset?.filename;
+    if (!filename) return;
+    setEmbeddingChatSelected(filename, input.checked);
+    updateEmbeddingSelectionControls();
 }
 
 function handleTagButton(e) {

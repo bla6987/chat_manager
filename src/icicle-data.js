@@ -17,9 +17,14 @@
  * @property {string[]} chatFiles - which chats pass through this node
  * @property {Map<string, TrieNode>} children
  * @property {{ text: string, timestamp: number|null }} representative
+ * @property {number|null} clusterLabel
+ * @property {number[]|null} chatEmbedding
+ * @property {number[]|null} pca3d
  * @property {number} y0 - top of vertical span [0,1]
  * @property {number} y1 - bottom of vertical span [0,1]
  */
+
+import { pca3D } from './semantic-engine.js';
 
 /**
  * Normalize message text for trie keying: trim + collapse whitespace.
@@ -63,7 +68,7 @@ function filterToThread(loadedEntries, activeChatFile) {
  * @param {Object} chatIndex - keyed by fileName
  * @param {string|null} activeChatFile
  * @param {{ threadFocus?: boolean }} [options]
- * @returns {{ root: TrieNode, flatNodes: Array, maxDepth: number, loadedCount: number }}
+ * @returns {{ root: TrieNode, flatNodes: Array, maxDepth: number, loadedCount: number, pcaRanges: { x: [number, number], y: [number, number], z: [number, number] }|null }}
  */
 export function buildIcicleData(chatIndex, activeChatFile, options = {}) {
     const loadedEntries = [];
@@ -110,6 +115,9 @@ export function buildIcicleData(chatIndex, activeChatFile, options = {}) {
         }
     }
 
+    const semanticContext = buildSemanticContext(entries);
+    annotateSemanticFields(root, chatIndex, semanticContext);
+
     // ── Phase 2: Layout computation ──
     computeLayout(root, 0, 1, activeChatFile);
 
@@ -117,7 +125,9 @@ export function buildIcicleData(chatIndex, activeChatFile, options = {}) {
     const flatNodes = [];
     flattenTrie(root, flatNodes);
 
-    return { root, flatNodes, maxDepth, loadedCount: entries.length };
+    const pcaRanges = computePcaRanges(flatNodes);
+
+    return { root, flatNodes, maxDepth, loadedCount: entries.length, pcaRanges };
 }
 
 /**
@@ -131,9 +141,181 @@ function makeNode(normalizedText, role, depth) {
         chatFiles: [],
         children: new Map(),
         representative: { text: '', timestamp: null },
+        clusterLabel: null,
+        chatEmbedding: null,
+        pca3d: null,
         y0: 0,
         y1: 1,
     };
+}
+
+/**
+ * @param {Array<{fileName: string, entry: Object}>} entries
+ * @returns {{ mean: number[]|null, components: number[][]|null }}
+ */
+function buildSemanticContext(entries) {
+    const vectors = [];
+    for (const { entry } of entries) {
+        if (Array.isArray(entry.chatEmbedding) && entry.chatEmbedding.length > 0) {
+            vectors.push(entry.chatEmbedding);
+        }
+    }
+
+    if (vectors.length === 0) {
+        return { mean: null, components: null };
+    }
+
+    const { mean, components } = pca3D(vectors);
+    if (!Array.isArray(mean) || !Array.isArray(components) || components.length === 0) {
+        return { mean: null, components: null };
+    }
+
+    return { mean, components };
+}
+
+/**
+ * @param {string[]} chatFiles
+ * @param {Object} chatIndex
+ * @returns {number|null}
+ */
+function majorityCluster(chatFiles, chatIndex) {
+    const counts = new Map();
+    for (const file of chatFiles) {
+        const label = chatIndex[file]?.clusterLabel;
+        if (!Number.isFinite(label)) continue;
+        const key = Math.floor(label);
+        counts.set(key, (counts.get(key) || 0) + 1);
+    }
+
+    if (counts.size === 0) return null;
+
+    let bestLabel = null;
+    let bestCount = -1;
+    for (const [label, count] of counts) {
+        if (count > bestCount) {
+            bestCount = count;
+            bestLabel = label;
+        }
+    }
+    return bestLabel;
+}
+
+/**
+ * @param {string[]} chatFiles
+ * @param {Object} chatIndex
+ * @returns {number[]|null}
+ */
+function meanPoolEmbeddings(chatFiles, chatIndex) {
+    let dims = 0;
+    let count = 0;
+    let sum = null;
+
+    for (const file of chatFiles) {
+        const vector = chatIndex[file]?.chatEmbedding;
+        if (!Array.isArray(vector) || vector.length === 0) continue;
+
+        if (!sum) {
+            dims = vector.length;
+            sum = new Array(dims).fill(0);
+        }
+        if (vector.length !== dims) continue;
+
+        for (let i = 0; i < dims; i++) {
+            sum[i] += vector[i];
+        }
+        count++;
+    }
+
+    if (!sum || count === 0) return null;
+
+    for (let i = 0; i < sum.length; i++) {
+        sum[i] /= count;
+    }
+    return sum;
+}
+
+/**
+ * Project a pooled embedding into the shared PCA basis.
+ * @param {number[]} vector
+ * @param {number[]} mean
+ * @param {number[][]} components
+ * @returns {number[]|null}
+ */
+function projectToPca3(vector, mean, components) {
+    if (!Array.isArray(vector) || !Array.isArray(mean) || !Array.isArray(components)) return null;
+    if (vector.length !== mean.length) return null;
+
+    const centered = new Array(vector.length);
+    for (let i = 0; i < vector.length; i++) {
+        centered[i] = vector[i] - mean[i];
+    }
+
+    const out = [0, 0, 0];
+    for (let c = 0; c < 3; c++) {
+        const component = components[c];
+        if (!Array.isArray(component) || component.length !== centered.length) {
+            out[c] = 0;
+            continue;
+        }
+
+        let dot = 0;
+        for (let i = 0; i < centered.length; i++) {
+            dot += centered[i] * component[i];
+        }
+        out[c] = dot;
+    }
+
+    return out;
+}
+
+/**
+ * @param {TrieNode} node
+ * @param {Object} chatIndex
+ * @param {{ mean: number[]|null, components: number[][]|null }} semanticContext
+ */
+function annotateSemanticFields(node, chatIndex, semanticContext) {
+    node.clusterLabel = majorityCluster(node.chatFiles, chatIndex);
+    node.chatEmbedding = meanPoolEmbeddings(node.chatFiles, chatIndex);
+
+    if (node.chatEmbedding && semanticContext.mean && semanticContext.components) {
+        node.pca3d = projectToPca3(node.chatEmbedding, semanticContext.mean, semanticContext.components);
+    } else {
+        node.pca3d = null;
+    }
+
+    for (const child of node.children.values()) {
+        annotateSemanticFields(child, chatIndex, semanticContext);
+    }
+}
+
+/**
+ * @param {Array<TrieNode>} nodes
+ * @returns {{ x: [number, number], y: [number, number], z: [number, number] } | null}
+ */
+function computePcaRanges(nodes) {
+    let minX = Infinity;
+    let maxX = -Infinity;
+    let minY = Infinity;
+    let maxY = -Infinity;
+    let minZ = Infinity;
+    let maxZ = -Infinity;
+    let count = 0;
+
+    for (const node of nodes) {
+        if (!Array.isArray(node.pca3d) || node.pca3d.length < 3) continue;
+        const [x, y, z] = node.pca3d;
+        if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) continue;
+        minX = Math.min(minX, x);
+        maxX = Math.max(maxX, x);
+        minY = Math.min(minY, y);
+        maxY = Math.max(maxY, y);
+        minZ = Math.min(minZ, z);
+        maxZ = Math.max(maxZ, z);
+        count++;
+    }
+
+    if (count === 0) return null;
+    return { x: [minX, maxX], y: [minY, maxY], z: [minZ, maxZ] };
 }
 
 /**

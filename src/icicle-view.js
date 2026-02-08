@@ -11,7 +11,8 @@
 
 import { buildIcicleData, reLayoutSubtree } from './icicle-data.js';
 import { getIndex } from './chat-reader.js';
-import { getDisplayName } from './metadata-store.js';
+import { getDisplayName, getEmbeddingSettings, setEmbeddingSettings } from './metadata-store.js';
+import { clusterColor, gradientColor, topicShiftScores } from './semantic-engine.js';
 
 const MODULE_NAME = 'chat_manager';
 const EXTENSION_PATH = '/scripts/extensions/third-party/chat_manager';
@@ -29,6 +30,8 @@ const DRAG_THRESHOLD = 4;    // pixels before drag activates
 const TOUCH_SPEED = 1.8;    // multiplier for touch drag panning (>1 = faster)
 const INERTIA_DECAY = 0.92; // velocity decay per frame during momentum scroll
 const MIN_INERTIA_V = 0.5;  // stop inertia below this velocity (pixels)
+const DRIFT_MEDIUM_THRESHOLD = 0.2;
+const DRIFT_HIGH_THRESHOLD = 0.4;
 
 // ── Module state ──
 let canvas = null;
@@ -43,6 +46,7 @@ let icicleRoot = null;
 let flatNodes = [];
 let maxDepth = 0;
 let loadedCount = 0;
+let pcaRanges = null;
 
 // Viewport (free navigation model)
 let viewX = 0;               // horizontal offset in world pixels
@@ -99,11 +103,18 @@ let hoveredNode = null;
 let resetBtnEl = null;
 let focusBtnEl = null;
 let jumpToCurrentBtnEl = null;
+let colorModeBtnEl = null;
+let clusterLegendEl = null;
 let tooltipEl = null;
 let popupEl = null;
 let breadcrumbEl = null;
 let modalInjected = false;
 let pendingFocusRequest = null;
+let colorMode = 'structural';
+let legendSelectedCluster = null;
+let activeTopicDrift = null;
+let activeTopicDriftChatFile = null;
+const topicDriftCache = new Map();
 
 // Search state
 let searchBarEl = null;
@@ -171,14 +182,23 @@ export function mountIcicle(containerEl, mode) {
     container.style.position = 'relative';
 
     // Build data
+    const settings = getEmbeddingSettings();
+    colorMode = settings.colorMode || 'structural';
+    if (!['structural', 'cluster', 'gradient'].includes(colorMode)) {
+        colorMode = 'structural';
+    }
+    legendSelectedCluster = null;
+
     const activeChatFile = getActiveChatFile ? getActiveChatFile() : null;
     const chatIndex = getIndex();
     const data = buildIcicleData(chatIndex, activeChatFile, { threadFocus: threadFocusActive });
+    refreshActiveTopicDrift(activeChatFile, chatIndex);
 
     icicleRoot = data.root;
     flatNodes = data.flatNodes;
     maxDepth = data.maxDepth;
     loadedCount = data.loadedCount;
+    pcaRanges = data.pcaRanges || null;
     viewX = 0;
     viewY0 = 0;
     viewY1 = 1;
@@ -245,12 +265,30 @@ export function mountIcicle(containerEl, mode) {
     });
     container.appendChild(jumpToCurrentBtnEl);
 
+    // Create color mode toggle button
+    colorModeBtnEl = document.createElement('button');
+    colorModeBtnEl.className = 'chat-manager-btn chat-manager-icicle-color-mode-btn';
+    colorModeBtnEl.title = 'Cycle color mode';
+    colorModeBtnEl.addEventListener('click', (e) => {
+        e.stopPropagation();
+        cycleColorMode();
+    });
+    container.appendChild(colorModeBtnEl);
+
+    // Floating cluster legend (visible in cluster mode with semantic data)
+    clusterLegendEl = document.createElement('div');
+    clusterLegendEl.className = 'chat-manager-icicle-cluster-legend';
+    clusterLegendEl.style.display = 'none';
+    container.appendChild(clusterLegendEl);
+
     // Create tooltip
     createTooltip();
 
     // Size and render
     resizeCanvas();
     scrollToActiveLeaf(activeChatFile);
+    updateColorModeControl();
+    updateClusterLegend();
     render();
 
     // Bind events
@@ -294,6 +332,14 @@ export function unmountIcicle() {
         jumpToCurrentBtnEl.remove();
         jumpToCurrentBtnEl = null;
     }
+    if (colorModeBtnEl) {
+        colorModeBtnEl.remove();
+        colorModeBtnEl = null;
+    }
+    if (clusterLegendEl) {
+        clusterLegendEl.remove();
+        clusterLegendEl = null;
+    }
 
     container = null;
     currentMode = null;
@@ -314,6 +360,10 @@ export function unmountIcicle() {
     touchTapCandidate = null;
     inertiaVx = 0;
     inertiaVy = 0;
+    pcaRanges = null;
+    legendSelectedCluster = null;
+    activeTopicDrift = null;
+    activeTopicDriftChatFile = null;
     mounted = false;
 }
 
@@ -323,15 +373,18 @@ export function updateIcicleData() {
     const activeChatFile = getActiveChatFile ? getActiveChatFile() : null;
     const chatIndex = getIndex();
     const data = buildIcicleData(chatIndex, activeChatFile, { threadFocus: threadFocusActive });
+    refreshActiveTopicDrift(activeChatFile, chatIndex);
 
     icicleRoot = data.root;
     flatNodes = data.flatNodes;
     maxDepth = data.maxDepth;
     loadedCount = data.loadedCount;
+    pcaRanges = data.pcaRanges || null;
     zoomStack = [];
     zoomRoot = null;
     exploreRoot = null;
     exploreDepthOffset = 0;
+    legendSelectedCluster = null;
     viewX = 0;
     viewY0 = 0;
     viewY1 = 1;
@@ -347,6 +400,8 @@ export function updateIcicleData() {
     }
 
     scrollToActiveLeaf(activeChatFile);
+    updateColorModeControl();
+    updateClusterLegend();
     render();
     updateBreadcrumbs();
     updateResetButton();
@@ -572,6 +627,196 @@ function removeSearchBar() {
     searchMatchIndex = -1;
 }
 
+/**
+ * Compute and cache per-depth topic drift for one chat.
+ * Drift score for a depth N means change from message N-1 -> N.
+ * @param {string|null} chatFile
+ * @param {Object} chatIndex
+ * @returns {{ scoresByDepth: Map<number, number>, mediumCount: number, highCount: number, totalShifts: number }|null}
+ */
+function getTopicDriftForChat(chatFile, chatIndex) {
+    if (!chatFile || !chatIndex) return null;
+
+    const entry = chatIndex[chatFile];
+    if (!entry?.isLoaded || !Array.isArray(entry.messages) || entry.messages.length < 2) return null;
+    if (!(entry.messageEmbeddings instanceof Map) || entry.messageEmbeddings.size < 2) return null;
+
+    const embeddingSettings = getEmbeddingSettings();
+    const cacheSignature = [
+        entry.messages.length,
+        entry.lastMessageTimestamp || '',
+        entry.messageEmbeddings.size,
+        embeddingSettings.provider || '',
+        embeddingSettings.model || '',
+        embeddingSettings.dimensions ?? 'na',
+    ].join('|');
+
+    const cached = topicDriftCache.get(chatFile);
+    if (cached?.signature === cacheSignature) {
+        return cached.data;
+    }
+
+    const ordered = [];
+    for (let depth = 0; depth < entry.messages.length; depth++) {
+        const msg = entry.messages[depth];
+        const vector = entry.messageEmbeddings.get(msg.index);
+        if (!Array.isArray(vector) || vector.length === 0) continue;
+        ordered.push({ depth, vector });
+    }
+
+    if (ordered.length < 2) {
+        topicDriftCache.set(chatFile, { signature: cacheSignature, data: null });
+        return null;
+    }
+
+    let scores = [];
+    try {
+        scores = topicShiftScores(ordered.map(item => item.vector));
+    } catch {
+        topicDriftCache.set(chatFile, { signature: cacheSignature, data: null });
+        return null;
+    }
+
+    const scoresByDepth = new Map();
+    let mediumCount = 0;
+    let highCount = 0;
+    for (let i = 0; i < scores.length; i++) {
+        const score = Number(scores[i]);
+        const targetDepth = ordered[i + 1]?.depth;
+        if (!Number.isFinite(score) || !Number.isFinite(targetDepth)) continue;
+
+        scoresByDepth.set(targetDepth, score);
+        if (score > DRIFT_HIGH_THRESHOLD) {
+            highCount++;
+        } else if (score >= DRIFT_MEDIUM_THRESHOLD) {
+            mediumCount++;
+        }
+    }
+
+    const data = {
+        scoresByDepth,
+        mediumCount,
+        highCount,
+        totalShifts: mediumCount + highCount,
+    };
+    topicDriftCache.set(chatFile, { signature: cacheSignature, data });
+
+    if (topicDriftCache.size > 64) {
+        const oldestKey = topicDriftCache.keys().next().value;
+        topicDriftCache.delete(oldestKey);
+    }
+
+    return data;
+}
+
+function refreshActiveTopicDrift(chatFile, chatIndex = getIndex()) {
+    activeTopicDriftChatFile = chatFile || null;
+    activeTopicDrift = getTopicDriftForChat(activeTopicDriftChatFile, chatIndex);
+}
+
+function hasSemanticData() {
+    for (const node of flatNodes) {
+        if (Number.isFinite(node.clusterLabel)) return true;
+        if (Array.isArray(node.pca3d) && node.pca3d.length >= 3) return true;
+    }
+    return false;
+}
+
+function getEffectiveColorMode() {
+    if (!hasSemanticData()) return 'structural';
+    if (colorMode === 'cluster' || colorMode === 'gradient') return colorMode;
+    return 'structural';
+}
+
+function cycleColorMode() {
+    const semanticReady = hasSemanticData();
+    if (!semanticReady) return;
+
+    if (colorMode === 'structural') {
+        colorMode = 'cluster';
+    } else if (colorMode === 'cluster') {
+        colorMode = 'gradient';
+    } else {
+        colorMode = 'structural';
+    }
+
+    legendSelectedCluster = null;
+    setEmbeddingSettings({ colorMode });
+    updateColorModeControl();
+    updateClusterLegend();
+    render();
+}
+
+function updateColorModeControl() {
+    if (!colorModeBtnEl) return;
+
+    const semanticReady = hasSemanticData();
+    const effective = getEffectiveColorMode();
+    const labels = {
+        structural: 'Struct',
+        cluster: 'Cluster',
+        gradient: 'Gradient',
+    };
+
+    colorModeBtnEl.textContent = labels[effective] || 'Struct';
+    colorModeBtnEl.title = semanticReady
+        ? `Color mode: ${labels[effective]} (click to cycle)`
+        : 'Generate embeddings to enable semantic color modes';
+    colorModeBtnEl.disabled = !semanticReady;
+    colorModeBtnEl.classList.toggle('active', semanticReady && effective !== 'structural');
+}
+
+function updateClusterLegend() {
+    if (!clusterLegendEl) return;
+
+    const semanticReady = hasSemanticData();
+    const effective = getEffectiveColorMode();
+    if (!semanticReady || effective !== 'cluster') {
+        clusterLegendEl.style.display = 'none';
+        clusterLegendEl.innerHTML = '';
+        legendSelectedCluster = null;
+        return;
+    }
+
+    const labels = new Set();
+    for (const node of flatNodes) {
+        if (Number.isFinite(node.clusterLabel)) {
+            labels.add(Math.floor(node.clusterLabel));
+        }
+    }
+
+    const ordered = [...labels].sort((a, b) => a - b);
+    if (ordered.length === 0) {
+        clusterLegendEl.style.display = 'none';
+        clusterLegendEl.innerHTML = '';
+        legendSelectedCluster = null;
+        return;
+    }
+
+    let html = '<div class="chat-manager-icicle-legend-title">Clusters</div>';
+    for (const label of ordered) {
+        const active = legendSelectedCluster === label;
+        html += `
+            <button class="chat-manager-icicle-legend-item${active ? ' active' : ''}" data-cluster="${label}" style="--cluster-color:${escapeAttr(clusterColor(label))}">
+                <span class="chat-manager-icicle-legend-dot"></span>
+            </button>
+        `;
+    }
+    clusterLegendEl.innerHTML = html;
+    clusterLegendEl.style.display = '';
+
+    clusterLegendEl.querySelectorAll('.chat-manager-icicle-legend-item').forEach(btn => {
+        btn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            const label = Number(btn.dataset.cluster);
+            if (!Number.isFinite(label)) return;
+            legendSelectedCluster = legendSelectedCluster === label ? null : label;
+            updateClusterLegend();
+            render();
+        });
+    });
+}
+
 // ──────────────────────────────────────────────
 //  Canvas Sizing
 // ──────────────────────────────────────────────
@@ -607,6 +852,12 @@ function render() {
     ctx.clearRect(0, 0, canvasWidth, canvasHeight);
 
     const activeChatFile = getActiveChatFile ? getActiveChatFile() : null;
+    if (activeChatFile !== activeTopicDriftChatFile) {
+        refreshActiveTopicDrift(activeChatFile);
+    }
+    const effectiveColorMode = getEffectiveColorMode();
+    const selectedCluster = legendSelectedCluster;
+    const activeDriftScoresByDepth = activeTopicDrift?.scoresByDepth || null;
 
     // Determine visible depth range from viewX (offset for explore mode)
     const minVisibleDepth = Math.floor(viewX / COL_WIDTH) + exploreDepthOffset;
@@ -640,26 +891,73 @@ function render() {
         const isActive = activeChatFile && node.chatFiles.includes(activeChatFile);
         const isDivergence = node.children.size > 1;
         const isHovered = node === hoveredNode;
+        const driftScore = isActive && activeDriftScoresByDepth
+            ? activeDriftScoresByDepth.get(node.depth)
+            : null;
 
         let fillColor;
-        if (isHovered) {
-            fillColor = isActive ? 'rgba(110, 195, 255, 0.85)' : 'rgba(180, 190, 210, 0.7)';
-        } else if (isActive) {
-            fillColor = node.role === 'user'
-                ? 'rgba(90, 165, 240, 0.7)'
-                : 'rgba(70, 145, 220, 0.6)';
-        } else if (isDivergence) {
-            fillColor = node.role === 'user'
-                ? 'rgba(200, 170, 80, 0.6)'
-                : 'rgba(180, 155, 75, 0.55)';
+        if (effectiveColorMode === 'cluster' && Number.isFinite(node.clusterLabel)) {
+            const base = clusterColor(node.clusterLabel);
+            if (selectedCluster != null && node.clusterLabel !== selectedCluster) {
+                fillColor = withAlpha(base, 0.15);
+            } else if (isHovered) {
+                fillColor = withAlpha(lightenColor(base, 15), 0.98);
+            } else {
+                fillColor = withAlpha(base, isActive ? 0.95 : 0.55);
+            }
+        } else if (effectiveColorMode === 'gradient' && Array.isArray(node.pca3d)) {
+            const base = gradientColor(node.pca3d, pcaRanges || undefined);
+            if (isHovered) {
+                fillColor = withAlpha(lightenColor(base, 10), 0.98);
+            } else {
+                fillColor = withAlpha(base, isActive ? 0.95 : 0.55);
+            }
         } else {
-            fillColor = node.role === 'user'
-                ? 'rgba(180, 130, 100, 0.5)'
-                : 'rgba(100, 130, 170, 0.5)';
+            if (isHovered) {
+                fillColor = isActive ? 'rgba(110, 195, 255, 0.85)' : 'rgba(180, 190, 210, 0.7)';
+            } else if (isActive) {
+                fillColor = node.role === 'user'
+                    ? 'rgba(90, 165, 240, 0.7)'
+                    : 'rgba(70, 145, 220, 0.6)';
+            } else if (isDivergence) {
+                fillColor = node.role === 'user'
+                    ? 'rgba(200, 170, 80, 0.6)'
+                    : 'rgba(180, 155, 75, 0.55)';
+            } else {
+                fillColor = node.role === 'user'
+                    ? 'rgba(180, 130, 100, 0.5)'
+                    : 'rgba(100, 130, 170, 0.5)';
+            }
         }
 
         ctx.fillStyle = fillColor;
         ctx.fillRect(x, y, w, h);
+
+        // Topic drift overlay (active chat path only).
+        if (Number.isFinite(driftScore)) {
+            if (driftScore > DRIFT_HIGH_THRESHOLD) {
+                ctx.save();
+                ctx.strokeStyle = 'rgba(255, 150, 66, 0.95)';
+                ctx.lineWidth = 2;
+                ctx.shadowColor = 'rgba(255, 150, 66, 0.65)';
+                ctx.shadowBlur = 7;
+                ctx.strokeRect(x + 1, y + 1, Math.max(0, w - 2), Math.max(0, h - 2));
+                ctx.restore();
+            } else if (driftScore >= DRIFT_MEDIUM_THRESHOLD) {
+                ctx.fillStyle = 'rgba(255, 176, 96, 0.16)';
+                ctx.fillRect(x, y, w, h);
+                ctx.strokeStyle = 'rgba(255, 176, 96, 0.62)';
+                ctx.lineWidth = 1;
+                ctx.strokeRect(x + 0.5, y + 0.5, w - 1, h - 1);
+            }
+        }
+
+        // Retain branch divergence marker regardless of color mode.
+        if (isDivergence) {
+            ctx.strokeStyle = 'rgba(232, 188, 98, 0.38)';
+            ctx.lineWidth = 1;
+            ctx.strokeRect(x + 0.5, y + 0.5, w - 1, h - 1);
+        }
 
         // Active path stroke
         if (isActive && !isHovered) {
@@ -1532,6 +1830,7 @@ function showTooltip(clientX, clientY, node) {
     if (!tooltipEl) return;
 
     const { moment } = SillyTavern.libs;
+    const activeChatFile = getActiveChatFile ? getActiveChatFile() : null;
     const role = node.role === 'user' ? 'User' : 'Character';
     const time = node.representative.timestamp && moment
         ? moment(node.representative.timestamp).format('MMM D, h:mm A')
@@ -1543,10 +1842,19 @@ function showTooltip(clientX, clientY, node) {
     const branchInfo = branchCount > 1
         ? `<div class="chat-manager-timeline-tooltip-branches">${branchCount} branches</div>`
         : '';
+    const driftScore = activeChatFile && node.chatFiles.includes(activeChatFile) && activeTopicDrift?.scoresByDepth
+        ? activeTopicDrift.scoresByDepth.get(node.depth)
+        : null;
+    let driftInfo = '';
+    if (Number.isFinite(driftScore) && driftScore >= DRIFT_MEDIUM_THRESHOLD) {
+        const driftLabel = driftScore > DRIFT_HIGH_THRESHOLD ? 'Major topic shift' : 'Topic shift';
+        driftInfo = `<div class="chat-manager-timeline-tooltip-drift">${driftLabel} (${driftScore.toFixed(2)})</div>`;
+    }
 
     tooltipEl.innerHTML =
         `<div class="chat-manager-timeline-tooltip-role">${role} — msg #${node.depth}</div>` +
         branchInfo +
+        driftInfo +
         (time ? `<div class="chat-manager-timeline-tooltip-time">${time}</div>` : '') +
         `<div class="chat-manager-timeline-tooltip-preview">${escapeHtml(preview)}</div>` +
         `<div class="chat-manager-timeline-tooltip-count">${chatCount} chat${chatCount !== 1 ? 's' : ''}</div>`;
@@ -1770,6 +2078,66 @@ async function ensureModalInjected() {
 // ──────────────────────────────────────────────
 //  Helpers
 // ──────────────────────────────────────────────
+
+function withAlpha(color, alpha) {
+    const a = Math.max(0, Math.min(1, Number(alpha) || 0));
+    const c = String(color || '').trim();
+
+    if (c.startsWith('#')) {
+        const hex = c.slice(1);
+        const normalized = hex.length === 3
+            ? hex.split('').map(ch => ch + ch).join('')
+            : hex;
+        if (normalized.length !== 6) return c;
+        const r = parseInt(normalized.slice(0, 2), 16);
+        const g = parseInt(normalized.slice(2, 4), 16);
+        const b = parseInt(normalized.slice(4, 6), 16);
+        return `rgba(${r}, ${g}, ${b}, ${a})`;
+    }
+
+    if (c.startsWith('hsl(')) {
+        return c.replace(/^hsl\((.+)\)$/i, `hsla($1, ${a})`);
+    }
+    if (c.startsWith('rgb(')) {
+        return c.replace(/^rgb\((.+)\)$/i, `rgba($1, ${a})`);
+    }
+    if (c.startsWith('hsla(') || c.startsWith('rgba(')) {
+        return c.replace(/,\s*[\d.]+\s*\)$/i, `, ${a})`);
+    }
+
+    return c;
+}
+
+function lightenColor(color, amount) {
+    const amt = Math.max(0, Math.min(100, Number(amount) || 0));
+    const c = String(color || '').trim();
+
+    if (c.startsWith('#')) {
+        const hex = c.slice(1);
+        const normalized = hex.length === 3
+            ? hex.split('').map(ch => ch + ch).join('')
+            : hex;
+        if (normalized.length !== 6) return c;
+        let r = parseInt(normalized.slice(0, 2), 16);
+        let g = parseInt(normalized.slice(2, 4), 16);
+        let b = parseInt(normalized.slice(4, 6), 16);
+        r = Math.round(r + ((255 - r) * (amt / 100)));
+        g = Math.round(g + ((255 - g) * (amt / 100)));
+        b = Math.round(b + ((255 - b) * (amt / 100)));
+        return `rgb(${r}, ${g}, ${b})`;
+    }
+
+    const hslMatch = c.match(/^hsl\(\s*([\d.]+)\s*,\s*([\d.]+)%\s*,\s*([\d.]+)%\s*\)$/i);
+    if (hslMatch) {
+        const h = Number(hslMatch[1]);
+        const s = Number(hslMatch[2]);
+        const l = Number(hslMatch[3]);
+        const nextL = Math.max(0, Math.min(100, l + amt));
+        return `hsl(${h}, ${s}%, ${nextL}%)`;
+    }
+
+    return c;
+}
 
 function truncate(text, max) {
     if (!text) return '';

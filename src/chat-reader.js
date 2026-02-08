@@ -50,6 +50,10 @@ let cachedSearchableVersion = -1;
  * @property {number} initialOrder - deterministic tie-breaker to avoid jitter while hydrating
  * @property {number|null} branchPoint - message index where this chat diverged from the active chat, or null
  * @property {boolean} isLoaded - whether full chat content has been fetched
+ * @property {number[]|null} chatEmbedding - transient semantic embedding vector for this chat
+ * @property {string|null} chatEmbeddingHash - transient content hash for representative chat embedding text
+ * @property {number|null} clusterLabel - transient cluster assignment derived from embeddings
+ * @property {Map<number, number[]>|null} messageEmbeddings - transient per-message embeddings keyed by message index
  */
 
 /**
@@ -322,6 +326,18 @@ function normalizeEntryShape(entry) {
     if (typeof entry.isLoaded !== 'boolean') {
         entry.isLoaded = entry.messages.length > 0;
     }
+    if (!Array.isArray(entry.chatEmbedding)) {
+        entry.chatEmbedding = null;
+    }
+    if (typeof entry.chatEmbeddingHash !== 'string') {
+        entry.chatEmbeddingHash = null;
+    }
+    if (!Number.isFinite(entry.clusterLabel)) {
+        entry.clusterLabel = null;
+    }
+    if (!(entry.messageEmbeddings instanceof Map)) {
+        entry.messageEmbeddings = null;
+    }
 
     if (entry.isLoaded) {
         for (const msg of entry.messages) {
@@ -376,6 +392,7 @@ async function hydrateEntry(fileName, sessionId) {
                 lastMessageTimestamp: messages.length > 0 ? messages[messages.length - 1].timestamp : current.lastMessageTimestamp,
                 branchPoint: null,
                 isLoaded: true,
+                messageEmbeddings: null,
             };
             bumpIndexVersion();
 
@@ -520,6 +537,10 @@ export async function buildIndex(onProgress, onMetadataReady) {
                         initialOrder: allocateInitialOrder(),
                         branchPoint: null,
                         isLoaded: true,
+                        chatEmbedding: null,
+                        chatEmbeddingHash: null,
+                        clusterLabel: null,
+                        messageEmbeddings: null,
                     };
                     continue;
                 }
@@ -536,6 +557,10 @@ export async function buildIndex(onProgress, onMetadataReady) {
                     initialOrder: allocateInitialOrder(),
                     branchPoint: null,
                     isLoaded: false,
+                    chatEmbedding: null,
+                    chatEmbeddingHash: null,
+                    clusterLabel: null,
+                    messageEmbeddings: null,
                 };
                 markEntryForHydration(fileName);
                 continue;
@@ -564,11 +589,13 @@ export async function buildIndex(onProgress, onMetadataReady) {
                     cached.firstMessageTimestamp = idbEntry.firstMessageTimestamp;
                     cached.lastMessageTimestamp = idbEntry.lastMessageTimestamp || metaLastTimestamp;
                     cached.branchPoint = null;
+                    cached.messageEmbeddings = null;
                 } else {
                     cached.isLoaded = false;
                     cached.messages = [];
                     cached.branchPoint = null;
                     cached.firstMessageTimestamp = null;
+                    cached.messageEmbeddings = null;
                     if (metaMessageCount !== null) {
                         cached.messageCount = metaMessageCount;
                     } else {
@@ -576,6 +603,9 @@ export async function buildIndex(onProgress, onMetadataReady) {
                     }
                     markEntryForHydration(fileName);
                 }
+                cached.chatEmbedding = null;
+                cached.chatEmbeddingHash = null;
+                cached.clusterLabel = null;
             } else if (!cached.isLoaded) {
                 // Check IndexedDB cache before scheduling hydration
                 const idbEntry = idbCache.get(fileName);
@@ -586,6 +616,7 @@ export async function buildIndex(onProgress, onMetadataReady) {
                     cached.firstMessageTimestamp = idbEntry.firstMessageTimestamp;
                     cached.lastMessageTimestamp = idbEntry.lastMessageTimestamp || metaLastTimestamp;
                     cached.branchPoint = null;
+                    cached.messageEmbeddings = null;
                     changed = true;
                 } else {
                     if (metaMessageCount !== null) {
@@ -692,6 +723,7 @@ export async function updateActiveChat(fileName) {
             sortTimestamp: hasValidLastModified ? parsedLastModified : cached.sortTimestamp,
             branchPoint: null,
             isLoaded: true,
+            messageEmbeddings: null,
         };
         bumpIndexVersion();
 
@@ -899,7 +931,7 @@ export function getIndexVersion() {
 /**
  * Get a filtered and sorted snapshot of entries.
  * @param {{ tags: string[], dateFrom: string|null, dateTo: string|null, messageCountMin: number|null, messageCountMax: number|null }} filterState
- * @param {{ field: string, direction: string }} sortState
+ * @param {{ field: string, direction: string, secondaryField?: string }} sortState
  * @param {(fileName: string) => Object} getChatMetaFn - function to retrieve per-chat metadata
  * @returns {ChatIndexEntry[]}
  */
@@ -948,32 +980,49 @@ export function getFilteredSortedEntries(filterState, sortState, getChatMetaFn) 
     // ── Sort ──
     const dir = sortState.direction === 'asc' ? 1 : -1;
     const field = sortState.field || 'recency';
+    const secondaryFieldRaw = sortState.secondaryField || 'recency';
+    const secondaryField = secondaryFieldRaw === 'cluster' ? 'recency' : secondaryFieldRaw;
 
-    entries.sort((a, b) => {
-        let cmp = 0;
-        switch (field) {
+    const compareByField = (a, b, fieldName) => {
+        switch (fieldName) {
             case 'recency': {
                 const aTime = Number.isFinite(a.sortTimestamp) ? a.sortTimestamp : FALLBACK_SORT_TIMESTAMP;
                 const bTime = Number.isFinite(b.sortTimestamp) ? b.sortTimestamp : FALLBACK_SORT_TIMESTAMP;
-                cmp = aTime - bTime;
-                break;
+                return aTime - bTime;
             }
             case 'alphabetical': {
                 const aName = (getChatMetaFn(a.fileName).displayName || a.fileName).toLowerCase();
                 const bName = (getChatMetaFn(b.fileName).displayName || b.fileName).toLowerCase();
-                cmp = aName.localeCompare(bName);
-                break;
+                return aName.localeCompare(bName);
             }
-            case 'messageCount': {
-                cmp = a.messageCount - b.messageCount;
-                break;
-            }
+            case 'messageCount':
+                return a.messageCount - b.messageCount;
             case 'created': {
                 const aFirst = a.firstMessageTimestamp ? new Date(a.firstMessageTimestamp).getTime() : FALLBACK_SORT_TIMESTAMP;
                 const bFirst = b.firstMessageTimestamp ? new Date(b.firstMessageTimestamp).getTime() : FALLBACK_SORT_TIMESTAMP;
-                cmp = aFirst - bFirst;
+                return aFirst - bFirst;
+            }
+            default:
+                return 0;
+        }
+    };
+
+    entries.sort((a, b) => {
+        let cmp = 0;
+        switch (field) {
+            case 'cluster': {
+                cmp = (a.clusterLabel ?? 999) - (b.clusterLabel ?? 999);
+                if (cmp === 0) {
+                    cmp = compareByField(a, b, secondaryField);
+                }
                 break;
             }
+            case 'recency':
+            case 'alphabetical':
+            case 'messageCount':
+            case 'created':
+                cmp = compareByField(a, b, field);
+                break;
             default:
                 cmp = 0;
         }

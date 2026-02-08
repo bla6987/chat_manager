@@ -4,10 +4,18 @@
  */
 
 import { clearIndex, getIndexCharacterAvatar, updateActiveChat } from './src/chat-reader.js';
-import { togglePanel, closePanel, refreshPanel, renderThreadCards, onSearchInput, isPanelOpen, resetSearchState, toggleTimeline, isTimelineActive, toggleStats, isStatsActive, toggleBranchContext, isBranchContextActive } from './src/ui-controller.js';
-import { getDisplayMode, setDisplayMode, getBranchContextEnabled, getAIConnectionProfile, setAIConnectionProfile } from './src/metadata-store.js';
+import {
+    togglePanel, closePanel, refreshPanel, renderThreadCards, onSearchInput, isPanelOpen, resetSearchState,
+    toggleTimeline, isTimelineActive, toggleStats, isStatsActive, toggleBranchContext, isBranchContextActive,
+    clearInMemoryEmbeddings, generateEmbeddingsForCurrentIndex, scheduleEmbeddingBootstrap, scheduleIncrementalEmbedding,
+} from './src/ui-controller.js';
+import {
+    getDisplayMode, setDisplayMode, getBranchContextEnabled, getAIConnectionProfile, setAIConnectionProfile,
+    getEmbeddingSettings, setEmbeddingSettings,
+} from './src/metadata-store.js';
 import { updateBranchContextInjection, clearBranchContextInjection } from './src/branch-context.js';
 import { attachMomentumScroll } from './src/momentum-scroll.js';
+import { acknowledgeEmbeddingModelChange, clearEmbeddingCache, getCacheStats } from './src/embedding-service.js';
 
 const MODULE_NAME = 'chat_manager';
 const EXTENSION_PATH = '/scripts/extensions/third-party/chat_manager';
@@ -25,6 +33,12 @@ let slashCommandsRegistered = false;
 let topBarInterceptorBound = false;
 let cleanupMomentumScroll = null;
 
+function isEmbeddingGenerationEnabled() {
+    const settings = getEmbeddingSettings();
+    if (!settings.enabled) return false;
+    return settings.embeddingLevels?.chat === true || settings.embeddingLevels?.message === true;
+}
+
 /**
  * Handle MESSAGE_SENT / MESSAGE_RECEIVED — lightweight update for active chat only.
  * Debounced to avoid redundant updates during rapid message events (e.g., streaming).
@@ -38,12 +52,23 @@ const onMessageUpdate = (() => {
 
             const context = SillyTavern.getContext();
             const activeChatFile = context.chatMetadata?.chat_file_name;
+            const embeddingGenerationEnabled = isEmbeddingGenerationEnabled();
+
+            let updated = false;
+            if (activeChatFile && (isPanelOpen() || embeddingGenerationEnabled)) {
+                updated = await updateActiveChat(activeChatFile);
+            }
 
             if (isPanelOpen() && activeChatFile) {
-                const updated = await updateActiveChat(activeChatFile);
                 if (updated && !isTimelineActive() && !isStatsActive()) {
                     renderThreadCards();
                 }
+            }
+
+            if (embeddingGenerationEnabled && activeChatFile && updated) {
+                scheduleIncrementalEmbedding(activeChatFile);
+            } else if (embeddingGenerationEnabled && activeChatFile && !updated) {
+                scheduleEmbeddingBootstrap();
             }
 
             // Branch context injection works even when panel is closed
@@ -102,6 +127,13 @@ const onMessageUpdate = (() => {
 
     registerSlashCommands();
 
+    // If embeddings are enabled, attempt to restore vectors/clusters from cache.
+    if (isEmbeddingGenerationEnabled()) {
+        setTimeout(() => {
+            scheduleEmbeddingBootstrap();
+        }, 1200);
+    }
+
     // Restore branch context injection if it was enabled
     if (getBranchContextEnabled()) {
         setTimeout(() => {
@@ -120,6 +152,9 @@ function onAppReady() {
     registerSlashCommands();
     hijackTopBarButton();
     void injectSettingsPanel();
+    if (isEmbeddingGenerationEnabled()) {
+        scheduleEmbeddingBootstrap();
+    }
 }
 
 function bindTopBarClickInterceptor() {
@@ -374,6 +409,495 @@ function populateAIProfileDropdown(selectEl) {
     }
 }
 
+function formatCacheStatsLine(stats) {
+    const count = Number.isFinite(stats?.count) ? stats.count : 0;
+    const sizeKB = Number.isFinite(stats?.estimatedSizeKB) ? stats.estimatedSizeKB : 0;
+    return `${count} vectors, ~${sizeKB.toFixed(1)} KB`;
+}
+
+/**
+ * Bind embedding-related settings controls.
+ * @param {HTMLElement} container
+ */
+function bindEmbeddingSettingsUI(container) {
+    const enabledEl = container.querySelector('#chat-manager-emb-enabled');
+    const levelChatEl = container.querySelector('#chat-manager-emb-level-chat');
+    const levelMessageEl = container.querySelector('#chat-manager-emb-level-message');
+    const levelQueryEl = container.querySelector('#chat-manager-emb-level-query');
+    const providerEl = container.querySelector('#chat-manager-emb-provider');
+    const apiKeyWrap = container.querySelector('#chat-manager-emb-api-key-wrap');
+    const apiKeyEl = container.querySelector('#chat-manager-emb-api-key');
+    const ollamaWrap = container.querySelector('#chat-manager-emb-ollama-wrap');
+    const ollamaUrlEl = container.querySelector('#chat-manager-emb-ollama-url');
+    const modelEl = container.querySelector('#chat-manager-emb-model');
+    const modelToolsWrap = container.querySelector('#chat-manager-emb-model-tools');
+    const loadModelsBtn = container.querySelector('#chat-manager-emb-load-models');
+    const modelListEl = container.querySelector('#chat-manager-emb-model-list');
+    const modelStatusEl = container.querySelector('#chat-manager-emb-model-status');
+    const colorModeEl = container.querySelector('#chat-manager-emb-color-mode');
+    const scopeModeEl = container.querySelector('#chat-manager-emb-scope-mode');
+    const generateBtn = container.querySelector('#chat-manager-emb-generate');
+    const clearCacheBtn = container.querySelector('#chat-manager-emb-clear-cache');
+    const clearVectorsBtn = container.querySelector('#chat-manager-emb-clear-vectors');
+    const progressWrap = container.querySelector('#chat-manager-emb-progress');
+    const progressBar = container.querySelector('#chat-manager-emb-progress-bar');
+    const progressText = container.querySelector('#chat-manager-emb-progress-text');
+    const cacheStatsEl = container.querySelector('#chat-manager-emb-cache-stats');
+
+    if (!enabledEl || !levelChatEl || !levelMessageEl || !levelQueryEl || !providerEl || !apiKeyEl || !ollamaUrlEl || !modelEl || !colorModeEl || !scopeModeEl || !generateBtn || !clearCacheBtn || !clearVectorsBtn) {
+        return;
+    }
+
+    const modelPlaceholderByProvider = {
+        openrouter: 'e.g. openai/text-embedding-3-small',
+        openai: 'e.g. text-embedding-3-small',
+        ollama: 'e.g. nomic-embed-text',
+    };
+
+    const getProviderModelSnapshot = () => ({
+        provider: String(providerEl.value || '').trim(),
+        model: String(modelEl.value || '').trim(),
+    });
+
+    /** @type {{ provider: string, model: string }|null} */
+    let lastProviderModel = null;
+
+    const setProgress = (completed, total) => {
+        if (!progressWrap || !progressBar || !progressText) return;
+
+        const safeTotal = Math.max(0, Number(total) || 0);
+        const safeCompleted = Math.max(0, Math.min(Number(completed) || 0, safeTotal || Number(completed) || 0));
+        const pct = safeTotal > 0 ? Math.round((safeCompleted / safeTotal) * 100) : 0;
+
+        progressWrap.style.display = '';
+        progressBar.style.width = `${pct}%`;
+        progressText.textContent = safeTotal > 0
+            ? `Embedding ${safeCompleted}/${safeTotal}`
+            : 'Preparing embeddings…';
+    };
+
+    const hideProgress = () => {
+        if (!progressWrap || !progressBar || !progressText) return;
+        progressWrap.style.display = 'none';
+        progressBar.style.width = '0%';
+        progressText.textContent = '';
+    };
+
+    /**
+     * @param {boolean} disabled
+     */
+    const setEmbeddingActionButtonsDisabled = (disabled) => {
+        generateBtn.disabled = disabled;
+        clearCacheBtn.disabled = disabled;
+        clearVectorsBtn.disabled = disabled;
+    };
+
+    /**
+     * @param {string} message
+     * @param {boolean} [isError]
+     */
+    const setModelStatus = (message, isError = false) => {
+        if (!modelStatusEl) return;
+        modelStatusEl.textContent = message;
+        modelStatusEl.classList.toggle('error', !!message && isError);
+    };
+
+    /**
+     * @param {any} payload
+     * @returns {string}
+     */
+    const extractApiError = (payload) => {
+        if (!payload || typeof payload !== 'object') return '';
+        if (typeof payload.message === 'string') return payload.message;
+        if (payload.error && typeof payload.error === 'object' && typeof payload.error.message === 'string') {
+            return payload.error.message;
+        }
+        return '';
+    };
+
+    /**
+     * @param {any} model
+     * @returns {boolean}
+     */
+    const isEmbeddingModel = (model) => {
+        if (!model || typeof model !== 'object') return false;
+        const id = typeof model.id === 'string' ? model.id : '';
+        const name = typeof model.name === 'string' ? model.name : '';
+        const architecture = model.architecture && typeof model.architecture === 'object' ? model.architecture : {};
+        const modality = typeof architecture.modality === 'string' ? architecture.modality : '';
+        const inputModalities = Array.isArray(architecture.input_modalities)
+            ? architecture.input_modalities.map(String)
+            : [];
+        const outputModalities = Array.isArray(architecture.output_modalities)
+            ? architecture.output_modalities.map(String)
+            : [];
+        const endpointHints = Array.isArray(model.endpoints)
+            ? model.endpoints.map(endpoint => {
+                if (typeof endpoint === 'string') return endpoint;
+                if (!endpoint || typeof endpoint !== 'object') return '';
+                return `${endpoint.name || ''} ${endpoint.endpoint || ''}`;
+            })
+            : [];
+
+        const signal = [
+            id,
+            name,
+            modality,
+            ...inputModalities,
+            ...outputModalities,
+            ...endpointHints,
+        ].join(' ').toLowerCase();
+
+        return signal.includes('embed') || signal.includes('embedding');
+    };
+
+    /**
+     * @param {{ id: string, name: string, contextLength: number|null }[]} models
+     */
+    const populateModelList = (models) => {
+        if (!modelListEl) return;
+        const currentModel = String(modelEl.value || '').trim();
+        modelListEl.innerHTML = '';
+
+        const placeholder = document.createElement('option');
+        placeholder.value = '';
+        placeholder.textContent = models.length > 0 ? 'Select fetched model…' : 'No embedding models found';
+        modelListEl.appendChild(placeholder);
+
+        for (const model of models) {
+            const option = document.createElement('option');
+            option.value = model.id;
+            option.textContent = model.contextLength
+                ? `${model.id} (${model.contextLength.toLocaleString()} ctx)`
+                : model.id;
+            if (model.name && model.name !== model.id) {
+                option.title = model.name;
+            }
+            modelListEl.appendChild(option);
+        }
+
+        if (currentModel && models.some(model => model.id === currentModel)) {
+            modelListEl.value = currentModel;
+        } else {
+            modelListEl.value = '';
+        }
+        modelListEl.disabled = models.length === 0;
+    };
+
+    const fetchOpenRouterEmbeddingModels = async () => {
+        const headers = {
+            Accept: 'application/json',
+        };
+        const apiKey = String(apiKeyEl.value || '').trim();
+        if (apiKey) {
+            headers.Authorization = `Bearer ${apiKey}`;
+        }
+
+        const response = await fetch('https://openrouter.ai/api/v1/models', {
+            method: 'GET',
+            headers,
+        });
+
+        const raw = await response.text();
+        let payload = null;
+        if (raw) {
+            try {
+                payload = JSON.parse(raw);
+            } catch {
+                payload = null;
+            }
+        }
+
+        if (!response.ok) {
+            const detail = extractApiError(payload);
+            throw new Error(detail || `Model list request failed (${response.status} ${response.statusText})`);
+        }
+
+        if (!Array.isArray(payload?.data)) {
+            throw new Error('OpenRouter model list returned unexpected payload format.');
+        }
+
+        const deduped = new Map();
+        for (const model of payload.data) {
+            const id = typeof model?.id === 'string' ? model.id.trim() : '';
+            if (!id) continue;
+            if (!isEmbeddingModel(model)) continue;
+
+            const contextLength = Number.isInteger(model.context_length) && model.context_length > 0
+                ? model.context_length
+                : null;
+            const name = typeof model?.name === 'string' ? model.name.trim() : '';
+            deduped.set(id, { id, name, contextLength });
+        }
+
+        return Array.from(deduped.values()).sort((a, b) => a.id.localeCompare(b.id));
+    };
+
+    const updateProviderVisibility = () => {
+        const provider = providerEl.value;
+        const cloudProvider = provider === 'openrouter' || provider === 'openai';
+        if (apiKeyWrap) apiKeyWrap.style.display = cloudProvider ? '' : 'none';
+        if (ollamaWrap) ollamaWrap.style.display = provider === 'ollama' ? '' : 'none';
+        const showOpenRouterTools = provider === 'openrouter';
+        if (modelToolsWrap) modelToolsWrap.style.display = showOpenRouterTools ? '' : 'none';
+        if (modelStatusEl) modelStatusEl.style.display = showOpenRouterTools ? '' : 'none';
+        if (!showOpenRouterTools) {
+            setModelStatus('');
+        }
+        modelEl.placeholder = modelPlaceholderByProvider[provider] || modelPlaceholderByProvider.openrouter;
+    };
+
+    const loadToForm = () => {
+        const settings = getEmbeddingSettings();
+        const levels = settings.embeddingLevels || {};
+        enabledEl.checked = settings.enabled === true;
+        levelChatEl.checked = levels.chat === true;
+        levelMessageEl.checked = levels.message === true;
+        levelQueryEl.checked = levels.query === true;
+        providerEl.value = settings.provider || 'openrouter';
+        apiKeyEl.value = settings.apiKey || '';
+        ollamaUrlEl.value = settings.ollamaUrl || 'http://localhost:11434';
+        modelEl.value = settings.model || '';
+        colorModeEl.value = settings.colorMode || 'cluster';
+        scopeModeEl.value = settings.scopeMode || 'all';
+        updateProviderVisibility();
+    };
+
+    const persistForm = () => {
+        setEmbeddingSettings({
+            enabled: enabledEl.checked,
+            embeddingLevels: {
+                chat: levelChatEl.checked,
+                message: levelMessageEl.checked,
+                query: levelQueryEl.checked,
+            },
+            provider: providerEl.value,
+            apiKey: apiKeyEl.value,
+            ollamaUrl: ollamaUrlEl.value.trim() || 'http://localhost:11434',
+            model: modelEl.value.trim(),
+            colorMode: colorModeEl.value,
+            scopeMode: scopeModeEl.value,
+        });
+    };
+
+    const refreshCacheStats = async () => {
+        if (!cacheStatsEl) return;
+        try {
+            const stats = await getCacheStats();
+            cacheStatsEl.textContent = formatCacheStatsLine(stats);
+        } catch {
+            cacheStatsEl.textContent = 'Cache unavailable';
+        }
+    };
+
+    const handleProviderModelInvalidation = async () => {
+        const previous = lastProviderModel;
+        const next = getProviderModelSnapshot();
+        lastProviderModel = next;
+
+        if (!previous) return;
+        if (previous.provider === next.provider && previous.model === next.model) return;
+        if (!previous.model || !next.model) return;
+
+        const shouldClear = window.confirm(
+            `Embedding model changed. Clear cache and regenerate?\n\nPrevious: ${previous.provider || 'unknown'} / ${previous.model || 'unknown'}\nCurrent: ${next.provider || 'unknown'} / ${next.model || 'unknown'}`,
+        );
+
+        if (shouldClear) {
+            await clearEmbeddingCache();
+            clearInMemoryEmbeddings();
+            setEmbeddingSettings({ dimensions: null });
+            await refreshCacheStats();
+            if (typeof toastr !== 'undefined') {
+                toastr.info('Embedding cache cleared. Click "Generate Embeddings" to rebuild vectors.');
+            }
+            return;
+        }
+
+        await acknowledgeEmbeddingModelChange(next.provider, next.model);
+        if (typeof toastr !== 'undefined') {
+            toastr.warning('Provider/model changed without clearing cache. Existing embeddings may be inconsistent.');
+        }
+    };
+
+    loadToForm();
+    lastProviderModel = getProviderModelSnapshot();
+    void refreshCacheStats();
+    hideProgress();
+
+    enabledEl.addEventListener('change', () => {
+        persistForm();
+        if (enabledEl.checked) {
+            scheduleEmbeddingBootstrap();
+        }
+    });
+    levelChatEl.addEventListener('change', () => {
+        persistForm();
+        if (enabledEl.checked && (levelChatEl.checked || levelMessageEl.checked)) {
+            scheduleEmbeddingBootstrap();
+        }
+    });
+    levelMessageEl.addEventListener('change', () => {
+        persistForm();
+        if (enabledEl.checked && (levelChatEl.checked || levelMessageEl.checked)) {
+            scheduleEmbeddingBootstrap();
+        }
+    });
+    levelQueryEl.addEventListener('change', persistForm);
+
+    providerEl.addEventListener('change', async () => {
+        updateProviderVisibility();
+        persistForm();
+        try {
+            await handleProviderModelInvalidation();
+        } catch (err) {
+            console.warn(`[${MODULE_NAME}] Provider/model invalidation handling failed:`, err);
+        }
+    });
+
+    apiKeyEl.addEventListener('change', persistForm);
+    ollamaUrlEl.addEventListener('change', persistForm);
+    modelEl.addEventListener('change', async () => {
+        persistForm();
+        if (modelListEl && modelListEl.options.length > 0) {
+            modelListEl.value = modelEl.value.trim();
+        }
+        try {
+            await handleProviderModelInvalidation();
+        } catch (err) {
+            console.warn(`[${MODULE_NAME}] Provider/model invalidation handling failed:`, err);
+        }
+    });
+    colorModeEl.addEventListener('change', persistForm);
+    scopeModeEl.addEventListener('change', () => {
+        persistForm();
+        if (isPanelOpen() && !isTimelineActive() && !isStatsActive()) {
+            renderThreadCards();
+        }
+    });
+
+    if (loadModelsBtn && modelListEl) {
+        loadModelsBtn.addEventListener('click', async () => {
+            if (providerEl.value !== 'openrouter') {
+                setModelStatus('Model loading is available for OpenRouter only.', false);
+                return;
+            }
+
+            loadModelsBtn.disabled = true;
+            modelListEl.disabled = true;
+            setModelStatus('Loading OpenRouter model list…');
+
+            try {
+                const models = await fetchOpenRouterEmbeddingModels();
+                populateModelList(models);
+                const loadedAt = new Date().toLocaleTimeString();
+                setModelStatus(`Loaded ${models.length} embedding models at ${loadedAt}.`);
+                if (typeof toastr !== 'undefined') {
+                    toastr.success(`Loaded ${models.length} OpenRouter embedding models.`);
+                }
+            } catch (err) {
+                const message = err?.message || 'Failed to load OpenRouter models.';
+                setModelStatus(message, true);
+                if (typeof toastr !== 'undefined') {
+                    toastr.error(message);
+                }
+            } finally {
+                loadModelsBtn.disabled = false;
+                if (modelListEl.options.length > 1) {
+                    modelListEl.disabled = false;
+                }
+            }
+        });
+
+        modelListEl.addEventListener('change', async () => {
+            const selectedModel = String(modelListEl.value || '').trim();
+            if (!selectedModel) return;
+
+            modelEl.value = selectedModel;
+            persistForm();
+            try {
+                await handleProviderModelInvalidation();
+            } catch (err) {
+                console.warn(`[${MODULE_NAME}] Provider/model invalidation handling failed:`, err);
+            }
+        });
+    }
+
+    generateBtn.addEventListener('click', async () => {
+        persistForm();
+        const current = getEmbeddingSettings();
+        if (current.embeddingLevels?.chat !== true && current.embeddingLevels?.message !== true) {
+            if (typeof toastr !== 'undefined') {
+                toastr.info('Enable chat and/or message vector levels to generate embeddings.');
+            }
+            return;
+        }
+
+        setEmbeddingActionButtonsDisabled(true);
+        setProgress(0, 0);
+
+        try {
+            const result = await generateEmbeddingsForCurrentIndex({
+                onProgress: (completed, total) => setProgress(completed, total),
+            });
+            await refreshCacheStats();
+            if (typeof toastr !== 'undefined') {
+                const messagePart = Number.isFinite(result?.messageVectors) && result.messageVectors > 0
+                    ? `, ${result.messageVectors} messages`
+                    : '';
+                toastr.success(`Embeddings updated for ${result.updated} chats${messagePart} (${result.clusters} clusters).`);
+            }
+        } catch (err) {
+            console.error(`[${MODULE_NAME}] Failed to generate embeddings:`, err);
+            if (typeof toastr !== 'undefined') {
+                toastr.error(err?.message || 'Failed to generate embeddings.');
+            }
+        } finally {
+            setEmbeddingActionButtonsDisabled(false);
+            setTimeout(hideProgress, 800);
+        }
+    });
+
+    clearCacheBtn.addEventListener('click', async () => {
+        setEmbeddingActionButtonsDisabled(true);
+        try {
+            await clearEmbeddingCache();
+            setEmbeddingSettings({ dimensions: null });
+            await refreshCacheStats();
+            if (typeof toastr !== 'undefined') {
+                toastr.success('Embedding cache cleared.');
+            }
+        } catch (err) {
+            console.error(`[${MODULE_NAME}] Failed to clear embedding cache:`, err);
+            if (typeof toastr !== 'undefined') {
+                toastr.error('Failed to clear embedding cache.');
+            }
+        } finally {
+            setEmbeddingActionButtonsDisabled(false);
+        }
+    });
+
+    clearVectorsBtn.addEventListener('click', async () => {
+        setEmbeddingActionButtonsDisabled(true);
+        try {
+            await clearEmbeddingCache();
+            clearInMemoryEmbeddings();
+            setEmbeddingSettings({ dimensions: null });
+            await refreshCacheStats();
+            if (typeof toastr !== 'undefined') {
+                toastr.success('All semantic vectors cleared.');
+            }
+        } catch (err) {
+            console.error(`[${MODULE_NAME}] Failed to clear vectors:`, err);
+            if (typeof toastr !== 'undefined') {
+                toastr.error('Failed to clear vectors.');
+            }
+        } finally {
+            setEmbeddingActionButtonsDisabled(false);
+        }
+    });
+}
+
 /**
  * Inject the settings panel into SillyTavern's Extensions settings area.
  */
@@ -438,6 +962,8 @@ async function injectSettingsPanel() {
                 setAIConnectionProfile(aiProfileSelect.value);
             });
         }
+
+        bindEmbeddingSettingsUI(container);
     })().finally(() => {
         pendingSettingsInjection = null;
     });
@@ -638,5 +1164,16 @@ async function onChatChanged() {
                 updateBranchContextInjection(activeFile);
             }
         }, 1000);
+    }
+
+    if (isEmbeddingGenerationEnabled()) {
+        const activeFile = context.chatMetadata?.chat_file_name;
+        if (!sameCharacter) {
+            scheduleEmbeddingBootstrap();
+        } else if (activeFile) {
+            scheduleIncrementalEmbedding(activeFile);
+        } else {
+            scheduleEmbeddingBootstrap();
+        }
     }
 }
