@@ -32,6 +32,10 @@ import {
     setThreadFocus as setIcicleThreadFocus,
 } from './icicle-view.js';
 import {
+    mountSemanticMap, unmountSemanticMap, updateSemanticMapData,
+    focusMessageInSemanticMap, isSemanticMapMounted, setSemanticMapCallbacks,
+} from './semantic-map-view.js';
+import {
     mountStatsView, unmountStatsView, updateStatsView,
     isStatsMounted, setStatsCallbacks,
 } from './stats-view.js';
@@ -49,6 +53,7 @@ const RECLUSTER_CHAT_DELTA_RATIO = 0.2;
 
 let panelOpen = false;
 let timelineActive = false;
+let semanticMapActive = false;
 let statsActive = false;
 let branchContextActive = false;
 const RESULTS_PAGE_SIZE = 50;
@@ -56,6 +61,7 @@ let hydrationSubscriptionReady = false;
 let refreshFromHydrationTimer = null;
 let refreshSearchFromHydrationTimer = null;
 let refreshTimelineFromHydrationTimer = null;
+let refreshSemanticMapFromHydrationTimer = null;
 let refreshStatsFromHydrationTimer = null;
 let embedBootstrapTimer = null;
 let embedIncrementalTimer = null;
@@ -87,6 +93,10 @@ export function resetSearchState() {
 
 export function isTimelineActive() {
     return timelineActive;
+}
+
+export function isSemanticMapActive() {
+    return semanticMapActive;
 }
 
 export function isStatsActive() {
@@ -481,6 +491,13 @@ function refreshAfterEmbeddingUpdate() {
         return;
     }
 
+    if (semanticMapActive) {
+        if (isSemanticMapMounted()) {
+            updateSemanticMapData();
+        }
+        return;
+    }
+
     const query = getCurrentSearchQuery();
     if (query.length >= 2) {
         performSearch(query);
@@ -782,6 +799,55 @@ async function handleTimelineEmbedNode(chatFiles) {
 }
 
 /**
+ * Toggle semantic map view on/off.
+ */
+export function toggleSemanticMap() {
+    semanticMapActive = !semanticMapActive;
+
+    const btn = document.getElementById('chat-manager-semantic-map-toggle');
+    if (btn) btn.classList.toggle('active', semanticMapActive);
+
+    if (semanticMapActive) {
+        if (timelineActive) {
+            deactivateTimeline();
+        }
+        if (statsActive) {
+            deactivateStats();
+        }
+
+        const searchWrapper = document.querySelector('.chat-manager-search-wrapper');
+        const toolbar = document.querySelector('.chat-manager-filter-toolbar');
+        const content = document.getElementById('chat-manager-content');
+        if (searchWrapper) searchWrapper.style.display = 'none';
+        if (toolbar) toolbar.style.display = 'none';
+        dismissDropdown();
+        if (content) {
+            content.classList.add('timeline-active');
+            content.innerHTML = '<div class="chat-manager-loading"><div class="chat-manager-spinner"></div> Building semantic map…</div>';
+        }
+
+        setSemanticMapCallbacks({
+            onJump: handleTimelineJumpToMessage,
+            getActive: getActiveFilename,
+        });
+
+        requestAnimationFrame(() => {
+            requestAnimationFrame(() => {
+                if (!semanticMapActive) return;
+                if (content) {
+                    mountSemanticMap(content, 'mini');
+                }
+                const status = document.getElementById('chat-manager-status');
+                if (status) status.textContent = 'Semantic map view';
+            });
+        });
+    } else {
+        deactivateSemanticMap();
+        renderThreadCards();
+    }
+}
+
+/**
  * Toggle timeline view on/off. Called from index.js when the toggle button is clicked.
  * Expects Cytoscape libs to be loaded before this is called.
  */
@@ -795,6 +861,9 @@ export function toggleTimeline() {
     // Deactivate stats if active
     if (timelineActive && statsActive) {
         deactivateStats();
+    }
+    if (timelineActive && semanticMapActive) {
+        deactivateSemanticMap();
     }
 
     const searchWrapper = document.querySelector('.chat-manager-search-wrapper');
@@ -869,6 +938,9 @@ export function toggleStats() {
         // Deactivate timeline if active
         if (timelineActive) {
             deactivateTimeline();
+        }
+        if (semanticMapActive) {
+            deactivateSemanticMap();
         }
 
         // Hide search and toolbar
@@ -959,6 +1031,29 @@ function deactivateStats() {
 
     const content = document.getElementById('chat-manager-content');
     if (content) content.innerHTML = '';
+}
+
+/**
+ * Clean teardown of semantic map view.
+ */
+function deactivateSemanticMap() {
+    if (!semanticMapActive && !isSemanticMapMounted()) return;
+    semanticMapActive = false;
+    unmountSemanticMap();
+
+    const btn = document.getElementById('chat-manager-semantic-map-toggle');
+    if (btn) btn.classList.remove('active');
+
+    const searchWrapper = document.querySelector('.chat-manager-search-wrapper');
+    if (searchWrapper) searchWrapper.style.display = '';
+    const toolbar = document.querySelector('.chat-manager-filter-toolbar');
+    if (toolbar) toolbar.style.display = '';
+
+    const content = document.getElementById('chat-manager-content');
+    if (content) {
+        content.classList.remove('timeline-active');
+        content.innerHTML = '';
+    }
 }
 
 /**
@@ -1159,6 +1254,18 @@ function scheduleTimelineRefresh() {
     }, 600);
 }
 
+function scheduleSemanticMapRefresh() {
+    if (refreshSemanticMapFromHydrationTimer) return;
+
+    refreshSemanticMapFromHydrationTimer = setTimeout(() => {
+        refreshSemanticMapFromHydrationTimer = null;
+        if (!panelOpen || !semanticMapActive) return;
+        if (isSemanticMapMounted()) {
+            updateSemanticMapData();
+        }
+    }, 600);
+}
+
 function ensureHydrationSubscription() {
     if (hydrationSubscriptionReady) return;
 
@@ -1172,6 +1279,10 @@ function ensureHydrationSubscription() {
 
         if (timelineActive) {
             scheduleTimelineRefresh();
+            return;
+        }
+        if (semanticMapActive) {
+            scheduleSemanticMapRefresh();
             return;
         }
 
@@ -1243,6 +1354,7 @@ function closeSidePanel() {
     dismissDropdown();
     deactivateStats();
     deactivateTimeline();
+    deactivateSemanticMap();
 }
 
 // ── Popup ──
@@ -1283,6 +1395,7 @@ function closePopup() {
     dismissDropdown();
     deactivateStats();
     deactivateTimeline();
+    deactivateSemanticMap();
 }
 
 /**
@@ -1334,6 +1447,12 @@ export async function refreshPanel() {
     branchContextActive = getBranchContextEnabled();
     const branchCtxBtn = document.getElementById('chat-manager-branch-context-toggle');
     if (branchCtxBtn) branchCtxBtn.classList.toggle('active', branchContextActive);
+    const timelineBtn = document.getElementById('chat-manager-timeline-toggle');
+    if (timelineBtn) timelineBtn.classList.toggle('active', timelineActive);
+    const statsBtn = document.getElementById('chat-manager-stats-toggle');
+    if (statsBtn) statsBtn.classList.toggle('active', statsActive);
+    const semanticMapBtn = document.getElementById('chat-manager-semantic-map-toggle');
+    if (semanticMapBtn) semanticMapBtn.classList.toggle('active', semanticMapActive);
 
     // Guard: no character selected or group chat
     if (context.characterId === undefined) {
@@ -1368,6 +1487,37 @@ export async function refreshPanel() {
             }
         }
         // Still run index build in the background
+        const activeFile = getActiveFilename();
+        if (activeFile) prioritizeInQueue(activeFile);
+        await buildIndex(null, null);
+        return;
+    }
+
+    if (semanticMapActive) {
+        const content = document.getElementById('chat-manager-content');
+        const status = document.getElementById('chat-manager-status');
+        const searchWrapper = document.querySelector('.chat-manager-search-wrapper');
+        const toolbar = document.querySelector('.chat-manager-filter-toolbar');
+        if (searchWrapper) searchWrapper.style.display = 'none';
+        if (toolbar) toolbar.style.display = 'none';
+        if (content) {
+            content.classList.add('timeline-active');
+            if (isSemanticMapMounted()) {
+                requestAnimationFrame(() => updateSemanticMapData());
+            } else {
+                content.innerHTML = '<div class="chat-manager-loading"><div class="chat-manager-spinner"></div> Building semantic map\u2026</div>';
+                setSemanticMapCallbacks({
+                    onJump: handleTimelineJumpToMessage,
+                    getActive: getActiveFilename,
+                });
+                requestAnimationFrame(() => {
+                    if (!semanticMapActive) return;
+                    mountSemanticMap(content, 'mini');
+                });
+            }
+        }
+        if (status) status.textContent = 'Semantic map view';
+
         const activeFile = getActiveFilename();
         if (activeFile) prioritizeInQueue(activeFile);
         await buildIndex(null, null);
@@ -1907,9 +2057,9 @@ function ensureFilterToolbar() {
     if (clearBtn) clearBtn.style.display = hasActiveFilter() ? '' : 'none';
     updateEmbeddingSelectionControls(toolbar);
 
-    // Hide toolbar when search or timeline is active
+    // Hide toolbar when search or alternate visualization modes are active
     const query = getCurrentSearchQuery();
-    toolbar.style.display = (query.length >= 2 || timelineActive) ? 'none' : '';
+    toolbar.style.display = (query.length >= 2 || timelineActive || semanticMapActive || statsActive) ? 'none' : '';
 }
 
 function updateSortDirIcon(btn, direction) {
@@ -2974,18 +3124,24 @@ async function handleJumpToGraphMessage(e) {
     const entry = index[filename];
 
     const isLoaded = !!entry?.isLoaded;
-    focusMessageInIcicle(filename, msgIndex, {
-        openPopup: true,
-        persistIfMissing: !isLoaded,
-    });
-
-    if (!timelineActive) {
-        toggleTimeline();
+    if (semanticMapActive) {
+        focusMessageInSemanticMap(filename, msgIndex, {
+            openPopup: true,
+            persistIfMissing: !isLoaded,
+        });
+    } else {
+        focusMessageInIcicle(filename, msgIndex, {
+            openPopup: true,
+            persistIfMissing: !isLoaded,
+        });
+        if (!timelineActive) {
+            toggleTimeline();
+        }
     }
 
     if (!isLoaded) {
         prioritizeInQueue(filename);
-        toastr.info('Loading thread into graph…');
+        toastr.info(`Loading thread into ${semanticMapActive ? 'semantic map' : 'graph'}…`);
     }
 }
 
@@ -3128,7 +3284,7 @@ function escapeAttr(str) {
  * @param {string} query
  */
 export function onSearchInput(query) {
-    if (timelineActive || statsActive) {
+    if (timelineActive || statsActive || semanticMapActive) {
         return;
     }
 

@@ -6,7 +6,7 @@
 import { clearIndex, getIndexCharacterAvatar, updateActiveChat } from './src/chat-reader.js';
 import {
     togglePanel, closePanel, refreshPanel, renderThreadCards, onSearchInput, isPanelOpen, resetSearchState,
-    toggleTimeline, isTimelineActive, toggleStats, isStatsActive, toggleBranchContext, isBranchContextActive,
+    toggleTimeline, isTimelineActive, toggleSemanticMap, isSemanticMapActive, toggleStats, isStatsActive, toggleBranchContext, isBranchContextActive,
     clearInMemoryEmbeddings, generateEmbeddingsForCurrentIndex, scheduleEmbeddingBootstrap, scheduleIncrementalEmbedding,
 } from './src/ui-controller.js';
 import {
@@ -60,7 +60,7 @@ const onMessageUpdate = (() => {
             }
 
             if (isPanelOpen() && activeChatFile) {
-                if (updated && !isTimelineActive() && !isStatsActive()) {
+                if (updated && !isTimelineActive() && !isStatsActive() && !isSemanticMapActive()) {
                     renderThreadCards();
                 }
             }
@@ -787,7 +787,7 @@ function bindEmbeddingSettingsUI(container) {
     colorModeEl.addEventListener('change', persistForm);
     scopeModeEl.addEventListener('change', () => {
         persistForm();
-        if (isPanelOpen() && !isTimelineActive() && !isStatsActive()) {
+        if (isPanelOpen() && !isTimelineActive() && !isStatsActive() && !isSemanticMapActive()) {
             renderThreadCards();
         }
     });
@@ -1067,6 +1067,14 @@ function handleTimelineToggle(e) {
 }
 
 /**
+ * Handle semantic map toggle button click.
+ */
+function handleSemanticMapToggle(e) {
+    e.stopPropagation();
+    toggleSemanticMap();
+}
+
+/**
  * Bind events within the panel/popup (close button, search input, overlay click).
  */
 function bindPanelEvents() {
@@ -1128,6 +1136,12 @@ function bindPanelEvents() {
     const timelineToggleBtn = document.getElementById('chat-manager-timeline-toggle');
     if (timelineToggleBtn) {
         timelineToggleBtn.addEventListener('click', handleTimelineToggle);
+    }
+
+    // Semantic map toggle button
+    const semanticMapToggleBtn = document.getElementById('chat-manager-semantic-map-toggle');
+    if (semanticMapToggleBtn) {
+        semanticMapToggleBtn.addEventListener('click', handleSemanticMapToggle);
     }
 
     const content = document.getElementById('chat-manager-content');

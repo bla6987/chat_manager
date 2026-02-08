@@ -27,6 +27,10 @@ const DEFAULT_EMBEDDING_SETTINGS = {
     model: '',
     dimensions: null,
     colorMode: 'cluster',
+    mapEnabled: true,
+    mapLodMode: 'auto',
+    mapPointSize: 2.5,
+    mapSimilarityChannel: 'both',
     embeddingLevels: { ...DEFAULT_EMBEDDING_LEVELS },
     scopeMode: 'all',
     selectedChatsByAvatar: {},
@@ -82,6 +86,8 @@ function normalizeEmbeddingSettings(embeddings) {
     const providers = new Set(['openrouter', 'openai', 'ollama']);
     const colorModes = new Set(['structural', 'cluster', 'gradient']);
     const scopeModes = new Set(['all', 'selected']);
+    const mapLodModes = new Set(['auto', 'points', 'density']);
+    const mapSimilarityChannels = new Set(['alpha', 'size', 'both']);
 
     if (typeof embeddings.enabled !== 'boolean') embeddings.enabled = !!embeddings.enabled;
     if (!providers.has(embeddings.provider)) embeddings.provider = DEFAULT_EMBEDDING_SETTINGS.provider;
@@ -91,6 +97,13 @@ function normalizeEmbeddingSettings(embeddings) {
     }
     if (typeof embeddings.model !== 'string') embeddings.model = String(embeddings.model ?? '');
     if (!colorModes.has(embeddings.colorMode)) embeddings.colorMode = DEFAULT_EMBEDDING_SETTINGS.colorMode;
+    if (typeof embeddings.mapEnabled !== 'boolean') embeddings.mapEnabled = !!embeddings.mapEnabled;
+    if (!mapLodModes.has(embeddings.mapLodMode)) embeddings.mapLodMode = DEFAULT_EMBEDDING_SETTINGS.mapLodMode;
+    if (!mapSimilarityChannels.has(embeddings.mapSimilarityChannel)) embeddings.mapSimilarityChannel = DEFAULT_EMBEDDING_SETTINGS.mapSimilarityChannel;
+    const mapPointSize = Number(embeddings.mapPointSize);
+    embeddings.mapPointSize = Number.isFinite(mapPointSize)
+        ? Math.max(1, Math.min(8, mapPointSize))
+        : DEFAULT_EMBEDDING_SETTINGS.mapPointSize;
     if (embeddings.dimensions != null) {
         const dims = Number(embeddings.dimensions);
         embeddings.dimensions = Number.isInteger(dims) && dims > 0 ? dims : null;
@@ -537,7 +550,7 @@ export function setSortState(partial) {
 
 /**
  * Get embedding settings (global, persisted).
- * @returns {{ enabled: boolean, provider: string, apiKey: string, ollamaUrl: string, model: string, dimensions: number|null, colorMode: string, embeddingLevels: { chat: boolean, message: boolean, query: boolean }, scopeMode: string, selectedChatsByAvatar: Record<string, string[]> }}
+ * @returns {{ enabled: boolean, provider: string, apiKey: string, ollamaUrl: string, model: string, dimensions: number|null, colorMode: string, mapEnabled: boolean, mapLodMode: string, mapPointSize: number, mapSimilarityChannel: string, embeddingLevels: { chat: boolean, message: boolean, query: boolean }, scopeMode: string, selectedChatsByAvatar: Record<string, string[]> }}
  */
 export function getEmbeddingSettings() {
     const settings = getSettings();
@@ -559,7 +572,7 @@ export function getEmbeddingSettings() {
 
 /**
  * Merge and persist embedding settings.
- * @param {Partial<{ enabled: boolean, provider: string, apiKey: string, ollamaUrl: string, model: string, dimensions: number|null, colorMode: string, embeddingLevels: { chat: boolean, message: boolean, query: boolean }, scopeMode: string, selectedChatsByAvatar: Record<string, string[]> }>} partial
+ * @param {Partial<{ enabled: boolean, provider: string, apiKey: string, ollamaUrl: string, model: string, dimensions: number|null, colorMode: string, mapEnabled: boolean, mapLodMode: string, mapPointSize: number, mapSimilarityChannel: string, embeddingLevels: { chat: boolean, message: boolean, query: boolean }, scopeMode: string, selectedChatsByAvatar: Record<string, string[]> }>} partial
  */
 export function setEmbeddingSettings(partial) {
     const settings = getSettings();

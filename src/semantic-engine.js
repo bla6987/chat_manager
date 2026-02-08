@@ -779,6 +779,125 @@ export async function pca3DAsync(vectors) {
 }
 
 /**
+ * Async PCA projection to 2 dimensions.
+ * Reuses pca3DAsync and truncates to XY for deterministic behavior.
+ * @param {number[][]} vectors
+ * @returns {Promise<{ projected: number[][], mean: number[], components: number[][] }>}
+ */
+export async function pca2DAsync(vectors) {
+    const { projected, mean, components } = await pca3DAsync(vectors);
+    const projected2d = projected.map(row => [row[0] ?? 0, row[1] ?? 0]);
+    const components2d = [components[0] || [], components[1] || []];
+    return { projected: projected2d, mean, components: components2d };
+}
+
+/**
+ * Mini-batch k-means optimized for larger datasets.
+ * @param {number[][]} vectors
+ * @param {number} k
+ * @param {{ batchSize?: number, maxIter?: number }} [opts]
+ * @returns {Promise<{ labels: number[], centroids: number[][], inertia: number }>}
+ */
+export async function miniBatchKMeansAsync(vectors, k, opts = {}) {
+    const dims = validateVectors(vectors);
+    const n = vectors.length;
+    if (n === 0 || k <= 0) {
+        return { labels: [], centroids: [], inertia: 0 };
+    }
+
+    const clusterCount = Math.min(Math.max(1, Math.floor(k)), n);
+    const batchSize = Math.max(64, Math.min(n, Math.floor(opts.batchSize ?? 1024)));
+    const maxIter = Math.max(1, Math.floor(opts.maxIter ?? 100));
+    const rng = mulberry32(seedFromVectors(vectors, clusterCount ^ batchSize));
+    const centroids = initializeKMeansPlusPlus(vectors, clusterCount);
+    const seenCounts = new Array(clusterCount).fill(0);
+
+    for (let iter = 0; iter < maxIter; iter++) {
+        const start = Math.floor(rng() * n);
+        for (let b = 0; b < batchSize; b++) {
+            const idx = (start + b) % n;
+            const row = vectors[idx];
+            let bestLabel = 0;
+            let bestDist = Infinity;
+            for (let c = 0; c < clusterCount; c++) {
+                const d = squaredEuclideanDistance(row, centroids[c]);
+                if (d < bestDist) {
+                    bestDist = d;
+                    bestLabel = c;
+                }
+            }
+
+            seenCounts[bestLabel] += 1;
+            const eta = 1 / seenCounts[bestLabel];
+            const centroid = centroids[bestLabel];
+            for (let d = 0; d < dims; d++) {
+                centroid[d] = centroid[d] + eta * (row[d] - centroid[d]);
+            }
+        }
+
+        if (iter > 0 && iter % YIELD_INTERVAL === 0) {
+            await yieldToEventLoop();
+        }
+    }
+
+    const labels = new Array(n).fill(0);
+    let inertia = 0;
+    for (let i = 0; i < n; i++) {
+        let bestLabel = 0;
+        let bestDist = Infinity;
+        for (let c = 0; c < clusterCount; c++) {
+            const d = squaredEuclideanDistance(vectors[i], centroids[c]);
+            if (d < bestDist) {
+                bestDist = d;
+                bestLabel = c;
+            }
+        }
+        labels[i] = bestLabel;
+        inertia += bestDist;
+    }
+
+    return { labels, centroids, inertia };
+}
+
+/**
+ * Normalize a set of scalar values into [0,1] and return min/max metadata.
+ * @param {ArrayLike<number>} values
+ * @returns {{ normalized: Float32Array, min: number, max: number }}
+ */
+export function normalizeRange(values) {
+    const arr = values || [];
+    const len = Number.isFinite(arr.length) ? arr.length : 0;
+    const out = new Float32Array(len);
+    if (len === 0) {
+        return { normalized: out, min: 0, max: 0 };
+    }
+
+    let min = Infinity;
+    let max = -Infinity;
+    for (let i = 0; i < len; i++) {
+        const value = Number(arr[i]);
+        if (!Number.isFinite(value)) continue;
+        if (value < min) min = value;
+        if (value > max) max = value;
+    }
+    if (!Number.isFinite(min) || !Number.isFinite(max)) {
+        return { normalized: out, min: 0, max: 0 };
+    }
+
+    const span = max - min;
+    if (Math.abs(span) <= EPSILON) {
+        out.fill(1);
+        return { normalized: out, min, max };
+    }
+
+    for (let i = 0; i < len; i++) {
+        const value = Number(arr[i]);
+        out[i] = Number.isFinite(value) ? (value - min) / span : 0;
+    }
+    return { normalized: out, min, max };
+}
+
+/**
  * Topic drift scores between consecutive vectors.
  * @param {number[][]} orderedVectors
  * @returns {number[]}

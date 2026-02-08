@@ -921,6 +921,122 @@
     color: rgba(100, 180, 255, 0.9);
 }
 
+.chat-manager-semantic-map-toggle {
+    font-size: 1.05em;
+    line-height: 1;
+    width: 32px;
+    height: 32px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.chat-manager-semantic-map-toggle.active {
+    background: rgba(90, 210, 170, 0.22);
+    border-color: rgba(90, 210, 170, 0.52);
+    color: rgba(120, 240, 200, 0.95);
+}
+
+/* ── Semantic Map ── */
+
+.chat-manager-semantic-map-canvas {
+    display: block;
+    width: 100%;
+    height: 100%;
+    cursor: crosshair;
+    background: radial-gradient(circle at 50% 35%, rgba(42, 55, 70, 0.35), rgba(10, 13, 16, 0.95));
+}
+
+.chat-manager-semantic-map-overlay {
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+    z-index: 12;
+}
+
+.chat-manager-semantic-map-toolbar {
+    position: absolute;
+    top: 8px;
+    left: 8px;
+    right: 8px;
+    display: flex;
+    gap: 6px;
+    align-items: center;
+    pointer-events: auto;
+    padding: 6px;
+    border-radius: 10px;
+    background: rgba(14, 17, 22, 0.82);
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    backdrop-filter: blur(2px);
+}
+
+.chat-manager-semantic-map-query {
+    flex: 1;
+    min-width: 0;
+    height: 30px;
+    border-radius: 6px;
+    border: 1px solid rgba(255, 255, 255, 0.16);
+    background: rgba(0, 0, 0, 0.28);
+    color: inherit;
+    padding: 0 9px;
+    font-size: 0.84em;
+    outline: none;
+}
+
+.chat-manager-semantic-map-query:focus {
+    border-color: rgba(100, 180, 255, 0.45);
+    box-shadow: 0 0 0 2px rgba(100, 180, 255, 0.18);
+}
+
+.chat-manager-semantic-map-btn {
+    height: 30px;
+    padding: 0 9px;
+    font-size: 0.76em;
+    white-space: nowrap;
+}
+
+.chat-manager-semantic-map-info {
+    position: absolute;
+    left: 8px;
+    right: 8px;
+    bottom: 8px;
+    padding: 6px 9px;
+    border-radius: 8px;
+    background: rgba(14, 17, 22, 0.82);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    font-size: 0.75em;
+    line-height: 1.35;
+    color: rgba(230, 236, 244, 0.92);
+    pointer-events: none;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.chat-manager-semantic-map-empty {
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    padding: 10px 14px;
+    border-radius: 8px;
+    background: rgba(14, 17, 22, 0.86);
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    font-size: 0.83em;
+    color: rgba(230, 236, 244, 0.9);
+    text-align: center;
+    max-width: min(88%, 460px);
+    pointer-events: none;
+}
+
+.chat-manager-semantic-map-brush {
+    position: absolute;
+    border: 1px solid rgba(120, 200, 255, 0.9);
+    background: rgba(90, 160, 255, 0.15);
+    border-radius: 4px;
+    pointer-events: none;
+}
+
 /* ── Icicle Canvas Container ── */
 
 .chat-manager-icicle-canvas {
@@ -2002,6 +2118,11 @@
         height: 44px;
     }
 
+    .chat-manager-semantic-map-toggle {
+        width: 44px;
+        height: 44px;
+    }
+
     .chat-manager-icicle-toolbar {
         padding: 6px 10px;
         gap: 6px;
@@ -2054,6 +2175,22 @@
     .chat-manager-icicle-search-bar {
         gap: 6px;
         padding: 6px 8px;
+    }
+
+    .chat-manager-semantic-map-toolbar {
+        gap: 6px;
+        padding: 8px;
+    }
+
+    .chat-manager-semantic-map-btn {
+        min-height: 44px;
+        padding: 8px 10px;
+        font-size: 0.8em;
+    }
+
+    .chat-manager-semantic-map-query {
+        height: 44px;
+        font-size: 0.9em;
     }
 
     .chat-manager-timeline-popup-close {
@@ -2134,6 +2271,11 @@
     }
 
     .chat-manager-branch-ctx-toggle {
+        width: 44px;
+        height: 44px;
+    }
+
+    .chat-manager-semantic-map-toggle {
         width: 44px;
         height: 44px;
     }
