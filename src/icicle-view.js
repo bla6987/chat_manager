@@ -4,7 +4,7 @@
  * Public API mirrors the old timeline-view contract:
  *   mountIcicle(container, mode) / unmountIcicle()
  *   updateIcicleData() / isIcicleMounted()
- *   setIcicleCallbacks({ onJump, getActive })
+ *   setIcicleCallbacks({ onJump, getActive, onThreadFocusChanged, canEmbedThread, onEmbedThread })
  *   focusMessageInIcicle(filename, msgIndex, options)
  *   expandToFullScreen() / closeFullScreen()
  */
@@ -132,6 +132,8 @@ let searchDebounceTimer = null;
 let onJumpToChat = null;
 let getActiveChatFile = null;
 let onThreadFocusChanged = null;
+let canEmbedThread = null;
+let onEmbedThread = null;
 
 // ──────────────────────────────────────────────
 //  Public API
@@ -141,6 +143,8 @@ export function setIcicleCallbacks(callbacks) {
     onJumpToChat = callbacks.onJump;
     getActiveChatFile = callbacks.getActive;
     onThreadFocusChanged = callbacks.onThreadFocusChanged || null;
+    canEmbedThread = callbacks.canEmbedThread || null;
+    onEmbedThread = callbacks.onEmbedThread || null;
 }
 
 export function setThreadFocus(active) {
@@ -1971,10 +1975,16 @@ function showNodePopup(clientX, clientY, node) {
         const isCurrentChat = file === activeChatFile;
         const activeTag = isCurrentChat ? ' <span class="chat-manager-timeline-popup-active">(current)</span>' : '';
         const label = isCurrentChat ? 'Scroll' : 'Jump';
+        const needsEmbedding = typeof canEmbedThread === 'function' ? canEmbedThread(file) : false;
 
         html += '<div class="chat-manager-timeline-popup-entry">';
         html += `<span class="chat-manager-timeline-popup-name">${escapeHtml(displayName)}${activeTag}</span>`;
+        html += '<div class="chat-manager-timeline-popup-actions">';
+        if (needsEmbedding) {
+            html += `<button class="chat-manager-btn chat-manager-timeline-embed-btn" data-filename="${escapeAttr(file)}" title="Generate embeddings for this thread">Embed</button>`;
+        }
         html += `<button class="chat-manager-btn chat-manager-timeline-jump-btn" data-filename="${escapeAttr(file)}" data-msg-index="${node.depth}">${label}</button>`;
+        html += '</div>';
         html += '</div>';
     }
 
@@ -2003,6 +2013,9 @@ function showNodePopup(clientX, clientY, node) {
     popupEl.querySelectorAll('.chat-manager-timeline-jump-btn').forEach(btn => {
         btn.addEventListener('click', handleJump);
     });
+    popupEl.querySelectorAll('.chat-manager-timeline-embed-btn').forEach(btn => {
+        btn.addEventListener('click', handleEmbedFromPopup);
+    });
 
     // Bind explore thread button
     const exploreBtn = popupEl.querySelector('.chat-manager-timeline-explore-btn');
@@ -2018,6 +2031,31 @@ function handleJump(e) {
     removePopup();
     if (onJumpToChat) {
         onJumpToChat(filename, msgIndex);
+    }
+}
+
+async function handleEmbedFromPopup(e) {
+    e.stopPropagation();
+    const btn = e.currentTarget;
+    const fileName = btn?.dataset?.filename;
+    if (!fileName || typeof onEmbedThread !== 'function') return;
+
+    const prevText = btn.textContent;
+    btn.disabled = true;
+    btn.textContent = 'Embedding…';
+
+    try {
+        const result = await onEmbedThread(fileName);
+        if (!result || result?.skipped) {
+            btn.disabled = false;
+            btn.textContent = prevText || 'Embed';
+            return;
+        }
+        removePopup();
+    } catch (err) {
+        console.error(`[${MODULE_NAME}] Failed to embed thread from graph popup:`, err);
+        btn.disabled = false;
+        btn.textContent = prevText || 'Embed';
     }
 }
 

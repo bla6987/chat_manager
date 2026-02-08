@@ -332,6 +332,38 @@ function getMessageEmbeddingCandidates(entries) {
     return candidates;
 }
 
+function hasChatEmbedding(entry) {
+    return Array.isArray(entry?.chatEmbedding) && entry.chatEmbedding.length > 0;
+}
+
+function hasMessageEmbeddingsForAllTextMessages(entry) {
+    if (!entry?.isLoaded || !Array.isArray(entry.messages) || entry.messages.length === 0) return false;
+    if (!(entry.messageEmbeddings instanceof Map)) return false;
+
+    for (const msg of entry.messages) {
+        const text = typeof msg?.text === 'string' ? msg.text.trim() : '';
+        if (!text) continue;
+        const vector = entry.messageEmbeddings.get(msg.index);
+        if (!Array.isArray(vector) || vector.length === 0) return false;
+    }
+    return true;
+}
+
+function threadNeedsEmbeddings(fileName) {
+    if (!fileName) return false;
+    const entry = getIndex()[fileName];
+    if (!entry) return false;
+
+    const settings = getEmbeddingSettings();
+    const chatLevelEnabled = isEmbeddingLevelOn(settings, 'chat');
+    const messageLevelEnabled = isEmbeddingLevelOn(settings, 'message');
+    if (!chatLevelEnabled && !messageLevelEnabled) return false;
+
+    if (chatLevelEnabled && !hasChatEmbedding(entry)) return true;
+    if (messageLevelEnabled && !hasMessageEmbeddingsForAllTextMessages(entry)) return true;
+    return false;
+}
+
 function recomputeEmbeddingClusters(options = {}) {
     const index = getIndex();
     const entries = Object.values(index);
@@ -422,7 +454,7 @@ async function runEmbeddingGeneration(targetFileNames = null, options = {}) {
     const sourceEntries = Array.isArray(targetFileNames) && targetFileNames.length > 0
         ? targetFileNames.map(fileName => index[fileName]).filter(Boolean)
         : Object.values(index);
-    const scopedEntries = getScopeFilteredEntries(sourceEntries, settings);
+    const scopedEntries = options.ignoreScope ? sourceEntries : getScopeFilteredEntries(sourceEntries, settings);
 
     const chatCandidates = chatLevelEnabled
         ? scopedEntries
@@ -644,6 +676,52 @@ export function scheduleIncrementalEmbedding(fileName) {
     }, EMBED_INCREMENTAL_DELAY_MS);
 }
 
+function canEmbedThreadFromTimeline(fileName) {
+    return threadNeedsEmbeddings(fileName);
+}
+
+async function handleTimelineEmbedThread(fileName) {
+    if (!fileName) return null;
+    const entry = getIndex()[fileName];
+    if (!entry) return null;
+
+    const settings = getEmbeddingSettings();
+    if (!settings.enabled) {
+        toastr.info('Enable semantic embeddings in settings first.');
+        return null;
+    }
+
+    if (settings.embeddingLevels?.chat !== true && settings.embeddingLevels?.message !== true) {
+        toastr.info('Enable chat and/or message vector levels to generate embeddings.');
+        return null;
+    }
+
+    if (!isEmbeddingConfigured()) {
+        toastr.info('Configure provider/model settings before generating embeddings.');
+        return null;
+    }
+
+    if (!threadNeedsEmbeddings(fileName)) {
+        return { skipped: true, updated: 0, total: 0, clusters: getCurrentClusterCount(), messageVectors: 0 };
+    }
+
+    const displayName = getDisplayName(fileName) || fileName;
+    toastr.info(`Generating embeddings for "${displayName}"…`);
+
+    const result = await queueEmbeddingRun(() => runEmbeddingGeneration([fileName], {
+        ensureIndex: false,
+        rerender: true,
+        silent: false,
+        ignoreScope: true,
+    }));
+
+    const messagePart = Number.isFinite(result?.messageVectors) && result.messageVectors > 0
+        ? `, ${result.messageVectors} messages`
+        : '';
+    toastr.success(`Embeddings updated for "${displayName}"${messagePart} (${result.clusters} clusters).`);
+    return result;
+}
+
 /**
  * Toggle timeline view on/off. Called from index.js when the toggle button is clicked.
  * Expects Cytoscape libs to be loaded before this is called.
@@ -676,6 +754,8 @@ export function toggleTimeline() {
             onJump: handleTimelineJumpToMessage,
             getActive: getActiveFilename,
             onThreadFocusChanged: persistThreadFocus,
+            canEmbedThread: canEmbedThreadFromTimeline,
+            onEmbedThread: handleTimelineEmbedThread,
         });
 
         // Initialize thread focus from persisted preference

@@ -584,16 +584,17 @@ function bindEmbeddingSettingsUI(container) {
         modelListEl.disabled = models.length === 0;
     };
 
-    const fetchOpenRouterEmbeddingModels = async () => {
+    const fetchOpenRouterModelList = async (url) => {
         const headers = {
             Accept: 'application/json',
         };
         const apiKey = String(apiKeyEl.value || '').trim();
-        if (apiKey) {
-            headers.Authorization = `Bearer ${apiKey}`;
+        if (!apiKey) {
+            throw new Error('OpenRouter API key is required to load embedding models.');
         }
+        headers.Authorization = `Bearer ${apiKey}`;
 
-        const response = await fetch('https://openrouter.ai/api/v1/models', {
+        const response = await fetch(url, {
             method: 'GET',
             headers,
         });
@@ -617,11 +618,26 @@ function bindEmbeddingSettingsUI(container) {
             throw new Error('OpenRouter model list returned unexpected payload format.');
         }
 
+        return payload.data;
+    };
+
+    const fetchOpenRouterEmbeddingModels = async () => {
+        let modelsRaw = [];
+        let fromDedicatedEndpoint = false;
+        try {
+            // OpenRouter's dedicated embeddings model endpoint.
+            modelsRaw = await fetchOpenRouterModelList('https://openrouter.ai/api/v1/embeddings/models');
+            fromDedicatedEndpoint = true;
+        } catch (err) {
+            // Fallback to generic models endpoint for backward compatibility.
+            modelsRaw = await fetchOpenRouterModelList('https://openrouter.ai/api/v1/models');
+        }
+
         const deduped = new Map();
-        for (const model of payload.data) {
+        for (const model of modelsRaw) {
             const id = typeof model?.id === 'string' ? model.id.trim() : '';
             if (!id) continue;
-            if (!isEmbeddingModel(model)) continue;
+            if (!fromDedicatedEndpoint && !isEmbeddingModel(model)) continue;
 
             const contextLength = Number.isInteger(model.context_length) && model.context_length > 0
                 ? model.context_length

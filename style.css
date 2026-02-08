@@ -1272,6 +1272,12 @@
     padding: 2px 8px;
 }
 
+.chat-manager-timeline-embed-btn {
+    flex-shrink: 0;
+    font-size: 0.85em;
+    padding: 2px 8px;
+}
+
 .chat-manager-timeline-popup-actions {
     display: inline-flex;
     gap: 6px;
