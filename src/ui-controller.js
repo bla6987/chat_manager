@@ -3128,6 +3128,10 @@ function escapeAttr(str) {
  * @param {string} query
  */
 export function onSearchInput(query) {
+    if (timelineActive || statsActive) {
+        return;
+    }
+
     const toolbar = document.querySelector('.chat-manager-filter-toolbar');
     if (!query || query.trim().length < 2) {
         if (toolbar) toolbar.style.display = '';
