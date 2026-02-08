@@ -1029,6 +1029,37 @@
     pointer-events: none;
 }
 
+.chat-manager-semantic-map-loading {
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    min-width: 220px;
+    max-width: min(90%, 460px);
+    padding: 12px 14px;
+    border-radius: 10px;
+    background: rgba(14, 17, 22, 0.9);
+    border: 1px solid rgba(255, 255, 255, 0.14);
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    pointer-events: none;
+}
+
+.chat-manager-semantic-map-loading .chat-manager-spinner {
+    width: 16px;
+    height: 16px;
+    flex: 0 0 16px;
+}
+
+.chat-manager-semantic-map-loading-text {
+    font-size: 0.8em;
+    color: rgba(230, 236, 244, 0.92);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
 .chat-manager-semantic-map-brush {
     position: absolute;
     border: 1px solid rgba(120, 200, 255, 0.9);

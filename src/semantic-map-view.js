@@ -31,6 +31,7 @@ let lodBtnEl = null;
 let simBtnEl = null;
 let jumpBtnEl = null;
 let emptyEl = null;
+let loadingEl = null;
 
 let gl = null;
 let fallbackCtx = null;
@@ -143,8 +144,10 @@ export async function mountSemanticMap(containerEl, mode = 'mini') {
 
     createCanvas();
     createOverlay();
+    showLoading('Preparing semantic map…');
 
     if (!ensureWorker()) {
+        hideLoading();
         showEmpty('Semantic map unavailable: worker initialization failed.');
         mounted = true;
         return;
@@ -152,6 +155,7 @@ export async function mountSemanticMap(containerEl, mode = 'mini') {
 
     const data = collectMessageVectors();
     if (data.count === 0) {
+        hideLoading();
         showEmpty('No message embeddings found. Generate message embeddings to use Semantic Map.');
         mounted = true;
         return;
@@ -203,6 +207,7 @@ export function unmountSemanticMap() {
     simBtnEl = null;
     jumpBtnEl = null;
     emptyEl = null;
+    loadingEl = null;
 
     gl = null;
     fallbackCtx = null;
@@ -235,11 +240,13 @@ export async function updateSemanticMapData() {
 
     const data = collectMessageVectors();
     if (data.count === 0) {
+        hideLoading();
         showEmpty('No message embeddings found. Generate message embeddings to use Semantic Map.');
         return;
     }
 
     hideEmpty();
+    showLoading('Refreshing semantic map…');
     setInfo(`Refreshing map (${data.count.toLocaleString()} messages)…`);
     queueBuild(data);
 }
@@ -283,6 +290,8 @@ function ensureWorker() {
         if (msg.type === 'error') {
             console.warn(`[${MODULE_NAME}] Semantic worker error:`, msg.message);
             if (msg.jobId === workerBuildJobId) {
+                hideLoading();
+                showEmpty('Failed to build semantic map. Check console for details.');
                 setInfo('Failed to build semantic map.');
             }
             if (msg.jobId === workerScoreJobId) {
@@ -382,6 +391,7 @@ function queueBuild({ count, dims: vectorDims, vectorsFlat }) {
         maxK: 8,
     }, [vectorsFlat.buffer]);
 
+    showLoading(`Building map for ${count.toLocaleString()} messages…`);
     setInfo(`Projecting ${count.toLocaleString()} vectors…`);
 }
 
@@ -392,6 +402,7 @@ function handleMapDataReady(msg) {
     clusterSizes = new Uint32Array(msg.clusterSizesBuffer || new ArrayBuffer(0));
     bounds = msg.bounds || { minX: -1, maxX: 1, minY: -1, maxY: 1 };
 
+    hideLoading();
     initializeCamera(bounds);
     buildGridIndex();
     rebuildRenderBuffers();
@@ -627,6 +638,15 @@ function createOverlay() {
     emptyEl.style.display = 'none';
     overlayEl.appendChild(emptyEl);
 
+    loadingEl = document.createElement('div');
+    loadingEl.className = 'chat-manager-semantic-map-loading';
+    loadingEl.style.display = 'none';
+    loadingEl.innerHTML = `
+        <div class="chat-manager-spinner"></div>
+        <div class="chat-manager-semantic-map-loading-text"></div>
+    `;
+    overlayEl.appendChild(loadingEl);
+
     container.appendChild(overlayEl);
 
     updateLodButtonLabel();
@@ -761,6 +781,18 @@ function showEmpty(message) {
 function hideEmpty() {
     if (!emptyEl) return;
     emptyEl.style.display = 'none';
+}
+
+function showLoading(message) {
+    if (!loadingEl) return;
+    const textEl = loadingEl.querySelector('.chat-manager-semantic-map-loading-text');
+    if (textEl) textEl.textContent = message || 'Loading…';
+    loadingEl.style.display = '';
+}
+
+function hideLoading() {
+    if (!loadingEl) return;
+    loadingEl.style.display = 'none';
 }
 
 function setInfo(text) {

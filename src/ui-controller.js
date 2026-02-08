@@ -385,8 +385,6 @@ function getMessageEmbeddingCandidates(entries) {
 
         if (!(entry.messageEmbeddings instanceof Map)) {
             entry.messageEmbeddings = new Map();
-        } else {
-            entry.messageEmbeddings.clear();
         }
 
         for (const msg of entry.messages) {
