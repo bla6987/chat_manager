@@ -12,7 +12,8 @@
 import { buildIcicleData, reLayoutSubtree } from './icicle-data.js';
 import { getIndex } from './chat-reader.js';
 import { getDisplayName, getEmbeddingSettings, setEmbeddingSettings } from './metadata-store.js';
-import { clusterColor, gradientColor, topicShiftScores } from './semantic-engine.js';
+import { clusterColor, gradientColor, topicShiftScores, cosineSimilarity } from './semantic-engine.js';
+import { embedText, isEmbeddingConfigured } from './embedding-service.js';
 
 const MODULE_NAME = 'chat_manager';
 const EXTENSION_PATH = '/scripts/extensions/third-party/chat_manager';
@@ -44,6 +45,7 @@ let threadFocusActive = true;
 // Data
 let icicleRoot = null;
 let flatNodes = [];
+let nodesByDepth = new Map();
 let maxDepth = 0;
 let loadedCount = 0;
 let pcaRanges = null;
@@ -123,11 +125,20 @@ let searchInputEl = null;
 let searchPrevBtn = null;
 let searchNextBtn = null;
 let searchCounterEl = null;
+let searchModeBtnEl = null;
 let searchQuery = '';
 let searchMatches = [];
 let searchMatchSet = new Set();
 let searchMatchIndex = -1;
 let searchDebounceTimer = null;
+let searchModeSemantic = false;
+
+// Semantic search heatmap state (graph view)
+let semanticSearchScores = new Map(); // node → similarity score
+let semanticSearchActive = false;
+let semanticSearchMin = 0;
+let semanticSearchMax = 0;
+let semanticQueryCache = new Map(); // query string → vector
 
 // Callbacks
 let onJumpToChat = null;
@@ -183,10 +194,8 @@ export function mountIcicle(containerEl, mode) {
 
     container = containerEl;
     currentMode = mode;
-    container.innerHTML = '';
-    container.style.position = 'relative';
 
-    // Build data
+    // Build data FIRST (loading spinner still visible in container)
     const settings = getEmbeddingSettings();
     colorMode = settings.colorMode || 'structural';
     if (!['structural', 'cluster', 'gradient'].includes(colorMode)) {
@@ -204,6 +213,7 @@ export function mountIcicle(containerEl, mode) {
     maxDepth = data.maxDepth;
     loadedCount = data.loadedCount;
     pcaRanges = data.pcaRanges || null;
+    rebuildDepthIndex();
     viewX = 0;
     viewY0 = 0;
     viewY1 = 1;
@@ -218,6 +228,10 @@ export function mountIcicle(containerEl, mode) {
         container.innerHTML = '<div class="chat-manager-empty">No loaded chats to visualize.</div>';
         return;
     }
+
+    // NOW clear container and build DOM (data is ready)
+    container.innerHTML = '';
+    container.style.position = 'relative';
 
     // Create search bar (inserted first so it sits above canvas)
     createSearchBar();
@@ -347,6 +361,7 @@ export function unmountIcicle() {
     currentMode = null;
     icicleRoot = null;
     flatNodes = [];
+    nodesByDepth = new Map();
     zoomStack = [];
     zoomRoot = null;
     exploreRoot = null;
@@ -382,6 +397,7 @@ export function updateIcicleData() {
     maxDepth = data.maxDepth;
     loadedCount = data.loadedCount;
     pcaRanges = data.pcaRanges || null;
+    rebuildDepthIndex();
     zoomStack = [];
     zoomRoot = null;
     exploreRoot = null;
@@ -439,8 +455,10 @@ export async function expandToFullScreen() {
     document.addEventListener('keydown', modal._escHandler);
 
     requestAnimationFrame(() => {
-        if (!modal.classList.contains('visible')) return;
-        mountIcicle(modalContainer, 'full');
+        requestAnimationFrame(() => {
+            if (!modal.classList.contains('visible')) return;
+            mountIcicle(modalContainer, 'full');
+        });
     });
 }
 
@@ -491,7 +509,27 @@ function createSearchBar() {
     searchCounterEl = document.createElement('span');
     searchCounterEl.className = 'chat-manager-icicle-search-counter';
 
+    // Semantic search toggle button
+    searchModeBtnEl = document.createElement('button');
+    searchModeBtnEl.className = 'chat-manager-btn chat-manager-icicle-search-mode';
+    searchModeBtnEl.title = 'Toggle semantic search (heatmap)';
+    updateSearchModeBtn();
+    if (!isEmbeddingConfigured()) {
+        searchModeBtnEl.disabled = true;
+        searchModeBtnEl.title = 'Embeddings not configured';
+    }
+    searchModeBtnEl.addEventListener('click', (e) => {
+        e.stopPropagation();
+        searchModeSemantic = !searchModeSemantic;
+        updateSearchModeBtn();
+        // Re-run search with new mode
+        if (searchInputEl && searchInputEl.value.trim().length >= 2) {
+            executeSearch(searchInputEl.value);
+        }
+    });
+
     searchBarEl.appendChild(searchInputEl);
+    searchBarEl.appendChild(searchModeBtnEl);
     searchBarEl.appendChild(searchPrevBtn);
     searchBarEl.appendChild(searchNextBtn);
     searchBarEl.appendChild(searchCounterEl);
@@ -528,6 +566,12 @@ function createSearchBar() {
     });
 }
 
+function updateSearchModeBtn() {
+    if (!searchModeBtnEl) return;
+    searchModeBtnEl.textContent = searchModeSemantic ? '\u{1F9E0}' : 'Aa';
+    searchModeBtnEl.classList.toggle('active', searchModeSemantic);
+}
+
 function executeSearch(raw) {
     const query = raw.toLowerCase().trim();
     searchQuery = query;
@@ -536,10 +580,18 @@ function executeSearch(raw) {
         searchMatches = [];
         searchMatchSet = new Set();
         searchMatchIndex = -1;
+        clearSemanticSearchState();
         updateSearchUI();
         render();
         return;
     }
+
+    if (searchModeSemantic && query.length >= 3) {
+        executeSemanticSearch(query);
+        return;
+    }
+
+    clearSemanticSearchState();
 
     searchMatches = flatNodes.filter(n => n.normalizedText && n.normalizedText.toLowerCase().includes(query));
 
@@ -552,6 +604,91 @@ function executeSearch(raw) {
         return (Number.isFinite(bTime) ? bTime : 0) - (Number.isFinite(aTime) ? aTime : 0);
     });
 
+    searchMatchSet = new Set(searchMatches);
+
+    if (searchMatches.length > 0) {
+        searchMatchIndex = 0;
+        panToMatch();
+    } else {
+        searchMatchIndex = -1;
+    }
+
+    updateSearchUI();
+    render();
+}
+
+function clearSemanticSearchState() {
+    semanticSearchScores = new Map();
+    semanticSearchActive = false;
+    semanticSearchMin = 0;
+    semanticSearchMax = 0;
+}
+
+async function executeSemanticSearch(query) {
+    // Show loading indicator
+    if (searchCounterEl) searchCounterEl.textContent = 'Embedding\u2026';
+
+    let queryVector = semanticQueryCache.get(query);
+    if (!queryVector) {
+        try {
+            queryVector = await embedText(query, { level: 'query' });
+        } catch (err) {
+            console.warn('[chat_manager] Semantic graph search embedding failed:', err);
+            if (searchCounterEl) searchCounterEl.textContent = 'Error';
+            clearSemanticSearchState();
+            return;
+        }
+        semanticQueryCache.set(query, queryVector);
+        if (semanticQueryCache.size > 32) {
+            const firstKey = semanticQueryCache.keys().next().value;
+            semanticQueryCache.delete(firstKey);
+        }
+    }
+
+    // If query changed while we were awaiting, bail
+    if (searchQuery !== query) return;
+
+    const index = getIndex();
+    const scores = new Map();
+    let min = 1, max = 0;
+    let scored = [];
+
+    for (const node of flatNodes) {
+        // Try to find an embedding for this node via any of its chat files
+        let nodeVector = null;
+        for (const chatFile of node.chatFiles) {
+            const entry = index[chatFile];
+            if (!entry || !(entry.messageEmbeddings instanceof Map)) continue;
+            const vec = entry.messageEmbeddings.get(node.depth);
+            if (Array.isArray(vec) && vec.length > 0) {
+                nodeVector = vec;
+                break;
+            }
+        }
+
+        if (!nodeVector) continue;
+
+        let sim = 0;
+        try {
+            sim = cosineSimilarity(queryVector, nodeVector);
+        } catch { continue; }
+
+        if (!Number.isFinite(sim)) continue;
+
+        scores.set(node, sim);
+        if (sim < min) min = sim;
+        if (sim > max) max = sim;
+        scored.push({ node, sim });
+    }
+
+    semanticSearchScores = scores;
+    semanticSearchMin = min;
+    semanticSearchMax = max;
+    semanticSearchActive = true;
+
+    // Populate searchMatches for keyboard navigation — sorted by score descending
+    scored.sort((a, b) => b.sim - a.sim);
+    searchMatches = scored.map(s => s.node);
     searchMatchSet = new Set(searchMatches);
 
     if (searchMatches.length > 0) {
@@ -606,6 +743,8 @@ function updateSearchUI() {
 
     if (searchQuery.length < 2) {
         searchCounterEl.textContent = '';
+    } else if (semanticSearchActive && hasMatches) {
+        searchCounterEl.textContent = `${searchMatchIndex + 1} of ${semanticSearchScores.size} scored`;
     } else if (hasMatches) {
         searchCounterEl.textContent = `${searchMatchIndex + 1} of ${searchMatches.length}`;
     } else {
@@ -623,10 +762,13 @@ function removeSearchBar() {
     searchPrevBtn = null;
     searchNextBtn = null;
     searchCounterEl = null;
+    searchModeBtnEl = null;
     searchQuery = '';
     searchMatches = [];
     searchMatchSet = new Set();
     searchMatchIndex = -1;
+    searchModeSemantic = false;
+    clearSemanticSearchState();
 }
 
 /**
@@ -830,6 +972,12 @@ function resizeCanvas() {
     canvasWidth = container.clientWidth;
     canvasHeight = container.clientHeight;
 
+    if (canvasWidth === 0 || canvasHeight === 0) {
+        // Container not yet laid out — retry next frame
+        requestAnimationFrame(() => { resizeCanvas(); render(); });
+        return;
+    }
+
     // Reserve space for search bar and breadcrumbs
     const searchBarHeight = searchBarEl ? searchBarEl.offsetHeight : 0;
     const breadcrumbHeight = breadcrumbEl ? breadcrumbEl.offsetHeight : 0;
@@ -898,7 +1046,25 @@ function render() {
             : null;
 
         let fillColor;
-        if (effectiveColorMode === 'cluster' && Number.isFinite(node.clusterLabel)) {
+        if (semanticSearchActive) {
+            // Semantic search heatmap: override all color modes
+            const simScore = semanticSearchScores.get(node);
+            if (isHovered) {
+                fillColor = 'rgba(220, 230, 255, 0.9)';
+            } else if (simScore != null) {
+                const range = semanticSearchMax - semanticSearchMin;
+                const t = range > 0 ? (simScore - semanticSearchMin) / range : 1;
+                // Interpolate: dim blue-gray (low) → bright green (high)
+                const hue = 220 + t * (140 - 220);      // 220 → 140
+                const sat = 30 + t * (75 - 30);          // 30% → 75%
+                const light = 35 + t * (55 - 35);        // 35% → 55%
+                const alpha = 0.3 + t * (0.95 - 0.3);    // 0.3 → 0.95
+                fillColor = `hsla(${hue}, ${sat}%, ${light}%, ${alpha})`;
+            } else {
+                // No embedding data for this node
+                fillColor = 'rgba(80, 80, 80, 0.15)';
+            }
+        } else if (effectiveColorMode === 'cluster' && Number.isFinite(node.clusterLabel)) {
             const base = clusterColor(node.clusterLabel);
             if (selectedCluster != null && node.clusterLabel !== selectedCluster) {
                 fillColor = withAlpha(base, 0.15);
@@ -954,7 +1120,14 @@ function render() {
         }
 
         // Search match highlight (outline, since it's a transient indicator)
-        if (searchMatchSet.has(node)) {
+        // In semantic mode, only show the focused match outline (not all scored nodes)
+        if (semanticSearchActive) {
+            if (searchMatchIndex >= 0 && searchMatches[searchMatchIndex] === node) {
+                ctx.strokeStyle = 'rgba(255, 180, 50, 1.0)';
+                ctx.lineWidth = 3;
+                ctx.strokeRect(x + 0.5, y + 0.5, w - 1, h - 1);
+            }
+        } else if (searchMatchSet.has(node)) {
             const isFocused = searchMatches[searchMatchIndex] === node;
             ctx.strokeStyle = isFocused ? 'rgba(255, 180, 50, 1.0)' : 'rgba(255, 180, 50, 0.7)';
             ctx.lineWidth = isFocused ? 3 : 1.5;
@@ -1061,6 +1234,15 @@ function cancelViewportAnim() {
 //  Hit Testing
 // ──────────────────────────────────────────────
 
+function rebuildDepthIndex() {
+    nodesByDepth = new Map();
+    for (const node of flatNodes) {
+        let arr = nodesByDepth.get(node.depth);
+        if (!arr) { arr = []; nodesByDepth.set(node.depth, arr); }
+        arr.push(node);
+    }
+}
+
 function hitTest(px, py) {
     const yStart = viewY0;
     const yEnd = viewY1;
@@ -1070,10 +1252,11 @@ function hitTest(px, py) {
     // Determine depth column (offset for explore mode)
     const depth = Math.floor((px + viewX) / COL_WIDTH) + exploreDepthOffset;
 
-    // Collect candidates at this depth
-    for (const node of flatNodes) {
-        if (node.depth !== depth) continue;
+    // Only iterate candidates at this depth
+    const candidates = nodesByDepth.get(depth);
+    if (!candidates) return null;
 
+    for (const node of candidates) {
         if (node.y1 <= yStart || node.y0 >= yEnd) continue;
 
         const relY0 = (Math.max(node.y0, yStart) - yStart) / ySpan;
@@ -1278,15 +1461,19 @@ function onWheel(e) {
         if (exploreRoot) {
             exploreRoot = null;
             exploreDepthOffset = 0;
-            // Rebuild full data in background, but keep current viewport
-            const activeChatFile = getActiveChatFile ? getActiveChatFile() : null;
-            const chatIndex = getIndex();
-            const data = buildIcicleData(chatIndex, activeChatFile, { threadFocus: threadFocusActive });
-            icicleRoot = data.root;
-            flatNodes = data.flatNodes;
-            maxDepth = data.maxDepth;
-            loadedCount = data.loadedCount;
-            if (searchQuery.length >= 2) executeSearch(searchQuery);
+            // Defer rebuild so current frame renders immediately
+            setTimeout(() => {
+                const activeChatFile = getActiveChatFile ? getActiveChatFile() : null;
+                const chatIndex = getIndex();
+                const data = buildIcicleData(chatIndex, activeChatFile, { threadFocus: threadFocusActive });
+                icicleRoot = data.root;
+                flatNodes = data.flatNodes;
+                maxDepth = data.maxDepth;
+                loadedCount = data.loadedCount;
+                rebuildDepthIndex();
+                if (searchQuery.length >= 2) executeSearch(searchQuery);
+                render();
+            }, 0);
         }
         updateBreadcrumbs();
 
@@ -1666,6 +1853,7 @@ function exploreThread(node) {
     exploreDepthOffset = result.depthOffset;
     flatNodes = result.flatNodes;
     maxDepth = result.maxDepth;
+    rebuildDepthIndex();
 
     // Reset zoom and viewport
     zoomStack = [];

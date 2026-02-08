@@ -821,11 +821,13 @@ export function toggleTimeline() {
         const status = document.getElementById('chat-manager-status');
         if (status) status.textContent = 'Loading timeline\u2026';
 
-        // Defer mount to next frame
+        // Defer mount past reflow (double-rAF ensures CSS class change has reflowed)
         requestAnimationFrame(() => {
-            if (!timelineActive) return;
-            if (content) mountIcicle(content, 'mini');
-            if (status) status.textContent = 'Timeline view';
+            requestAnimationFrame(() => {
+                if (!timelineActive) return;
+                if (content) mountIcicle(content, 'mini');
+                if (status) status.textContent = 'Timeline view';
+            });
         });
     } else {
         // Dismiss modal if open, then tear down
@@ -2250,7 +2252,28 @@ async function performSemanticSearch(trimmed, requestId) {
     }
 
     scored.sort((a, b) => b.combinedScore - a.combinedScore);
-    const limited = scored.slice(0, HYBRID_SEARCH_LIMIT);
+
+    // Deduplicate: group by messageIndex:textLower, keep highest-scoring entry
+    const dedupMap = new Map();
+    const deduped = [];
+    for (const entry of scored) {
+        const msg = entry.item;
+        const textLower = msg.textLower || (msg.textLower = msg.text.toLowerCase());
+        const dedupKey = `${msg.index}:${textLower}`;
+        const existingIdx = dedupMap.get(dedupKey);
+        if (existingIdx != null) {
+            const existing = deduped[existingIdx];
+            if (!existing.otherFiles) existing.otherFiles = [];
+            if (existing.item.filename !== msg.filename && !existing.otherFiles.includes(msg.filename)) {
+                existing.otherFiles.push(msg.filename);
+            }
+        } else {
+            dedupMap.set(dedupKey, deduped.length);
+            deduped.push({ ...entry, otherFiles: [] });
+        }
+    }
+
+    const limited = deduped.slice(0, HYBRID_SEARCH_LIMIT);
 
     searchState = {
         query: trimmed,
@@ -2258,7 +2281,7 @@ async function performSemanticSearch(trimmed, requestId) {
         searchable,
         position: searchable.length,
         results: limited,
-        totalMatches: scored.length,
+        totalMatches: deduped.length,
         exhausted: true,
         mode: 'semantic',
     };
@@ -2282,6 +2305,7 @@ function performKeywordSearch(trimmed) {
         totalMatches: 0,
         exhausted: false,
         mode: 'keyword',
+        dedupMap: new Map(), // key → index in results (for deduplication)
     };
 
     searchMoreResults(RESULTS_PAGE_SIZE);
@@ -2319,7 +2343,13 @@ function setSearchStatus(queryText) {
     const status = document.getElementById('chat-manager-status');
     if (!status || !searchState) return;
 
-    const threadSet = new Set(searchState.results.map(r => r.item.filename));
+    const threadSet = new Set();
+    for (const r of searchState.results) {
+        threadSet.add(r.item.filename);
+        if (r.otherFiles) {
+            for (const f of r.otherFiles) threadSet.add(f);
+        }
+    }
     const countLabel = searchState.exhausted
         ? `Found ${searchState.totalMatches} match${searchState.totalMatches !== 1 ? 'es' : ''}`
         : `Found ${searchState.totalMatches}+ match${searchState.totalMatches !== 1 ? 'es' : ''}`;
@@ -2335,7 +2365,7 @@ function setSearchStatus(queryText) {
 function searchMoreResults(count) {
     if (!searchState || searchState.exhausted) return;
 
-    const { lowerQuery, searchable } = searchState;
+    const { lowerQuery, searchable, dedupMap } = searchState;
     let found = 0;
 
     while (searchState.position < searchable.length && found < count) {
@@ -2343,9 +2373,21 @@ function searchMoreResults(count) {
         const textLower = msg.textLower || (msg.textLower = msg.text.toLowerCase());
         const matchIndex = textLower.indexOf(lowerQuery);
         if (matchIndex !== -1) {
-            searchState.results.push({ item: msg, matchIndex });
-            searchState.totalMatches++;
-            found++;
+            const dedupKey = `${msg.index}:${textLower}`;
+            const existingIdx = dedupMap?.get(dedupKey);
+            if (existingIdx != null) {
+                // Duplicate — append filename to existing result's otherFiles
+                const existing = searchState.results[existingIdx];
+                if (!existing.otherFiles) existing.otherFiles = [];
+                if (existing.item.filename !== msg.filename && !existing.otherFiles.includes(msg.filename)) {
+                    existing.otherFiles.push(msg.filename);
+                }
+            } else {
+                if (dedupMap) dedupMap.set(dedupKey, searchState.results.length);
+                searchState.results.push({ item: msg, matchIndex, otherFiles: [] });
+                searchState.totalMatches++;
+                found++;
+            }
         }
         searchState.position++;
     }
@@ -2366,6 +2408,7 @@ function renderSearchPage(container, fromIndex) {
     const { DOMPurify, moment } = SillyTavern.libs;
     const prevChatJumpButtonCount = container.querySelectorAll('.chat-manager-jump-btn').length;
     const prevGraphJumpButtonCount = container.querySelectorAll('.chat-manager-graph-jump-btn').length;
+    const prevDedupBadgeCount = container.querySelectorAll('.chat-manager-dedup-badge').length;
     const end = Math.min(fromIndex + RESULTS_PAGE_SIZE, searchState.results.length);
     let html = '';
 
@@ -2398,10 +2441,18 @@ function renderSearchPage(container, fromIndex) {
             similarityPct = ` · ${Math.round(result.semanticScore * 100)}%`;
         }
 
+        // Dedup badge
+        let dedupBadge = '';
+        if (result.otherFiles && result.otherFiles.length > 0) {
+            const otherNames = result.otherFiles.map(f => escapeAttr(f));
+            dedupBadge = `<span class="chat-manager-dedup-badge" data-other-files="${otherNames.join('|')}" data-msg-index="${item.index}">+ ${result.otherFiles.length} other thread${result.otherFiles.length !== 1 ? 's' : ''}</span>`;
+        }
+
         html += `
         <div class="chat-manager-search-result"${scoreAttr} data-filename="${escapeAttr(item.filename)}" data-msg-index="${item.index}">
             <div class="chat-manager-result-header">
                 <span class="chat-manager-result-thread">${escapeHtml(displayName)}</span>
+                ${dedupBadge}
             </div>
             <div class="chat-manager-result-meta">
                 Message #${item.index} (${roleLabel}${dateStr ? ', ' + dateStr : ''}${similarityPct})
@@ -2483,6 +2534,12 @@ function renderSearchPage(container, fromIndex) {
     const allGraphJumpButtons = container.querySelectorAll('.chat-manager-graph-jump-btn');
     for (let i = prevGraphJumpButtonCount; i < allGraphJumpButtons.length; i++) {
         allGraphJumpButtons[i].addEventListener('click', handleJumpToGraphMessage);
+    }
+
+    // Bind dedup badges (expand/collapse other threads list)
+    const allDedupBadges = container.querySelectorAll('.chat-manager-dedup-badge');
+    for (let i = prevDedupBadgeCount; i < allDedupBadges.length; i++) {
+        allDedupBadges[i].addEventListener('click', handleDedupBadgeClick);
     }
 }
 
@@ -2928,6 +2985,62 @@ async function handleJumpToGraphMessage(e) {
     if (!isLoaded) {
         prioritizeInQueue(filename);
         toastr.info('Loading thread into graph…');
+    }
+}
+
+function handleDedupBadgeClick(e) {
+    e.stopPropagation();
+    const badge = e.currentTarget;
+    const resultEl = badge.closest('.chat-manager-search-result');
+    if (!resultEl) return;
+
+    // Toggle: if already expanded, collapse
+    const existing = resultEl.querySelector('.chat-manager-dedup-list');
+    if (existing) {
+        existing.remove();
+        badge.classList.remove('expanded');
+        return;
+    }
+
+    const otherFilesStr = badge.dataset.otherFiles;
+    const msgIndex = badge.dataset.msgIndex;
+    if (!otherFilesStr) return;
+
+    const files = otherFilesStr.split('|').filter(Boolean);
+    if (files.length === 0) return;
+
+    badge.classList.add('expanded');
+
+    const list = document.createElement('div');
+    list.className = 'chat-manager-dedup-list';
+
+    for (const filename of files) {
+        const displayName = getDisplayName(filename) || filename;
+        const row = document.createElement('div');
+        row.className = 'chat-manager-dedup-item';
+
+        const nameSpan = document.createElement('span');
+        nameSpan.className = 'chat-manager-dedup-item-name';
+        nameSpan.textContent = displayName;
+        row.appendChild(nameSpan);
+
+        const jumpBtn = document.createElement('button');
+        jumpBtn.className = 'chat-manager-btn chat-manager-jump-btn';
+        jumpBtn.dataset.filename = filename;
+        jumpBtn.dataset.msgIndex = msgIndex;
+        jumpBtn.textContent = 'Jump';
+        jumpBtn.addEventListener('click', handleJumpToMessage);
+        row.appendChild(jumpBtn);
+
+        list.appendChild(row);
+    }
+
+    // Insert after the header row
+    const header = resultEl.querySelector('.chat-manager-result-header');
+    if (header && header.nextSibling) {
+        resultEl.insertBefore(list, header.nextSibling);
+    } else {
+        resultEl.appendChild(list);
     }
 }
 
