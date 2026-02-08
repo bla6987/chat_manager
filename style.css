@@ -1306,9 +1306,33 @@
     box-shadow: 0 6px 20px rgba(0, 0, 0, 0.5);
 }
 
+.chat-manager-timeline-popup-header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 8px;
+    margin-bottom: 4px;
+}
+
 .chat-manager-timeline-popup-title {
     font-weight: 600;
-    margin-bottom: 4px;
+}
+
+.chat-manager-timeline-popup-close {
+    background: none;
+    border: none;
+    color: var(--SmartThemeBodyColor, #ccc);
+    opacity: 0.5;
+    font-size: 1.2em;
+    cursor: pointer;
+    padding: 2px 4px;
+    line-height: 1;
+    flex-shrink: 0;
+    transition: opacity 0.15s;
+}
+
+.chat-manager-timeline-popup-close:hover {
+    opacity: 1;
 }
 
 .chat-manager-timeline-popup-run-tag {
@@ -2016,6 +2040,31 @@
         font-size: 0.85em;
     }
 
+    .chat-manager-icicle-search-mode {
+        width: 44px;
+        height: 44px;
+        font-size: 0.9em;
+    }
+
+    .chat-manager-icicle-search-input {
+        padding: 8px 10px;
+        font-size: 0.88em;
+    }
+
+    .chat-manager-icicle-search-bar {
+        gap: 6px;
+        padding: 6px 8px;
+    }
+
+    .chat-manager-timeline-popup-close {
+        width: 44px;
+        height: 44px;
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        font-size: 1.4em;
+    }
+
     .chat-manager-btn {
         min-height: 44px;
         padding: 8px 12px;
@@ -2113,6 +2162,7 @@
 
     .chat-manager-timeline-popup {
         max-width: calc(100vw - 24px);
+        max-height: calc(100dvh - 40px);
         min-width: 160px;
     }
 

@@ -668,7 +668,11 @@ async function executeSemanticSearch(query) {
         for (const chatFile of node.chatFiles) {
             const entry = index[chatFile];
             if (!entry || !(entry.messageEmbeddings instanceof Map)) continue;
-            const vec = entry.messageEmbeddings.get(node.depth);
+            // messageEmbeddings is keyed by msg.index (original chatData position),
+            // not array position — look up the actual message index at this depth
+            const msgObj = Array.isArray(entry.messages) ? entry.messages[node.depth] : null;
+            const embeddingKey = msgObj ? msgObj.index : node.depth;
+            const vec = entry.messageEmbeddings.get(embeddingKey);
             if (Array.isArray(vec) && vec.length > 0) {
                 nodeVector = vec;
                 break;
@@ -2156,7 +2160,10 @@ function showNodePopup(clientX, clientY, node) {
     if (chatFiles.length === 0) return;
 
     let html = '<div class="chat-manager-timeline-popup-inner">';
+    html += '<div class="chat-manager-timeline-popup-header">';
     html += `<div class="chat-manager-timeline-popup-title">Message #${node.depth}</div>`;
+    html += '<button class="chat-manager-timeline-popup-close" title="Close">&times;</button>';
+    html += '</div>';
     html += `<div class="chat-manager-timeline-popup-preview">${escapeHtml(truncateForTooltip(node.representative.text || node.normalizedText, 120))}</div>`;
 
     // Deduplicate chat files
@@ -2209,6 +2216,26 @@ function showNodePopup(clientX, clientY, node) {
         if (popRect.bottom > window.innerHeight - 10) {
             popupEl.style.top = Math.max(10, clientY - popRect.height - 10) + 'px';
         }
+    });
+
+    // Bind close button
+    const closeBtn = popupEl.querySelector('.chat-manager-timeline-popup-close');
+    if (closeBtn) {
+        closeBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            removePopup();
+        });
+    }
+
+    // Click-outside dismiss (delayed to avoid immediate self-dismissal)
+    requestAnimationFrame(() => {
+        if (!popupEl) return;
+        popupEl._outsideHandler = (e) => {
+            if (popupEl && !popupEl.contains(e.target)) {
+                removePopup();
+            }
+        };
+        document.addEventListener('pointerdown', popupEl._outsideHandler, true);
     });
 
     // Bind jump buttons
@@ -2264,6 +2291,9 @@ async function handleEmbedNodeFromPopup(btn, chatFiles) {
 
 function removePopup() {
     if (popupEl) {
+        if (popupEl._outsideHandler) {
+            document.removeEventListener('pointerdown', popupEl._outsideHandler, true);
+        }
         popupEl.remove();
         popupEl = null;
     }
