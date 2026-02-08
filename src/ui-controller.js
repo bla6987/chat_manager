@@ -38,7 +38,7 @@ import {
 import {
     embedText, embedTexts, getCachedEmbeddingForText, hashEmbeddingText, isEmbeddingConfigured,
 } from './embedding-service.js';
-import { clusterColor, cosineSimilarity, findOptimalK, kMeans, topicShiftScores } from './semantic-engine.js';
+import { clusterColor, cosineSimilarity, findOptimalK, findOptimalKAsync, kMeans, kMeansAsync, topicShiftScores } from './semantic-engine.js';
 
 const MODULE_NAME = 'chat_manager';
 const HYBRID_SEARCH_MIN_CHARS = 5;
@@ -252,14 +252,14 @@ function shouldRedetectK(chatCount) {
     return delta > RECLUSTER_CHAT_DELTA_RATIO;
 }
 
-function runDebouncedRecluster() {
+async function runDebouncedRecluster() {
     clearReclusterTimer();
     const index = getIndex();
     const chatCount = Object.values(index).filter(entry => Array.isArray(entry.chatEmbedding) && entry.chatEmbedding.length > 0).length;
     const reuseK = !shouldRedetectK(chatCount);
     const fixedK = reuseK ? lastClusterK : null;
 
-    const result = recomputeEmbeddingClusters({ fixedK });
+    const result = await recomputeEmbeddingClusters({ fixedK });
     pendingClusterChanges = 0;
     lastClusterResult = result.clusterCount;
     refreshAfterEmbeddingUpdate();
@@ -325,6 +325,10 @@ function getDriftSummary(entry) {
         firstMsgIndex: all[0],
     };
     driftSummaryCache.set(cacheKey, summary);
+    if (driftSummaryCache.size > 128) {
+        const firstKey = driftSummaryCache.keys().next().value;
+        driftSummaryCache.delete(firstKey);
+    }
     return summary;
 }
 
@@ -421,7 +425,7 @@ function threadNeedsEmbeddings(fileName) {
     return false;
 }
 
-function recomputeEmbeddingClusters(options = {}) {
+async function recomputeEmbeddingClusters(options = {}) {
     const index = getIndex();
     const entries = Object.values(index);
     const embeddedEntries = entries.filter(entry => Array.isArray(entry.chatEmbedding) && entry.chatEmbedding.length > 0);
@@ -445,13 +449,13 @@ function recomputeEmbeddingClusters(options = {}) {
     const vectors = embeddedEntries.map(entry => entry.chatEmbedding);
     let k = Number.isFinite(options.fixedK) && options.fixedK > 0
         ? Math.floor(options.fixedK)
-        : findOptimalK(vectors, 8);
+        : await findOptimalKAsync(vectors, 8);
     if (!Number.isFinite(k) || k < 1) {
         k = Math.min(5, Math.ceil(embeddedEntries.length / 3));
     }
     k = Math.max(1, Math.min(Math.floor(k), embeddedEntries.length));
 
-    const { labels } = kMeans(vectors, k, 50);
+    const { labels } = await kMeansAsync(vectors, k, 50);
     for (let i = 0; i < embeddedEntries.length; i++) {
         embeddedEntries[i].clusterLabel = labels[i] ?? 0;
     }
@@ -533,7 +537,7 @@ async function runEmbeddingGeneration(targetFileNames = null, options = {}) {
     if (totalWork === 0) {
         let clusters = getCurrentClusterCount();
         if (!options.incremental) {
-            const clusterResult = recomputeEmbeddingClusters();
+            const clusterResult = await recomputeEmbeddingClusters();
             clusters = clusterResult.clusterCount;
             lastClusterResult = clusters;
         }
@@ -632,7 +636,7 @@ async function runEmbeddingGeneration(targetFileNames = null, options = {}) {
     } else {
         clearReclusterTimer();
         pendingClusterChanges = 0;
-        const clusterResult = recomputeEmbeddingClusters();
+        const clusterResult = await recomputeEmbeddingClusters();
         clusters = clusterResult.clusterCount;
         lastClusterResult = clusters;
     }
@@ -2575,56 +2579,53 @@ function buildHighlightedExcerpt(text, query) {
 // ──────────────────────────────────────────────
 
 function bindCardEvents(container) {
-    // Embedding selection scope toggles
-    container.querySelectorAll('.chat-manager-emb-select-cb').forEach(cb => {
-        cb.addEventListener('click', (e) => e.stopPropagation());
-        cb.addEventListener('change', handleEmbeddingSelectionToggle);
-    });
+    container.addEventListener('click', handleCardContainerClick);
+    container.addEventListener('change', handleCardContainerChange);
+}
 
-    // Click on card to switch thread
-    container.querySelectorAll('.chat-manager-display-name').forEach(el => {
-        el.addEventListener('click', handleSwitchThread);
-    });
+function handleCardContainerClick(e) {
+    const target = e.target;
 
-    // Edit display name
-    container.querySelectorAll('.chat-manager-edit-name-btn').forEach(btn => {
-        btn.addEventListener('click', handleEditDisplayName);
-    });
+    // Embedding checkbox — stop propagation so card click doesn't fire
+    if (target.closest('.chat-manager-emb-select-cb')) {
+        e.stopPropagation();
+        return;
+    }
 
-    // Tag assignment
-    container.querySelectorAll('.chat-manager-tag-btn').forEach(btn => {
-        btn.addEventListener('click', handleTagButton);
-    });
+    const displayName = target.closest('.chat-manager-display-name');
+    if (displayName) { handleSwitchThread({ currentTarget: displayName }); return; }
 
-    // AI title
-    container.querySelectorAll('.chat-manager-ai-title-btn').forEach(btn => {
-        btn.addEventListener('click', handleAITitle);
-    });
+    const editNameBtn = target.closest('.chat-manager-edit-name-btn');
+    if (editNameBtn) { handleEditDisplayName({ stopPropagation: () => e.stopPropagation(), currentTarget: editNameBtn }); return; }
 
-    // Rename file
-    container.querySelectorAll('.chat-manager-rename-file-btn').forEach(btn => {
-        btn.addEventListener('click', handleRenameFile);
-    });
+    const tagBtn = target.closest('.chat-manager-tag-btn');
+    if (tagBtn) { handleTagButton({ stopPropagation: () => e.stopPropagation(), currentTarget: tagBtn }); return; }
 
-    // Edit summary
-    container.querySelectorAll('.chat-manager-edit-summary-btn').forEach(btn => {
-        btn.addEventListener('click', handleEditSummary);
-    });
+    const aiTitleBtn = target.closest('.chat-manager-ai-title-btn');
+    if (aiTitleBtn) { handleAITitle({ stopPropagation: () => e.stopPropagation(), currentTarget: aiTitleBtn }); return; }
 
-    // Regenerate summary
-    container.querySelectorAll('.chat-manager-regen-summary-btn').forEach(btn => {
-        btn.addEventListener('click', handleRegenSummary);
-    });
+    const renameBtn = target.closest('.chat-manager-rename-file-btn');
+    if (renameBtn) { handleRenameFile({ stopPropagation: () => e.stopPropagation(), currentTarget: renameBtn }); return; }
 
-    // Branch jump
-    container.querySelectorAll('.chat-manager-branch-jump').forEach(btn => {
-        btn.addEventListener('click', handleJumpToGraphMessage);
-    });
+    const editSummaryBtn = target.closest('.chat-manager-edit-summary-btn');
+    if (editSummaryBtn) { handleEditSummary({ stopPropagation: () => e.stopPropagation(), currentTarget: editSummaryBtn }); return; }
 
-    // Drift jump
-    container.querySelectorAll('.chat-manager-drift-jump').forEach(btn => {
-        btn.addEventListener('click', handleJumpToGraphMessage);
-    });
+    const regenBtn = target.closest('.chat-manager-regen-summary-btn');
+    if (regenBtn) { handleRegenSummary({ stopPropagation: () => e.stopPropagation(), currentTarget: regenBtn }); return; }
+
+    const branchJump = target.closest('.chat-manager-branch-jump');
+    if (branchJump) { handleJumpToGraphMessage({ stopPropagation: () => e.stopPropagation(), currentTarget: branchJump }); return; }
+
+    const driftJump = target.closest('.chat-manager-drift-jump');
+    if (driftJump) { handleJumpToGraphMessage({ stopPropagation: () => e.stopPropagation(), currentTarget: driftJump }); return; }
+}
+
+function handleCardContainerChange(e) {
+    const cb = e.target.closest('.chat-manager-emb-select-cb');
+    if (cb) {
+        e.stopPropagation();
+        handleEmbeddingSelectionToggle({ stopPropagation: () => e.stopPropagation(), currentTarget: cb });
+    }
 }
 
 function handleEmbeddingSelectionToggle(e) {

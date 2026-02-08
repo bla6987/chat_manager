@@ -119,6 +119,12 @@ let activeTopicDrift = null;
 let activeTopicDriftChatFile = null;
 const topicDriftCache = new Map();
 
+// rAF coalescing for drag/wheel rendering
+let renderPending = false;
+
+// Debounce for explore-exit rebuild
+let rebuildTimer = null;
+
 // Search state
 let searchBarEl = null;
 let searchInputEl = null;
@@ -189,7 +195,7 @@ export function focusMessageInIcicle(filename, msgIndex, options = {}) {
     return tryApplyPendingFocus();
 }
 
-export function mountIcicle(containerEl, mode) {
+export async function mountIcicle(containerEl, mode) {
     if (mounted) unmountIcicle();
 
     container = containerEl;
@@ -205,7 +211,7 @@ export function mountIcicle(containerEl, mode) {
 
     const activeChatFile = getActiveChatFile ? getActiveChatFile() : null;
     const chatIndex = getIndex();
-    const data = buildIcicleData(chatIndex, activeChatFile, { threadFocus: threadFocusActive });
+    const data = await buildIcicleData(chatIndex, activeChatFile, { threadFocus: threadFocusActive });
     refreshActiveTopicDrift(activeChatFile, chatIndex);
 
     icicleRoot = data.root;
@@ -330,6 +336,9 @@ export function mountIcicle(containerEl, mode) {
 export function unmountIcicle() {
     cancelViewportAnim();
     cancelInertia();
+    clearTimeout(rebuildTimer);
+    rebuildTimer = null;
+    renderPending = false;
     unbindEvents();
     removeTooltip();
     removePopup();
@@ -384,12 +393,12 @@ export function unmountIcicle() {
     mounted = false;
 }
 
-export function updateIcicleData() {
+export async function updateIcicleData() {
     if (!mounted || !canvas) return;
 
     const activeChatFile = getActiveChatFile ? getActiveChatFile() : null;
     const chatIndex = getIndex();
-    const data = buildIcicleData(chatIndex, activeChatFile, { threadFocus: threadFocusActive });
+    const data = await buildIcicleData(chatIndex, activeChatFile, { threadFocus: threadFocusActive });
     refreshActiveTopicDrift(activeChatFile, chatIndex);
 
     icicleRoot = data.root;
@@ -1368,7 +1377,10 @@ function onMouseMove(e) {
             viewY1 = dragStartViewY1 + yShift;
 
             clampViewport();
-            render();
+            if (!renderPending) {
+                renderPending = true;
+                requestAnimationFrame(() => { renderPending = false; render(); });
+            }
             canvas.style.cursor = 'grabbing';
         }
         return;
@@ -1461,11 +1473,12 @@ function onWheel(e) {
         if (exploreRoot) {
             exploreRoot = null;
             exploreDepthOffset = 0;
-            // Defer rebuild so current frame renders immediately
-            setTimeout(() => {
+            // Debounced rebuild so rapid wheel events don't each trigger a full trie rebuild
+            clearTimeout(rebuildTimer);
+            rebuildTimer = setTimeout(async () => {
                 const activeChatFile = getActiveChatFile ? getActiveChatFile() : null;
                 const chatIndex = getIndex();
-                const data = buildIcicleData(chatIndex, activeChatFile, { threadFocus: threadFocusActive });
+                const data = await buildIcicleData(chatIndex, activeChatFile, { threadFocus: threadFocusActive });
                 icicleRoot = data.root;
                 flatNodes = data.flatNodes;
                 maxDepth = data.maxDepth;
@@ -1473,18 +1486,24 @@ function onWheel(e) {
                 rebuildDepthIndex();
                 if (searchQuery.length >= 2) executeSearch(searchQuery);
                 render();
-            }, 0);
+            }, 120);
         }
         updateBreadcrumbs();
 
         clampViewport();
-        render();
+        if (!renderPending) {
+            renderPending = true;
+            requestAnimationFrame(() => { renderPending = false; render(); });
+        }
     } else if (e.shiftKey || Math.abs(e.deltaX) > Math.abs(e.deltaY)) {
         // ── Shift+wheel or horizontal trackpad: horizontal pan ──
         const delta = e.shiftKey ? e.deltaY : e.deltaX;
         viewX += delta;
         clampViewport();
-        render();
+        if (!renderPending) {
+            renderPending = true;
+            requestAnimationFrame(() => { renderPending = false; render(); });
+        }
     } else {
         // ── Plain wheel: vertical pan ──
         const viewSpan = viewY1 - viewY0;
@@ -1492,7 +1511,10 @@ function onWheel(e) {
         viewY0 += yShift;
         viewY1 += yShift;
         clampViewport();
-        render();
+        if (!renderPending) {
+            renderPending = true;
+            requestAnimationFrame(() => { renderPending = false; render(); });
+        }
     }
 }
 
@@ -1591,7 +1613,10 @@ function onTouchMove(e) {
             viewY1 = cursorY + (1 - ratio) * newSpan;
 
             clampViewport();
-            render();
+            if (!renderPending) {
+                renderPending = true;
+                requestAnimationFrame(() => { renderPending = false; render(); });
+            }
         }
         return;
     }
@@ -1617,7 +1642,10 @@ function onTouchMove(e) {
             viewY1 = dragStartViewY1 + yShift;
 
             clampViewport();
-            render();
+            if (!renderPending) {
+                renderPending = true;
+                requestAnimationFrame(() => { renderPending = false; render(); });
+            }
 
             // Track velocity for momentum (use instantaneous movement)
             const now = performance.now();

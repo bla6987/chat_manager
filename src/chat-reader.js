@@ -323,6 +323,13 @@ function normalizeEntryShape(entry) {
         entry.initialOrder = allocateInitialOrder();
     }
 
+    if (!Number.isFinite(entry.firstTimestampMs)) {
+        entry.firstTimestampMs = normalizeTimestamp(entry.firstMessageTimestamp);
+    }
+    if (!Number.isFinite(entry.lastTimestampMs)) {
+        entry.lastTimestampMs = normalizeTimestamp(entry.lastMessageTimestamp);
+    }
+
     if (typeof entry.isLoaded !== 'boolean') {
         entry.isLoaded = entry.messages.length > 0;
     }
@@ -383,13 +390,17 @@ async function hydrateEntry(fileName, sessionId) {
             }
 
             const messages = parseMessages(chatData, fileName);
+            const firstTs = messages.length > 0 ? messages[0].timestamp : null;
+            const lastTs = messages.length > 0 ? messages[messages.length - 1].timestamp : current.lastMessageTimestamp;
 
             chatIndex[fileName] = {
                 ...current,
                 messageCount: messages.length,
                 messages,
-                firstMessageTimestamp: messages.length > 0 ? messages[0].timestamp : null,
-                lastMessageTimestamp: messages.length > 0 ? messages[messages.length - 1].timestamp : current.lastMessageTimestamp,
+                firstMessageTimestamp: firstTs,
+                lastMessageTimestamp: lastTs,
+                firstTimestampMs: normalizeTimestamp(firstTs),
+                lastTimestampMs: normalizeTimestamp(lastTs),
                 branchPoint: null,
                 isLoaded: true,
                 messageEmbeddings: null,
@@ -526,13 +537,16 @@ export async function buildIndex(onProgress, onMetadataReady) {
                 const idbEntry = idbCache.get(fileName);
                 if (idbEntry && idbEntry.lastModified === serverTimestamp && Array.isArray(idbEntry.messages) && idbEntry.messages.length > 0) {
                     changed = true;
+                    const idbLastTs = idbEntry.lastMessageTimestamp || metaLastTimestamp;
                     chatIndex[fileName] = {
                         fileName,
                         lastModified: serverTimestamp,
                         messageCount: idbEntry.messageCount,
                         messages: idbEntry.messages,
                         firstMessageTimestamp: idbEntry.firstMessageTimestamp,
-                        lastMessageTimestamp: idbEntry.lastMessageTimestamp || metaLastTimestamp,
+                        lastMessageTimestamp: idbLastTs,
+                        firstTimestampMs: normalizeTimestamp(idbEntry.firstMessageTimestamp),
+                        lastTimestampMs: normalizeTimestamp(idbLastTs),
                         sortTimestamp: idbEntry.sortTimestamp || serverTimestamp,
                         initialOrder: allocateInitialOrder(),
                         branchPoint: null,
@@ -553,6 +567,8 @@ export async function buildIndex(onProgress, onMetadataReady) {
                     messages: [],
                     firstMessageTimestamp: null,
                     lastMessageTimestamp: metaLastTimestamp,
+                    firstTimestampMs: FALLBACK_SORT_TIMESTAMP,
+                    lastTimestampMs: normalizeTimestamp(metaLastTimestamp),
                     sortTimestamp: serverTimestamp,
                     initialOrder: allocateInitialOrder(),
                     branchPoint: null,
@@ -576,6 +592,7 @@ export async function buildIndex(onProgress, onMetadataReady) {
 
             if (metaLastTimestamp) {
                 cached.lastMessageTimestamp = metaLastTimestamp;
+                cached.lastTimestampMs = normalizeTimestamp(metaLastTimestamp);
             }
 
             if (timestampChanged) {
@@ -587,7 +604,9 @@ export async function buildIndex(onProgress, onMetadataReady) {
                     cached.messages = idbEntry.messages;
                     cached.messageCount = idbEntry.messageCount;
                     cached.firstMessageTimestamp = idbEntry.firstMessageTimestamp;
+                    cached.firstTimestampMs = normalizeTimestamp(idbEntry.firstMessageTimestamp);
                     cached.lastMessageTimestamp = idbEntry.lastMessageTimestamp || metaLastTimestamp;
+                    cached.lastTimestampMs = normalizeTimestamp(cached.lastMessageTimestamp);
                     cached.branchPoint = null;
                     cached.messageEmbeddings = null;
                 } else {
@@ -595,6 +614,7 @@ export async function buildIndex(onProgress, onMetadataReady) {
                     cached.messages = [];
                     cached.branchPoint = null;
                     cached.firstMessageTimestamp = null;
+                    cached.firstTimestampMs = FALLBACK_SORT_TIMESTAMP;
                     cached.messageEmbeddings = null;
                     if (metaMessageCount !== null) {
                         cached.messageCount = metaMessageCount;
@@ -614,7 +634,9 @@ export async function buildIndex(onProgress, onMetadataReady) {
                     cached.messages = idbEntry.messages;
                     cached.messageCount = idbEntry.messageCount;
                     cached.firstMessageTimestamp = idbEntry.firstMessageTimestamp;
+                    cached.firstTimestampMs = normalizeTimestamp(idbEntry.firstMessageTimestamp);
                     cached.lastMessageTimestamp = idbEntry.lastMessageTimestamp || metaLastTimestamp;
+                    cached.lastTimestampMs = normalizeTimestamp(cached.lastMessageTimestamp);
                     cached.branchPoint = null;
                     cached.messageEmbeddings = null;
                     changed = true;
@@ -709,16 +731,20 @@ export async function updateActiveChat(fileName) {
 
         const messages = parseMessages(chatData, fileName);
         const cached = chatIndex[fileName];
+        const firstTimestamp = messages.length > 0 ? messages[0].timestamp : null;
         const lastTimestamp = messages.length > 0 ? messages[messages.length - 1].timestamp : null;
         const parsedLastModified = lastTimestamp ? new Date(lastTimestamp).getTime() : NaN;
         const hasValidLastModified = Number.isFinite(parsedLastModified);
+        const effectiveLastTs = lastTimestamp || cached.lastMessageTimestamp;
 
         chatIndex[fileName] = {
             ...cached,
             messageCount: messages.length,
             messages,
-            firstMessageTimestamp: messages.length > 0 ? messages[0].timestamp : null,
-            lastMessageTimestamp: lastTimestamp || cached.lastMessageTimestamp,
+            firstMessageTimestamp: firstTimestamp,
+            lastMessageTimestamp: effectiveLastTs,
+            firstTimestampMs: normalizeTimestamp(firstTimestamp),
+            lastTimestampMs: normalizeTimestamp(effectiveLastTs),
             lastModified: hasValidLastModified ? parsedLastModified : cached.lastModified,
             sortTimestamp: hasValidLastModified ? parsedLastModified : cached.sortTimestamp,
             branchPoint: null,
@@ -953,7 +979,7 @@ export function getFilteredSortedEntries(filterState, sortState, getChatMetaFn) 
         const from = new Date(filterState.dateFrom).getTime();
         if (Number.isFinite(from)) {
             entries = entries.filter(entry => {
-                const ts = entry.lastMessageTimestamp ? new Date(entry.lastMessageTimestamp).getTime() : entry.sortTimestamp;
+                const ts = entry.lastTimestampMs ?? entry.sortTimestamp;
                 return Number.isFinite(ts) && ts >= from;
             });
         }
@@ -963,7 +989,7 @@ export function getFilteredSortedEntries(filterState, sortState, getChatMetaFn) 
         const to = new Date(filterState.dateTo).getTime() + 86400000;
         if (Number.isFinite(to)) {
             entries = entries.filter(entry => {
-                const ts = entry.firstMessageTimestamp ? new Date(entry.firstMessageTimestamp).getTime() : entry.sortTimestamp;
+                const ts = entry.firstTimestampMs ?? entry.sortTimestamp;
                 return Number.isFinite(ts) && ts <= to;
             });
         }
@@ -998,8 +1024,8 @@ export function getFilteredSortedEntries(filterState, sortState, getChatMetaFn) 
             case 'messageCount':
                 return a.messageCount - b.messageCount;
             case 'created': {
-                const aFirst = a.firstMessageTimestamp ? new Date(a.firstMessageTimestamp).getTime() : FALLBACK_SORT_TIMESTAMP;
-                const bFirst = b.firstMessageTimestamp ? new Date(b.firstMessageTimestamp).getTime() : FALLBACK_SORT_TIMESTAMP;
+                const aFirst = a.firstTimestampMs ?? FALLBACK_SORT_TIMESTAMP;
+                const bFirst = b.firstTimestampMs ?? FALLBACK_SORT_TIMESTAMP;
                 return aFirst - bFirst;
             }
             default:

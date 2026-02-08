@@ -511,6 +511,273 @@ export function gradientColor(pca3dVector, ranges = {}) {
     return `hsl(${hue}, ${saturation}%, ${lightness}%)`;
 }
 
+const YIELD_INTERVAL = 5;
+const yieldToEventLoop = () => new Promise(r => setTimeout(r, 0));
+
+/**
+ * Async k-means — same logic as kMeans but yields every YIELD_INTERVAL iterations.
+ * @param {number[][]} vectors
+ * @param {number} k
+ * @param {number} [maxIter=50]
+ * @returns {Promise<{ labels: number[], centroids: number[][], inertia: number }>}
+ */
+export async function kMeansAsync(vectors, k, maxIter = 50) {
+    const dims = validateVectors(vectors);
+    const n = vectors.length;
+
+    if (n === 0 || k <= 0) {
+        return { labels: [], centroids: [], inertia: 0 };
+    }
+
+    const clusterCount = Math.min(Math.floor(k), n);
+    const centroids = initializeKMeansPlusPlus(vectors, clusterCount);
+    const labels = new Array(n).fill(0);
+
+    let inertia = 0;
+    for (let iter = 0; iter < Math.max(1, Math.floor(maxIter)); iter++) {
+        if (iter > 0 && iter % YIELD_INTERVAL === 0) {
+            await yieldToEventLoop();
+        }
+
+        inertia = 0;
+        const counts = new Array(clusterCount).fill(0);
+        const sums = new Array(clusterCount);
+        const pointDist = new Float64Array(n);
+
+        for (let c = 0; c < clusterCount; c++) {
+            sums[c] = new Float64Array(dims);
+        }
+
+        for (let i = 0; i < n; i++) {
+            let bestLabel = 0;
+            let bestDist = Infinity;
+            for (let c = 0; c < clusterCount; c++) {
+                const d = squaredEuclideanDistance(vectors[i], centroids[c]);
+                if (d < bestDist) {
+                    bestDist = d;
+                    bestLabel = c;
+                }
+            }
+            labels[i] = bestLabel;
+            pointDist[i] = bestDist;
+            inertia += bestDist;
+            counts[bestLabel] += 1;
+
+            const target = sums[bestLabel];
+            const row = vectors[i];
+            for (let d = 0; d < dims; d++) {
+                target[d] += row[d];
+            }
+        }
+
+        let maxShiftSq = 0;
+        for (let c = 0; c < clusterCount; c++) {
+            if (counts[c] === 0) {
+                let farthestIndex = 0;
+                let farthestDist = -1;
+                for (let i = 0; i < n; i++) {
+                    if (pointDist[i] > farthestDist) {
+                        farthestDist = pointDist[i];
+                        farthestIndex = i;
+                    }
+                }
+                centroids[c] = vectors[farthestIndex].slice();
+                continue;
+            }
+
+            const next = new Array(dims);
+            for (let d = 0; d < dims; d++) {
+                next[d] = sums[c][d] / counts[c];
+            }
+            const shiftSq = squaredEuclideanDistance(centroids[c], next);
+            if (shiftSq > maxShiftSq) maxShiftSq = shiftSq;
+            centroids[c] = next;
+        }
+
+        if (maxShiftSq < CONVERGENCE_THRESHOLD * CONVERGENCE_THRESHOLD) {
+            break;
+        }
+    }
+
+    return { labels, centroids, inertia };
+}
+
+/**
+ * Async findOptimalK — yields between k values.
+ * @param {number[][]} vectors
+ * @param {number} [maxK=8]
+ * @returns {Promise<number>}
+ */
+export async function findOptimalKAsync(vectors, maxK = 8) {
+    const n = Array.isArray(vectors) ? vectors.length : 0;
+    if (n <= 1) return 1;
+
+    validateVectors(vectors);
+
+    const lowerK = 2;
+    const upperK = Math.max(lowerK, Math.min(Math.floor(maxK), n));
+    if (upperK === lowerK) return lowerK;
+
+    const ks = [];
+    const inertias = [];
+    for (let k = lowerK; k <= upperK; k++) {
+        const result = await kMeansAsync(vectors, k, 50);
+        ks.push(k);
+        inertias.push(result.inertia);
+        await yieldToEventLoop();
+    }
+
+    if (inertias.length < 3) {
+        return ks[0];
+    }
+
+    const minInertia = Math.min(...inertias);
+    const maxInertia = Math.max(...inertias);
+    const span = maxInertia - minInertia;
+    if (span <= EPSILON) {
+        return Math.min(5, Math.ceil(n / 3));
+    }
+
+    let bestIdx = -1;
+    let bestScore = -Infinity;
+    for (let i = 1; i < ks.length - 1; i++) {
+        const x = i / (ks.length - 1);
+        const y = (inertias[i] - minInertia) / span;
+        const score = (1 - x) - y;
+        if (score > bestScore) {
+            bestScore = score;
+            bestIdx = i;
+        }
+    }
+
+    if (bestIdx < 0 || bestScore < 0.02) {
+        return Math.min(5, Math.ceil(n / 3));
+    }
+    return ks[bestIdx];
+}
+
+/**
+ * Async PCA projection to 3 dimensions — yields during power iteration.
+ * @param {number[][]} vectors
+ * @returns {Promise<{ projected: number[][], mean: number[], components: number[][] }>}
+ */
+export async function pca3DAsync(vectors) {
+    const dims = validateVectors(vectors);
+    const n = vectors.length;
+    if (n === 0) {
+        return { projected: [], mean: [], components: [] };
+    }
+
+    const mean = new Array(dims).fill(0);
+    for (let i = 0; i < n; i++) {
+        const row = vectors[i];
+        for (let d = 0; d < dims; d++) {
+            mean[d] += row[d];
+        }
+    }
+    for (let d = 0; d < dims; d++) {
+        mean[d] /= n;
+    }
+
+    const centered = new Array(n);
+    for (let i = 0; i < n; i++) {
+        const row = new Array(dims);
+        for (let d = 0; d < dims; d++) {
+            row[d] = vectors[i][d] - mean[d];
+        }
+        centered[i] = row;
+    }
+
+    const cov = new Array(dims);
+    for (let i = 0; i < dims; i++) {
+        cov[i] = new Array(dims).fill(0);
+    }
+
+    for (let r = 0; r < n; r++) {
+        const row = centered[r];
+        for (let i = 0; i < dims; i++) {
+            const vi = row[i];
+            for (let j = i; j < dims; j++) {
+                cov[i][j] += vi * row[j];
+            }
+        }
+    }
+
+    const scale = 1 / Math.max(1, n - 1);
+    for (let i = 0; i < dims; i++) {
+        for (let j = i; j < dims; j++) {
+            const value = cov[i][j] * scale;
+            cov[i][j] = value;
+            cov[j][i] = value;
+        }
+    }
+
+    await yieldToEventLoop();
+
+    const componentCount = Math.min(3, dims);
+    const components = [];
+
+    for (let c = 0; c < componentCount; c++) {
+        const init = new Array(dims).fill(0);
+        init[c % dims] = 1;
+        let v = init;
+
+        for (let iter = 0; iter < POWER_ITER_MAX; iter++) {
+            if (iter > 0 && iter % YIELD_INTERVAL === 0) {
+                await yieldToEventLoop();
+            }
+
+            let w = matrixVectorMultiply(cov, v);
+
+            for (let p = 0; p < components.length; p++) {
+                const u = components[p];
+                const projection = dot(w, u);
+                for (let d = 0; d < dims; d++) {
+                    w[d] -= projection * u[d];
+                }
+            }
+
+            const wNorm = vectorNorm(w);
+            if (wNorm <= EPSILON) break;
+
+            for (let d = 0; d < dims; d++) {
+                w[d] /= wNorm;
+            }
+
+            let diff = 0;
+            for (let d = 0; d < dims; d++) {
+                const delta = w[d] - v[d];
+                diff += delta * delta;
+            }
+            v = w;
+            if (Math.sqrt(diff) <= POWER_ITER_TOL) {
+                break;
+            }
+        }
+
+        const Av = matrixVectorMultiply(cov, v);
+        const eigenvalue = dot(v, Av);
+        if (eigenvalue <= EPSILON) {
+            break;
+        }
+        components.push(v.slice());
+    }
+
+    while (components.length < 3) {
+        components.push(new Array(dims).fill(0));
+    }
+
+    const projected = centered.map(row => {
+        const out = [0, 0, 0];
+        for (let c = 0; c < 3; c++) {
+            out[c] = dot(row, components[c]);
+        }
+        return out;
+    });
+
+    return { projected, mean, components };
+}
+
 /**
  * Topic drift scores between consecutive vectors.
  * @param {number[][]} orderedVectors

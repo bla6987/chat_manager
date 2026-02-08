@@ -24,7 +24,7 @@
  * @property {number} y1 - bottom of vertical span [0,1]
  */
 
-import { pca3D } from './semantic-engine.js';
+import { pca3D, pca3DAsync } from './semantic-engine.js';
 
 /**
  * Normalize message text for trie keying: trim + collapse whitespace.
@@ -70,7 +70,7 @@ function filterToThread(loadedEntries, activeChatFile) {
  * @param {{ threadFocus?: boolean }} [options]
  * @returns {{ root: TrieNode, flatNodes: Array, maxDepth: number, loadedCount: number, pcaRanges: { x: [number, number], y: [number, number], z: [number, number] }|null }}
  */
-export function buildIcicleData(chatIndex, activeChatFile, options = {}) {
+export async function buildIcicleData(chatIndex, activeChatFile, options = {}) {
     const loadedEntries = [];
     for (const [fileName, entry] of Object.entries(chatIndex)) {
         if (entry.isLoaded && entry.messages && entry.messages.length > 0) {
@@ -115,7 +115,7 @@ export function buildIcicleData(chatIndex, activeChatFile, options = {}) {
         }
     }
 
-    const semanticContext = buildSemanticContext(entries);
+    const semanticContext = await buildSemanticContext(entries);
     annotateSemanticFields(root, chatIndex, semanticContext);
 
     // ── Phase 2: Layout computation ──
@@ -153,7 +153,7 @@ function makeNode(normalizedText, role, depth) {
  * @param {Array<{fileName: string, entry: Object}>} entries
  * @returns {{ mean: number[]|null, components: number[][]|null }}
  */
-function buildSemanticContext(entries) {
+async function buildSemanticContext(entries) {
     const vectors = [];
     for (const { entry } of entries) {
         if (Array.isArray(entry.chatEmbedding) && entry.chatEmbedding.length > 0) {
@@ -165,7 +165,7 @@ function buildSemanticContext(entries) {
         return { mean: null, components: null };
     }
 
-    const { mean, components } = pca3D(vectors);
+    const { mean, components } = await pca3DAsync(vectors);
     if (!Array.isArray(mean) || !Array.isArray(components) || components.length === 0) {
         return { mean: null, components: null };
     }
