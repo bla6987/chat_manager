@@ -100,6 +100,21 @@
                 Selected mode uses per-chat checkboxes in Chat Manager plus "Select Visible/Clear Visible" toolbar buttons.
             </small>
 
+            <label class="chat-manager-settings-label chat-manager-settings-sub-label">Swipe Embedding</label>
+            <label class="chat-manager-settings-inline-check">
+                <input id="chat-manager-emb-include-alt-swipes" type="checkbox" />
+                <span>Include alternate swipes in semantic index</span>
+            </label>
+            <small class="chat-manager-settings-desc" style="padding-left: 0;">
+                Active swipe embeds first. Alternate swipes are embedded gradually in background.
+            </small>
+            <label class="chat-manager-settings-label chat-manager-settings-sub-label">Max swipes per message</label>
+            <input id="chat-manager-emb-max-swipes" type="number" min="1" max="64" class="chat-manager-settings-input" />
+            <label class="chat-manager-settings-label chat-manager-settings-sub-label">Background swipe batch size</label>
+            <input id="chat-manager-emb-swipe-batch" type="number" min="1" max="256" class="chat-manager-settings-input" />
+            <label class="chat-manager-settings-label chat-manager-settings-sub-label">Background swipe delay (ms)</label>
+            <input id="chat-manager-emb-swipe-delay" type="number" min="100" max="5000" class="chat-manager-settings-input" />
+
             <div class="chat-manager-emb-actions">
                 <button id="chat-manager-emb-generate" type="button" class="chat-manager-btn">Generate Embeddings</button>
                 <button id="chat-manager-emb-clear-cache" type="button" class="chat-manager-btn">Clear Cache</button>

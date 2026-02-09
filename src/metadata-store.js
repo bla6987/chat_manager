@@ -34,6 +34,10 @@ const DEFAULT_EMBEDDING_SETTINGS = {
     embeddingLevels: { ...DEFAULT_EMBEDDING_LEVELS },
     scopeMode: 'all',
     selectedChatsByAvatar: {},
+    includeAlternateSwipes: false,
+    maxSwipesPerMessage: 8,
+    swipeBackgroundBatchSize: 24,
+    swipeBackgroundDelayMs: 650,
 };
 
 function createDefaultEmbeddingSettings() {
@@ -132,6 +136,25 @@ function normalizeEmbeddingSettings(embeddings) {
             .map(fileName => fileName.trim());
         embeddings.selectedChatsByAvatar[avatar] = Array.from(new Set(normalized));
     }
+
+    if (typeof embeddings.includeAlternateSwipes !== 'boolean') {
+        embeddings.includeAlternateSwipes = DEFAULT_EMBEDDING_SETTINGS.includeAlternateSwipes;
+    }
+
+    const maxSwipesPerMessage = Number(embeddings.maxSwipesPerMessage);
+    embeddings.maxSwipesPerMessage = Number.isFinite(maxSwipesPerMessage)
+        ? Math.max(1, Math.min(64, Math.floor(maxSwipesPerMessage)))
+        : DEFAULT_EMBEDDING_SETTINGS.maxSwipesPerMessage;
+
+    const swipeBackgroundBatchSize = Number(embeddings.swipeBackgroundBatchSize);
+    embeddings.swipeBackgroundBatchSize = Number.isFinite(swipeBackgroundBatchSize)
+        ? Math.max(1, Math.min(256, Math.floor(swipeBackgroundBatchSize)))
+        : DEFAULT_EMBEDDING_SETTINGS.swipeBackgroundBatchSize;
+
+    const swipeBackgroundDelayMs = Number(embeddings.swipeBackgroundDelayMs);
+    embeddings.swipeBackgroundDelayMs = Number.isFinite(swipeBackgroundDelayMs)
+        ? Math.max(100, Math.min(5000, Math.floor(swipeBackgroundDelayMs)))
+        : DEFAULT_EMBEDDING_SETTINGS.swipeBackgroundDelayMs;
 }
 
 /**
@@ -550,7 +573,7 @@ export function setSortState(partial) {
 
 /**
  * Get embedding settings (global, persisted).
- * @returns {{ enabled: boolean, provider: string, apiKey: string, ollamaUrl: string, model: string, dimensions: number|null, colorMode: string, mapEnabled: boolean, mapLodMode: string, mapPointSize: number, mapSimilarityChannel: string, embeddingLevels: { chat: boolean, message: boolean, query: boolean }, scopeMode: string, selectedChatsByAvatar: Record<string, string[]> }}
+ * @returns {{ enabled: boolean, provider: string, apiKey: string, ollamaUrl: string, model: string, dimensions: number|null, colorMode: string, mapEnabled: boolean, mapLodMode: string, mapPointSize: number, mapSimilarityChannel: string, embeddingLevels: { chat: boolean, message: boolean, query: boolean }, scopeMode: string, selectedChatsByAvatar: Record<string, string[]>, includeAlternateSwipes: boolean, maxSwipesPerMessage: number, swipeBackgroundBatchSize: number, swipeBackgroundDelayMs: number }}
  */
 export function getEmbeddingSettings() {
     const settings = getSettings();
@@ -572,7 +595,7 @@ export function getEmbeddingSettings() {
 
 /**
  * Merge and persist embedding settings.
- * @param {Partial<{ enabled: boolean, provider: string, apiKey: string, ollamaUrl: string, model: string, dimensions: number|null, colorMode: string, mapEnabled: boolean, mapLodMode: string, mapPointSize: number, mapSimilarityChannel: string, embeddingLevels: { chat: boolean, message: boolean, query: boolean }, scopeMode: string, selectedChatsByAvatar: Record<string, string[]> }>} partial
+ * @param {Partial<{ enabled: boolean, provider: string, apiKey: string, ollamaUrl: string, model: string, dimensions: number|null, colorMode: string, mapEnabled: boolean, mapLodMode: string, mapPointSize: number, mapSimilarityChannel: string, embeddingLevels: { chat: boolean, message: boolean, query: boolean }, scopeMode: string, selectedChatsByAvatar: Record<string, string[]>, includeAlternateSwipes: boolean, maxSwipesPerMessage: number, swipeBackgroundBatchSize: number, swipeBackgroundDelayMs: number }>} partial
  */
 export function setEmbeddingSettings(partial) {
     const settings = getSettings();

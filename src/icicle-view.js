@@ -10,7 +10,7 @@
  */
 
 import { buildIcicleData, reLayoutSubtree } from './icicle-data.js';
-import { getIndex } from './chat-reader.js';
+import { getIndex, getMessageEmbedding } from './chat-reader.js';
 import { getDisplayName, getEmbeddingSettings, setEmbeddingSettings } from './metadata-store.js';
 import { clusterColor, gradientColor, topicShiftScores, cosineSimilarity } from './semantic-engine.js';
 import { embedText, isEmbeddingConfigured } from './embedding-service.js';
@@ -668,11 +668,10 @@ async function executeSemanticSearch(query) {
         for (const chatFile of node.chatFiles) {
             const entry = index[chatFile];
             if (!entry || !(entry.messageEmbeddings instanceof Map)) continue;
-            // messageEmbeddings is keyed by msg.index (original chatData position),
-            // not array position — look up the actual message index at this depth
+            // Embeddings are keyed by message+swipe variant; use helper against
+            // this depth's source message rather than array position directly.
             const msgObj = Array.isArray(entry.messages) ? entry.messages[node.depth] : null;
-            const embeddingKey = msgObj ? msgObj.index : node.depth;
-            const vec = entry.messageEmbeddings.get(embeddingKey);
+            const vec = msgObj ? getMessageEmbedding(entry, msgObj) : null;
             if (Array.isArray(vec) && vec.length > 0) {
                 nodeVector = vec;
                 break;
@@ -816,7 +815,7 @@ function getTopicDriftForChat(chatFile, chatIndex) {
     const ordered = [];
     for (let depth = 0; depth < entry.messages.length; depth++) {
         const msg = entry.messages[depth];
-        const vector = entry.messageEmbeddings.get(msg.index);
+        const vector = getMessageEmbedding(entry, msg);
         if (!Array.isArray(vector) || vector.length === 0) continue;
         ordered.push({ depth, vector });
     }

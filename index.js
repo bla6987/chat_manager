@@ -436,6 +436,10 @@ function bindEmbeddingSettingsUI(container) {
     const modelStatusEl = container.querySelector('#chat-manager-emb-model-status');
     const colorModeEl = container.querySelector('#chat-manager-emb-color-mode');
     const scopeModeEl = container.querySelector('#chat-manager-emb-scope-mode');
+    const includeAltSwipesEl = container.querySelector('#chat-manager-emb-include-alt-swipes');
+    const maxSwipesEl = container.querySelector('#chat-manager-emb-max-swipes');
+    const swipeBatchEl = container.querySelector('#chat-manager-emb-swipe-batch');
+    const swipeDelayEl = container.querySelector('#chat-manager-emb-swipe-delay');
     const generateBtn = container.querySelector('#chat-manager-emb-generate');
     const clearCacheBtn = container.querySelector('#chat-manager-emb-clear-cache');
     const clearVectorsBtn = container.querySelector('#chat-manager-emb-clear-vectors');
@@ -444,7 +448,7 @@ function bindEmbeddingSettingsUI(container) {
     const progressText = container.querySelector('#chat-manager-emb-progress-text');
     const cacheStatsEl = container.querySelector('#chat-manager-emb-cache-stats');
 
-    if (!enabledEl || !levelChatEl || !levelMessageEl || !levelQueryEl || !providerEl || !apiKeyEl || !ollamaUrlEl || !modelEl || !colorModeEl || !scopeModeEl || !generateBtn || !clearCacheBtn || !clearVectorsBtn) {
+    if (!enabledEl || !levelChatEl || !levelMessageEl || !levelQueryEl || !providerEl || !apiKeyEl || !ollamaUrlEl || !modelEl || !colorModeEl || !scopeModeEl || !includeAltSwipesEl || !maxSwipesEl || !swipeBatchEl || !swipeDelayEl || !generateBtn || !clearCacheBtn || !clearVectorsBtn) {
         return;
     }
 
@@ -663,6 +667,13 @@ function bindEmbeddingSettingsUI(container) {
         modelEl.placeholder = modelPlaceholderByProvider[provider] || modelPlaceholderByProvider.openrouter;
     };
 
+    const updateSwipeEmbeddingControls = () => {
+        const includeAltSwipes = includeAltSwipesEl.checked === true;
+        maxSwipesEl.disabled = !includeAltSwipes;
+        swipeBatchEl.disabled = !includeAltSwipes;
+        swipeDelayEl.disabled = !includeAltSwipes;
+    };
+
     const loadToForm = () => {
         const settings = getEmbeddingSettings();
         const levels = settings.embeddingLevels || {};
@@ -676,7 +687,12 @@ function bindEmbeddingSettingsUI(container) {
         modelEl.value = settings.model || '';
         colorModeEl.value = settings.colorMode || 'cluster';
         scopeModeEl.value = settings.scopeMode || 'all';
+        includeAltSwipesEl.checked = settings.includeAlternateSwipes === true;
+        maxSwipesEl.value = Number.isFinite(Number(settings.maxSwipesPerMessage)) ? String(settings.maxSwipesPerMessage) : '8';
+        swipeBatchEl.value = Number.isFinite(Number(settings.swipeBackgroundBatchSize)) ? String(settings.swipeBackgroundBatchSize) : '24';
+        swipeDelayEl.value = Number.isFinite(Number(settings.swipeBackgroundDelayMs)) ? String(settings.swipeBackgroundDelayMs) : '650';
         updateProviderVisibility();
+        updateSwipeEmbeddingControls();
     };
 
     const persistForm = () => {
@@ -693,6 +709,10 @@ function bindEmbeddingSettingsUI(container) {
             model: modelEl.value.trim(),
             colorMode: colorModeEl.value,
             scopeMode: scopeModeEl.value,
+            includeAlternateSwipes: includeAltSwipesEl.checked,
+            maxSwipesPerMessage: Number(maxSwipesEl.value) || 8,
+            swipeBackgroundBatchSize: Number(swipeBatchEl.value) || 24,
+            swipeBackgroundDelayMs: Number(swipeDelayEl.value) || 650,
         });
     };
 
@@ -791,6 +811,13 @@ function bindEmbeddingSettingsUI(container) {
             renderThreadCards();
         }
     });
+    includeAltSwipesEl.addEventListener('change', () => {
+        updateSwipeEmbeddingControls();
+        persistForm();
+    });
+    maxSwipesEl.addEventListener('change', persistForm);
+    swipeBatchEl.addEventListener('change', persistForm);
+    swipeDelayEl.addEventListener('change', persistForm);
 
     if (loadModelsBtn && modelListEl) {
         loadModelsBtn.addEventListener('click', async () => {
@@ -861,7 +888,10 @@ function bindEmbeddingSettingsUI(container) {
                 const messagePart = Number.isFinite(result?.messageVectors) && result.messageVectors > 0
                     ? `, ${result.messageVectors} messages`
                     : '';
-                toastr.success(`Embeddings updated for ${result.updated} chats${messagePart} (${result.clusters} clusters).`);
+                const queuedSwipePart = Number.isFinite(result?.queuedSwipeVectors) && result.queuedSwipeVectors > 0
+                    ? `, ${result.queuedSwipeVectors} swipe variants queued`
+                    : '';
+                toastr.success(`Embeddings updated for ${result.updated} chats${messagePart}${queuedSwipePart} (${result.clusters} clusters).`);
             }
         } catch (err) {
             console.error(`[${MODULE_NAME}] Failed to generate embeddings:`, err);

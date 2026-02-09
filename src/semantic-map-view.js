@@ -2,7 +2,7 @@
  * Semantic Map View — WebGL-first 2D semantic projection of message embeddings.
  */
 
-import { getIndex } from './chat-reader.js';
+import { getIndex, getMessageEmbedding } from './chat-reader.js';
 import { embedText, isEmbeddingConfigured } from './embedding-service.js';
 import { clusterColor } from './semantic-engine.js';
 import { getDisplayName, getEmbeddingSettings, setEmbeddingSettings } from './metadata-store.js';
@@ -342,7 +342,7 @@ function collectMessageVectors() {
 
         const displayName = getDisplayName(fileName) || fileName;
         for (const msg of entry.messages || []) {
-            const vec = entry.messageEmbeddings.get(msg.index);
+            const vec = getMessageEmbedding(entry, msg);
             if (!Array.isArray(vec) || vec.length === 0) continue;
 
             if (!detectedDims) {

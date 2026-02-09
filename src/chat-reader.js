@@ -36,6 +36,8 @@ let cachedSearchableVersion = -1;
  * @property {string} text
  * @property {string} [textLower] - lazily computed lowercased text for search
  * @property {string} timestamp
+ * @property {string[]} [swipes] - Optional swipe variants for this message
+ * @property {number} [swipeId] - Active swipe index
  */
 
 /**
@@ -53,8 +55,124 @@ let cachedSearchableVersion = -1;
  * @property {number[]|null} chatEmbedding - transient semantic embedding vector for this chat
  * @property {string|null} chatEmbeddingHash - transient content hash for representative chat embedding text
  * @property {number|null} clusterLabel - transient cluster assignment derived from embeddings
- * @property {Map<number, number[]>|null} messageEmbeddings - transient per-message embeddings keyed by message index
+ * @property {Map<string|number, number[]>|null} messageEmbeddings - transient message embeddings keyed by composite variant key or legacy message index
  */
+
+/**
+ * Build a stable composite key for a message swipe variant embedding.
+ * @param {number} messageIndex
+ * @param {number} swipeIndex
+ * @returns {string}
+ */
+export function makeMessageEmbeddingKey(messageIndex, swipeIndex = 0) {
+    const m = Number.isFinite(messageIndex) ? Math.max(0, Math.floor(messageIndex)) : 0;
+    const s = Number.isFinite(swipeIndex) ? Math.max(0, Math.floor(swipeIndex)) : 0;
+    return `m:${m}:s:${s}`;
+}
+
+/**
+ * Get active swipe index for a message.
+ * @param {IndexMessage|any} msg
+ * @returns {number}
+ */
+export function getMessageActiveSwipeIndex(msg) {
+    const raw = Number(msg?.swipeId);
+    if (!Number.isFinite(raw) || raw < 0) return 0;
+    return Math.floor(raw);
+}
+
+/**
+ * Ensure an entry has a usable message embedding map and migrate legacy keys.
+ * @param {ChatIndexEntry|any} entry
+ * @returns {Map<string|number, number[]>}
+ */
+export function ensureMessageEmbeddingMap(entry) {
+    if (!(entry?.messageEmbeddings instanceof Map)) {
+        entry.messageEmbeddings = new Map();
+        return entry.messageEmbeddings;
+    }
+
+    if (entry.messageEmbeddings.size === 0 || !Array.isArray(entry.messages) || entry.messages.length === 0) {
+        return entry.messageEmbeddings;
+    }
+
+    let needsMigration = false;
+    for (const key of entry.messageEmbeddings.keys()) {
+        if (typeof key === 'number') {
+            needsMigration = true;
+            break;
+        }
+    }
+
+    if (!needsMigration) {
+        return entry.messageEmbeddings;
+    }
+
+    const migrated = new Map();
+    for (const msg of entry.messages) {
+        const activeSwipe = getMessageActiveSwipeIndex(msg);
+        const key = makeMessageEmbeddingKey(msg.index, activeSwipe);
+        const legacyValue = entry.messageEmbeddings.get(msg.index);
+        if (Array.isArray(legacyValue) && legacyValue.length > 0) {
+            migrated.set(key, legacyValue);
+        }
+    }
+    // Keep any already-composite entries from mixed maps.
+    for (const [key, value] of entry.messageEmbeddings.entries()) {
+        if (typeof key === 'string' && key.startsWith('m:') && Array.isArray(value) && value.length > 0) {
+            migrated.set(key, value);
+        }
+    }
+
+    entry.messageEmbeddings = migrated;
+    return entry.messageEmbeddings;
+}
+
+/**
+ * Get a message embedding vector, defaulting to the active swipe variant.
+ * Falls back to legacy numeric keying for backward compatibility.
+ * @param {ChatIndexEntry|any} entry
+ * @param {IndexMessage|any} msg
+ * @param {number|null} [swipeIndex=null]
+ * @returns {number[]|null}
+ */
+export function getMessageEmbedding(entry, msg, swipeIndex = null) {
+    if (!entry || !(entry.messageEmbeddings instanceof Map) || !msg) return null;
+
+    const resolvedSwipe = swipeIndex == null ? getMessageActiveSwipeIndex(msg) : Math.max(0, Math.floor(Number(swipeIndex) || 0));
+    const compositeKey = makeMessageEmbeddingKey(msg.index, resolvedSwipe);
+    const fromComposite = entry.messageEmbeddings.get(compositeKey);
+    if (Array.isArray(fromComposite) && fromComposite.length > 0) {
+        return fromComposite;
+    }
+
+    const fromLegacy = entry.messageEmbeddings.get(msg.index);
+    if (Array.isArray(fromLegacy) && fromLegacy.length > 0) {
+        return fromLegacy;
+    }
+
+    if (resolvedSwipe !== 0) {
+        const fallbackPrimary = entry.messageEmbeddings.get(makeMessageEmbeddingKey(msg.index, 0));
+        if (Array.isArray(fallbackPrimary) && fallbackPrimary.length > 0) {
+            return fallbackPrimary;
+        }
+    }
+
+    return null;
+}
+
+/**
+ * Set a message embedding vector for a specific swipe variant.
+ * @param {ChatIndexEntry|any} entry
+ * @param {number} messageIndex
+ * @param {number} swipeIndex
+ * @param {number[]} vector
+ */
+export function setMessageEmbedding(entry, messageIndex, swipeIndex, vector) {
+    if (!entry || !Array.isArray(vector) || vector.length === 0) return;
+    const map = ensureMessageEmbeddingMap(entry);
+    map.set(makeMessageEmbeddingKey(messageIndex, swipeIndex), vector);
+}
 
 /**
  * Fetch list of chat files for the current character.
@@ -124,12 +242,34 @@ function parseMessages(chatData, fileName) {
         // Skip metadata-only entries (no 'mes' field)
         if (!msg || typeof msg.mes !== 'string') continue;
 
+        const rawSwipes = Array.isArray(msg.swipes) ? msg.swipes : null;
+        let swipeId = Number.isFinite(Number(msg.swipe_id)) ? Math.max(0, Math.floor(Number(msg.swipe_id))) : 0;
+        let swipes = null;
+
+        if (rawSwipes && rawSwipes.length > 0) {
+            swipes = rawSwipes.map(swipe => typeof swipe === 'string' ? swipe : '');
+            if (swipeId >= swipes.length) {
+                swipeId = swipes.length - 1;
+            }
+            if (swipeId < 0) {
+                swipeId = 0;
+            }
+            if (swipes[swipeId] !== msg.mes) {
+                swipes[swipeId] = msg.mes;
+            }
+        } else if (msg.mes.trim().length > 0) {
+            swipes = [msg.mes];
+            swipeId = 0;
+        }
+
         messages.push({
             filename: fileName,
             index: i,
             role: msg.is_user ? 'user' : 'assistant',
             text: msg.mes,
             timestamp: msg.send_date || '',
+            swipes: swipes || undefined,
+            swipeId,
         });
     }
     return messages;
@@ -342,7 +482,9 @@ function normalizeEntryShape(entry) {
     if (!Number.isFinite(entry.clusterLabel)) {
         entry.clusterLabel = null;
     }
-    if (!(entry.messageEmbeddings instanceof Map)) {
+    if (entry.messageEmbeddings instanceof Map) {
+        ensureMessageEmbeddingMap(entry);
+    } else {
         entry.messageEmbeddings = null;
     }
 

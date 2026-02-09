@@ -448,6 +448,10 @@
 }
 
 .chat-manager-result-header {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 6px;
     margin-bottom: 4px;
 }
 
@@ -495,13 +499,30 @@
     display: inline-block;
     font-size: 0.75em;
     padding: 1px 6px;
-    margin-left: 6px;
     border-radius: 8px;
     background: rgba(130, 170, 255, 0.15);
     color: rgba(180, 200, 255, 0.85);
     cursor: pointer;
     vertical-align: middle;
     transition: background 0.15s;
+}
+
+.chat-manager-swipe-hit-badge {
+    display: inline-block;
+    font-size: 0.72em;
+    padding: 1px 6px;
+    border-radius: 8px;
+    vertical-align: middle;
+}
+
+.chat-manager-swipe-hit-badge.is-active {
+    background: rgba(109, 209, 164, 0.18);
+    color: rgba(165, 236, 205, 0.95);
+}
+
+.chat-manager-swipe-hit-badge.is-alt {
+    background: rgba(245, 187, 90, 0.2);
+    color: rgba(255, 220, 165, 0.95);
 }
 
 .chat-manager-dedup-badge:hover,

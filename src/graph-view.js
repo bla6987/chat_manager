@@ -10,7 +10,7 @@
  * node repulsion, and velocity damping.
  */
 
-import { getIndex } from './chat-reader.js';
+import { getIndex, getMessageEmbedding } from './chat-reader.js';
 import { embedText, isEmbeddingConfigured } from './embedding-service.js';
 import { clusterColor, cosineSimilarity } from './semantic-engine.js';
 import { getDisplayName, getEmbeddingSettings } from './metadata-store.js';
@@ -297,7 +297,7 @@ function collectMessageVectors() {
 
         const displayName = getDisplayName(fileName) || fileName;
         for (const msg of entry.messages || []) {
-            const vec = entry.messageEmbeddings.get(msg.index);
+            const vec = getMessageEmbedding(entry, msg);
             if (!Array.isArray(vec) || vec.length === 0) continue;
 
             if (!detectedDims) detectedDims = vec.length;

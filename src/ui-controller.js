@@ -6,6 +6,7 @@ import {
     buildIndex, getHydrationProgress, getIndex, getSearchableMessages, getSortedEntries,
     getFilteredSortedEntries, getIndexVersion,
     isHydrationComplete, onHydrationUpdate, prioritizeInQueue, runDeferredBranchDetection,
+    ensureMessageEmbeddingMap, getMessageActiveSwipeIndex, getMessageEmbedding, setMessageEmbedding, makeMessageEmbeddingKey,
 } from './chat-reader.js';
 import {
     getDisplayName, setDisplayName, getSummary, setSummary,
@@ -54,6 +55,7 @@ const HYBRID_SEARCH_LIMIT = 100;
 const RECLUSTER_IDLE_MS = 60000;
 const RECLUSTER_IMMEDIATE_THRESHOLD = 5;
 const RECLUSTER_CHAT_DELTA_RATIO = 0.2;
+const SWIPE_BACKGROUND_EMBED_DELAY_MS = 650;
 
 let panelOpen = false;
 let timelineActive = false;
@@ -79,6 +81,9 @@ let reclusterIdleTimer = null;
 let lastClusterK = null;
 let lastClusterChatCount = 0;
 let lastClusterResult = 0;
+let backgroundSwipeEmbedTimer = null;
+let backgroundSwipeEmbedActive = false;
+const pendingBackgroundSwipeCandidates = new Map();
 let latestSearchRequestId = 0;
 const queryEmbeddingCache = new Map();
 const driftSummaryCache = new Map();
@@ -309,7 +314,7 @@ function getDriftSummary(entry) {
     const vectors = [];
     const msgIndices = [];
     for (const msg of entry.messages) {
-        const vector = entry.messageEmbeddings.get(msg.index);
+        const vector = getMessageEmbedding(entry, msg);
         if (!Array.isArray(vector) || vector.length === 0) continue;
         vectors.push(vector);
         msgIndices.push(msg.index);
@@ -384,24 +389,85 @@ function getRepresentativeEmbeddingText(entry) {
     return text.slice(0, 2000).trim();
 }
 
-function getMessageEmbeddingCandidates(entries) {
+function getEmbeddingOption(settings, key, fallback) {
+    const value = settings?.[key];
+    if (typeof fallback === 'boolean') {
+        return typeof value === 'boolean' ? value : fallback;
+    }
+    if (typeof fallback === 'number') {
+        const numeric = Number(value);
+        return Number.isFinite(numeric) ? numeric : fallback;
+    }
+    return value ?? fallback;
+}
+
+function clampPositiveInt(value, fallback) {
+    const numeric = Number(value);
+    if (!Number.isFinite(numeric) || numeric <= 0) return fallback;
+    return Math.max(1, Math.floor(numeric));
+}
+
+function collectMessageVariantsForEmbedding(msg, settings, mode = 'all') {
+    const variants = [];
+    const activeSwipeIndex = getMessageActiveSwipeIndex(msg);
+    const activeText = typeof msg?.text === 'string' ? msg.text.trim() : '';
+    const includeAlternates = getEmbeddingOption(settings, 'includeAlternateSwipes', false) === true;
+    const maxSwipesPerMessage = clampPositiveInt(getEmbeddingOption(settings, 'maxSwipesPerMessage', 8), 8);
+    const rawSwipes = Array.isArray(msg?.swipes) ? msg.swipes : [];
+
+    const shouldIncludeActive = mode === 'all' || mode === 'active';
+    const shouldIncludeAlternates = includeAlternates && (mode === 'all' || mode === 'alternate');
+
+    if (shouldIncludeActive && activeText.length > 0) {
+        variants.push({
+            swipeIndex: activeSwipeIndex,
+            text: activeText,
+            isActive: true,
+        });
+    }
+
+    if (!shouldIncludeAlternates || rawSwipes.length === 0) {
+        return variants;
+    }
+
+    const limit = Math.min(rawSwipes.length, maxSwipesPerMessage);
+    for (let swipeIndex = 0; swipeIndex < limit; swipeIndex++) {
+        if (swipeIndex === activeSwipeIndex) continue;
+        const swipeText = typeof rawSwipes[swipeIndex] === 'string' ? rawSwipes[swipeIndex].trim() : '';
+        if (!swipeText) continue;
+        variants.push({
+            swipeIndex,
+            text: swipeText,
+            isActive: false,
+        });
+    }
+
+    return variants;
+}
+
+function getMessageEmbeddingCandidates(entries, settings, mode = 'all') {
     const candidates = [];
     for (const entry of entries) {
         if (!entry?.isLoaded || !Array.isArray(entry.messages) || entry.messages.length === 0) continue;
-
-        if (!(entry.messageEmbeddings instanceof Map)) {
-            entry.messageEmbeddings = new Map();
-        }
+        ensureMessageEmbeddingMap(entry);
 
         for (const msg of entry.messages) {
-            const text = typeof msg?.text === 'string' ? msg.text.trim() : '';
-            if (!text) continue;
-            candidates.push({
-                entry,
-                msgIndex: msg.index,
-                text,
-                hash: hashEmbeddingText(text),
-            });
+            const variants = collectMessageVariantsForEmbedding(msg, settings, mode);
+            for (const variant of variants) {
+                const existingVector = getMessageEmbedding(entry, msg, variant.swipeIndex);
+                if (Array.isArray(existingVector) && existingVector.length > 0) continue;
+
+                const key = makeMessageEmbeddingKey(msg.index, variant.swipeIndex);
+                candidates.push({
+                    entry,
+                    msgIndex: msg.index,
+                    swipeIndex: variant.swipeIndex,
+                    key,
+                    text: variant.text,
+                    hash: hashEmbeddingText(variant.text),
+                    isActive: variant.isActive,
+                });
+            }
         }
     }
     return candidates;
@@ -418,7 +484,7 @@ function hasMessageEmbeddingsForAllTextMessages(entry) {
     for (const msg of entry.messages) {
         const text = typeof msg?.text === 'string' ? msg.text.trim() : '';
         if (!text) continue;
-        const vector = entry.messageEmbeddings.get(msg.index);
+        const vector = getMessageEmbedding(entry, msg);
         if (!Array.isArray(vector) || vector.length === 0) return false;
     }
     return true;
@@ -517,22 +583,95 @@ function refreshAfterEmbeddingUpdate() {
     }
 }
 
+function queueBackgroundSwipeCandidates(candidates, settings) {
+    if (!Array.isArray(candidates) || candidates.length === 0) return;
+    for (const candidate of candidates) {
+        if (!candidate?.entry || !candidate?.key) continue;
+        const dedupKey = `${candidate.entry.fileName}:${candidate.key}`;
+        pendingBackgroundSwipeCandidates.set(dedupKey, candidate);
+    }
+
+    const delayMs = clampPositiveInt(getEmbeddingOption(settings, 'swipeBackgroundDelayMs', SWIPE_BACKGROUND_EMBED_DELAY_MS), SWIPE_BACKGROUND_EMBED_DELAY_MS);
+    if (backgroundSwipeEmbedTimer) {
+        clearTimeout(backgroundSwipeEmbedTimer);
+    }
+    backgroundSwipeEmbedTimer = setTimeout(() => {
+        backgroundSwipeEmbedTimer = null;
+        void flushBackgroundSwipeEmbeddings(settings).catch((err) => {
+            console.warn(`[${MODULE_NAME}] Background swipe embedding failed:`, err);
+        });
+    }, delayMs);
+}
+
+async function flushBackgroundSwipeEmbeddings(settings, rerender = false) {
+    if (backgroundSwipeEmbedActive) return;
+    if (pendingBackgroundSwipeCandidates.size === 0) return;
+
+    backgroundSwipeEmbedActive = true;
+    const batchSize = clampPositiveInt(getEmbeddingOption(settings, 'swipeBackgroundBatchSize', 24), 24);
+
+    try {
+        while (pendingBackgroundSwipeCandidates.size > 0) {
+            const batch = Array.from(pendingBackgroundSwipeCandidates.values()).slice(0, batchSize);
+            for (const candidate of batch) {
+                const dedupKey = `${candidate.entry.fileName}:${candidate.key}`;
+                pendingBackgroundSwipeCandidates.delete(dedupKey);
+            }
+            if (batch.length === 0) break;
+
+            const cached = await getCachedEmbeddingsForTexts(batch.map(item => item.text));
+            const pending = [];
+            for (let i = 0; i < batch.length; i++) {
+                const item = batch[i];
+                const cachedVec = cached[i];
+                if (Array.isArray(cachedVec) && cachedVec.length > 0) {
+                    setMessageEmbedding(item.entry, item.msgIndex, item.swipeIndex, cachedVec);
+                } else {
+                    pending.push(item);
+                }
+            }
+
+            if (pending.length > 0) {
+                const vectors = await embedTexts(
+                    pending.map(item => item.text),
+                    { level: 'message' },
+                );
+                for (let i = 0; i < pending.length; i++) {
+                    setMessageEmbedding(pending[i].entry, pending[i].msgIndex, pending[i].swipeIndex, vectors[i]);
+                }
+            }
+        }
+    } finally {
+        backgroundSwipeEmbedActive = false;
+        if (rerender) {
+            refreshAfterEmbeddingUpdate();
+        }
+    }
+}
+
 async function runEmbeddingGeneration(targetFileNames = null, options = {}) {
     const settings = getEmbeddingSettings();
+    if (settings.includeAlternateSwipes !== true) {
+        pendingBackgroundSwipeCandidates.clear();
+        if (backgroundSwipeEmbedTimer) {
+            clearTimeout(backgroundSwipeEmbedTimer);
+            backgroundSwipeEmbedTimer = null;
+        }
+    }
     if (!settings.enabled) {
-        return { updated: 0, total: 0, clusters: 0, skipped: true };
+        return { updated: 0, total: 0, clusters: 0, skipped: true, messageVectors: 0, queuedSwipeVectors: 0 };
     }
     const chatLevelEnabled = isEmbeddingLevelOn(settings, 'chat');
     const messageLevelEnabled = isEmbeddingLevelOn(settings, 'message');
     if (!chatLevelEnabled && !messageLevelEnabled) {
-        return { updated: 0, total: 0, clusters: getCurrentClusterCount(), skipped: true };
+        return { updated: 0, total: 0, clusters: getCurrentClusterCount(), skipped: true, messageVectors: 0, queuedSwipeVectors: 0 };
     }
 
     if (!isEmbeddingConfigured()) {
         if (!options.silent) {
             throw new Error('Embeddings are not fully configured. Set provider, model, and API key if required.');
         }
-        return { updated: 0, total: 0, clusters: 0, skipped: true };
+        return { updated: 0, total: 0, clusters: 0, skipped: true, messageVectors: 0, queuedSwipeVectors: 0 };
     }
 
     if (options.ensureIndex && Object.keys(getIndex()).length === 0) {
@@ -559,7 +698,10 @@ async function runEmbeddingGeneration(targetFileNames = null, options = {}) {
         : [];
 
     const messageCandidates = messageLevelEnabled
-        ? getMessageEmbeddingCandidates(scopedEntries)
+        ? getMessageEmbeddingCandidates(scopedEntries, settings, 'active')
+        : [];
+    const alternateSwipeCandidates = messageLevelEnabled
+        ? getMessageEmbeddingCandidates(scopedEntries, settings, 'alternate')
         : [];
     const totalWork = chatCandidates.length + messageCandidates.length;
     if (totalWork === 0) {
@@ -570,7 +712,7 @@ async function runEmbeddingGeneration(targetFileNames = null, options = {}) {
             lastClusterResult = clusters;
         }
         if (options.rerender !== false) refreshAfterEmbeddingUpdate();
-        return { updated: 0, total: 0, clusters, skipped: true };
+        return { updated: 0, total: 0, clusters, skipped: true, messageVectors: 0, queuedSwipeVectors: 0 };
     }
 
     const onProgress = typeof options.onProgress === 'function' ? options.onProgress : null;
@@ -632,7 +774,7 @@ async function runEmbeddingGeneration(targetFileNames = null, options = {}) {
             const item = messageCandidates[mi];
             const cached = cachedMsgVectors[mi];
             if (cached) {
-                item.entry.messageEmbeddings.set(item.msgIndex, cached);
+                setMessageEmbedding(item.entry, item.msgIndex, item.swipeIndex, cached);
                 completed += 1;
                 if (onProgress) onProgress(completed, totalWork);
             } else {
@@ -655,10 +797,14 @@ async function runEmbeddingGeneration(targetFileNames = null, options = {}) {
 
         for (let i = 0; i < pendingMessages.length; i++) {
             const item = pendingMessages[i];
-            item.entry.messageEmbeddings.set(item.msgIndex, vectors[i]);
+            setMessageEmbedding(item.entry, item.msgIndex, item.swipeIndex, vectors[i]);
         }
         completed += pendingMessages.length;
         if (onProgress) onProgress(completed, totalWork);
+    }
+
+    if (!cacheOnly && alternateSwipeCandidates.length > 0) {
+        queueBackgroundSwipeCandidates(alternateSwipeCandidates, settings);
     }
 
     driftSummaryCache.clear();
@@ -687,6 +833,7 @@ async function runEmbeddingGeneration(targetFileNames = null, options = {}) {
         clusters,
         changedEmbeddings: changedChatEmbeddings,
         messageVectors: messageCandidates.length,
+        queuedSwipeVectors: alternateSwipeCandidates.length,
     };
 }
 
@@ -702,6 +849,12 @@ export async function generateEmbeddingsForCurrentIndex(options = {}) {
 export function clearInMemoryEmbeddings(options = {}) {
     const rerender = options.rerender !== false;
     clearReclusterTimer();
+    if (backgroundSwipeEmbedTimer) {
+        clearTimeout(backgroundSwipeEmbedTimer);
+        backgroundSwipeEmbedTimer = null;
+    }
+    pendingBackgroundSwipeCandidates.clear();
+    backgroundSwipeEmbedActive = false;
     pendingClusterChanges = 0;
     lastClusterK = null;
     lastClusterChatCount = 0;
@@ -798,7 +951,7 @@ async function handleTimelineEmbedNode(chatFiles, onProgress) {
 
     const filesToEmbed = chatFiles.filter(f => threadNeedsEmbeddings(f));
     if (filesToEmbed.length === 0) {
-        return { skipped: true, updated: 0, total: 0, clusters: getCurrentClusterCount(), messageVectors: 0 };
+        return { skipped: true, updated: 0, total: 0, clusters: getCurrentClusterCount(), messageVectors: 0, queuedSwipeVectors: 0 };
     }
 
     toastr.info(`Generating embeddings for ${filesToEmbed.length} thread${filesToEmbed.length > 1 ? 's' : ''}…`);
@@ -814,7 +967,10 @@ async function handleTimelineEmbedNode(chatFiles, onProgress) {
     const messagePart = Number.isFinite(result?.messageVectors) && result.messageVectors > 0
         ? `, ${result.messageVectors} messages`
         : '';
-    toastr.success(`Embeddings updated for ${filesToEmbed.length} thread${filesToEmbed.length > 1 ? 's' : ''}${messagePart} (${result.clusters} clusters).`);
+    const queuedSwipePart = Number.isFinite(result?.queuedSwipeVectors) && result.queuedSwipeVectors > 0
+        ? `, ${result.queuedSwipeVectors} swipe variants queued`
+        : '';
+    toastr.success(`Embeddings updated for ${filesToEmbed.length} thread${filesToEmbed.length > 1 ? 's' : ''}${messagePart}${queuedSwipePart} (${result.clusters} clusters).`);
     return result;
 }
 
@@ -2527,30 +2683,42 @@ async function performSemanticSearch(trimmed, requestId) {
     if (requestId !== latestSearchRequestId) return;
 
     const index = getIndex();
+    const embeddingSettings = getEmbeddingSettings();
     const scored = [];
     for (const msg of searchable) {
         const entry = index[msg.filename];
         if (!entry || !(entry.messageEmbeddings instanceof Map)) continue;
+        const variants = collectMessageVariantsForEmbedding(msg, embeddingSettings, 'all');
+        if (variants.length === 0) continue;
 
-        const msgVector = entry.messageEmbeddings.get(msg.index);
-        if (!Array.isArray(msgVector) || msgVector.length === 0) continue;
+        const activeSwipeIndex = getMessageActiveSwipeIndex(msg);
+        for (const variant of variants) {
+            const msgVector = getMessageEmbedding(entry, msg, variant.swipeIndex);
+            if (!Array.isArray(msgVector) || msgVector.length === 0) continue;
 
-        const textLower = msg.textLower || (msg.textLower = msg.text.toLowerCase());
-        const keywordScore = textLower.includes(lowerQuery) ? 1.0 : 0.0;
+            const variantTextLower = variant.isActive
+                ? (msg.textLower || (msg.textLower = msg.text.toLowerCase()))
+                : variant.text.toLowerCase();
+            const keywordScore = variantTextLower.includes(lowerQuery) ? 1.0 : 0.0;
 
-        let semanticScore = 0;
-        try {
-            semanticScore = cosineSimilarity(queryVector, msgVector);
-        } catch {
-            semanticScore = 0;
+            let semanticScore = 0;
+            try {
+                semanticScore = cosineSimilarity(queryVector, msgVector);
+            } catch {
+                semanticScore = 0;
+            }
+
+            const combinedScore = (0.7 * semanticScore) + (0.3 * keywordScore);
+            scored.push({
+                item: msg,
+                matchIndex: variantTextLower.indexOf(lowerQuery),
+                combinedScore,
+                semanticScore,
+                matchedSwipeIndex: variant.swipeIndex,
+                activeSwipeIndex,
+                isActiveSwipeMatch: variant.swipeIndex === activeSwipeIndex,
+            });
         }
-        const combinedScore = (0.7 * semanticScore) + (0.3 * keywordScore);
-        scored.push({
-            item: msg,
-            matchIndex: textLower.indexOf(lowerQuery),
-            combinedScore,
-            semanticScore,
-        });
     }
 
     scored.sort((a, b) => b.combinedScore - a.combinedScore);
@@ -2558,8 +2726,8 @@ async function performSemanticSearch(trimmed, requestId) {
     // Deduplicate: group by messageIndex:textLower, keep highest-scoring entry
     const dedupMap = new Map();
     const deduped = [];
-    for (const entry of scored) {
-        const msg = entry.item;
+    for (const result of scored) {
+        const msg = result.item;
         const textLower = msg.textLower || (msg.textLower = msg.text.toLowerCase());
         const dedupKey = `${msg.index}:${textLower}`;
         const existingIdx = dedupMap.get(dedupKey);
@@ -2571,7 +2739,7 @@ async function performSemanticSearch(trimmed, requestId) {
             }
         } else {
             dedupMap.set(dedupKey, deduped.length);
-            deduped.push({ ...entry, otherFiles: [] });
+            deduped.push({ ...result, otherFiles: [] });
         }
     }
 
@@ -2743,6 +2911,16 @@ function renderSearchPage(container, fromIndex) {
             similarityPct = ` · ${Math.round(result.semanticScore * 100)}%`;
         }
 
+        let swipeBadge = '';
+        if (isSemantic && typeof result.isActiveSwipeMatch === 'boolean') {
+            if (result.isActiveSwipeMatch) {
+                swipeBadge = '<span class="chat-manager-swipe-hit-badge is-active">Active Swipe</span>';
+            } else if (Number.isFinite(result.matchedSwipeIndex)) {
+                const swipeOrdinal = Number(result.matchedSwipeIndex) + 1;
+                swipeBadge = `<span class="chat-manager-swipe-hit-badge is-alt">Alt Swipe #${swipeOrdinal}</span>`;
+            }
+        }
+
         // Dedup badge
         let dedupBadge = '';
         if (result.otherFiles && result.otherFiles.length > 0) {
@@ -2754,6 +2932,7 @@ function renderSearchPage(container, fromIndex) {
         <div class="chat-manager-search-result"${scoreAttr} data-filename="${escapeAttr(item.filename)}" data-msg-index="${item.index}">
             <div class="chat-manager-result-header">
                 <span class="chat-manager-result-thread">${escapeHtml(displayName)}</span>
+                ${swipeBadge}
                 ${dedupBadge}
             </div>
             <div class="chat-manager-result-meta">
