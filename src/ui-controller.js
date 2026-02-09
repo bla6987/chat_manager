@@ -1377,13 +1377,7 @@ async function handleTimelineJumpToMessage(filename, msgIndex) {
         closePanel();
     }
 
-    // Scroll to message
-    const messageEl = document.querySelector(`#chat .mes[mesid="${msgIndex}"]`);
-    if (messageEl) {
-        messageEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
-        messageEl.classList.add('chat-manager-flash');
-        setTimeout(() => messageEl.classList.remove('chat-manager-flash'), 1500);
-    }
+    await scrollToMessageInChat(msgIndex);
 }
 
 function getIndexingSuffix() {
@@ -3433,13 +3427,7 @@ async function handleJumpToMessage(e) {
         closePanel();
     }
 
-    // Scroll to message
-    const messageEl = document.querySelector(`#chat .mes[mesid="${msgIndex}"]`);
-    if (messageEl) {
-        messageEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
-        messageEl.classList.add('chat-manager-flash');
-        setTimeout(() => messageEl.classList.remove('chat-manager-flash'), 1500);
-    }
+    await scrollToMessageInChat(msgIndex);
 }
 
 async function handleJumpToGraphMessage(e) {
@@ -3533,6 +3521,24 @@ function handleDedupBadgeClick(e) {
 // ──────────────────────────────────────────────
 //  Helpers
 // ──────────────────────────────────────────────
+
+/**
+ * Scroll to a message in the active chat, loading earlier messages if needed.
+ * Uses SillyTavern's built-in /chat-jump which handles message truncation.
+ */
+async function scrollToMessageInChat(msgIndex) {
+    const context = SillyTavern.getContext();
+    try {
+        await context.executeSlashCommandsWithOptions(`/chat-jump ${msgIndex}`);
+    } catch (err) {
+        console.warn(`[${MODULE_NAME}] /chat-jump failed for index ${msgIndex}:`, err);
+        // Fallback: direct scroll if element happens to exist
+        const messageEl = document.querySelector(`#chat .mes[mesid="${msgIndex}"]`);
+        if (messageEl) {
+            messageEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
+        }
+    }
+}
 
 /**
  * Perform a guarded chat switch for jump actions:
