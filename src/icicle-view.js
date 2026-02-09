@@ -2272,10 +2272,16 @@ async function handleEmbedNodeFromPopup(btn, chatFiles) {
 
     const prevText = btn.textContent;
     btn.disabled = true;
-    btn.textContent = 'Embedding…';
+    btn.textContent = 'Embedding… 0%';
+
+    const onProgress = (completed, total) => {
+        if (!btn.isConnected) return;
+        const pct = total > 0 ? Math.round((completed / total) * 100) : 0;
+        btn.textContent = `Embedding… ${pct}%`;
+    };
 
     try {
-        const result = await onEmbedNode(chatFiles);
+        const result = await onEmbedNode(chatFiles, onProgress);
         if (!result || result?.skipped) {
             btn.disabled = false;
             btn.textContent = prevText || 'Embed';

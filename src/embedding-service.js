@@ -5,8 +5,8 @@
 const MODULE_NAME = 'chat_manager';
 const CACHE_DB_NAME = 'ChatManager_Embeddings';
 const CACHE_META_KEY = '__cache_meta__';
-const BATCH_SIZE = 20;
-const API_BATCH_DELAY_MS = 100;
+const BATCH_SIZE = 100;
+const OLLAMA_BATCH_SIZE = 50;
 
 const PROVIDERS = /** @type {const} */ (['openrouter', 'openai', 'ollama']);
 const COLOR_MODES = /** @type {const} */ (['structural', 'cluster', 'gradient']);
@@ -362,6 +362,26 @@ async function embedOllamaSingle(settings, text) {
     return validateVector(payload?.embedding);
 }
 
+/** Flag: does the connected Ollama support /api/embed (batch)? */
+let ollamaBatchSupported = true;
+
+/**
+ * @param {typeof DEFAULT_EMBEDDING_SETTINGS} settings
+ * @param {string[]} texts
+ * @returns {Promise<number[][]>}
+ */
+async function embedOllamaBatch(settings, texts) {
+    const baseUrl = settings.ollamaUrl.replace(/\/+$/, '');
+    const payload = await postJson(`${baseUrl}/api/embed`, {
+        model: settings.model,
+        input: texts,
+    });
+    if (!Array.isArray(payload?.embeddings) || payload.embeddings.length !== texts.length) {
+        throw new Error(`Ollama /api/embed returned ${payload?.embeddings?.length ?? 0} vectors for ${texts.length} texts.`);
+    }
+    return payload.embeddings.map(v => validateVector(v));
+}
+
 /**
  * @param {string} currentProvider
  * @param {string} currentModel
@@ -475,6 +495,47 @@ export async function getCachedEmbeddingForText(text) {
 }
 
 /**
+ * Parallel cache lookups in chunks to avoid overwhelming IndexedDB.
+ * @param {import('localforage')} cache
+ * @param {{hash:string, text:string}[]} items
+ * @param {number} [concurrency]
+ * @returns {Promise<(object|null)[]>}
+ */
+async function batchCacheGet(cache, items, concurrency = 50) {
+    const results = new Array(items.length);
+    for (let i = 0; i < items.length; i += concurrency) {
+        const chunk = items.slice(i, i + concurrency);
+        const values = await Promise.all(chunk.map(item => cache.getItem(item.hash)));
+        for (let j = 0; j < chunk.length; j++) {
+            results[i + j] = values[j];
+        }
+    }
+    return results;
+}
+
+/**
+ * Batch version of getCachedEmbeddingForText — reads many entries in parallel.
+ * @param {string[]} texts
+ * @returns {Promise<(number[]|null)[]>}
+ */
+export async function getCachedEmbeddingsForTexts(texts) {
+    const settings = ensureEmbeddingSettings();
+    const expectedDims = Number.isInteger(settings.dimensions) && settings.dimensions > 0
+        ? settings.dimensions
+        : null;
+
+    const cache = getEmbeddingCache();
+    const items = texts.map(t => {
+        const normalized = String(t ?? '');
+        return { hash: makeTextCacheKey(normalized), text: normalized };
+    });
+    const cached = await batchCacheGet(cache, items);
+    return cached.map((value, i) =>
+        isUsableCacheEntry(value, settings, expectedDims, items[i].text) ? value.vector : null,
+    );
+}
+
+/**
  * Provider dispatch + batching + cache.
  * @param {string[]} texts
  * @param {{ level?: 'chat'|'message'|'query', onProgress?: (completed:number, total:number)=>void, _recovered?: boolean }} [options]
@@ -530,8 +591,11 @@ export async function embedTexts(texts, options = {}) {
         observed: null,
     };
 
-    for (const item of uniqueByText.values()) {
-        const cached = await cache.getItem(item.hash);
+    const uniqueItems = [...uniqueByText.values()];
+    const cachedValues = await batchCacheGet(cache, uniqueItems);
+    for (let ci = 0; ci < uniqueItems.length; ci++) {
+        const item = uniqueItems[ci];
+        const cached = cachedValues[ci];
         if (isUsableCacheEntry(cached, settings, dimensionState.expected, item.text)) {
             updateDimensionState(cached.dims, dimensionState);
             for (const idx of item.indices) {
@@ -546,22 +610,45 @@ export async function embedTexts(texts, options = {}) {
 
     try {
         if (provider === 'ollama') {
-            for (const item of pending) {
+            const batchSize = OLLAMA_BATCH_SIZE;
+            for (let i = 0; i < pending.length; i += batchSize) {
+                const batch = pending.slice(i, i + batchSize);
                 await sleep(0);
-                const vector = await embedOllamaSingle(settings, item.text);
-                const dims = getVectorDimensions(vector);
-                updateDimensionState(dims, dimensionState);
-                await cache.setItem(item.hash, {
-                    vector,
-                    dims,
-                    model: settings.model,
-                    provider: settings.provider,
-                    text: item.text,
-                });
-                for (const idx of item.indices) {
-                    vectors[idx] = vector;
+                let batchVectors;
+                if (ollamaBatchSupported) {
+                    try {
+                        batchVectors = await embedOllamaBatch(settings, batch.map(item => item.text));
+                    } catch {
+                        ollamaBatchSupported = false;
+                        batchVectors = null;
+                    }
                 }
-                completed += item.indices.length;
+                if (!batchVectors) {
+                    // Fallback: sequential single-text calls for this batch
+                    batchVectors = [];
+                    for (const item of batch) {
+                        batchVectors.push(await embedOllamaSingle(settings, item.text));
+                    }
+                }
+                const writes = [];
+                for (let j = 0; j < batch.length; j++) {
+                    const item = batch[j];
+                    const vector = batchVectors[j];
+                    const dims = getVectorDimensions(vector);
+                    updateDimensionState(dims, dimensionState);
+                    writes.push(cache.setItem(item.hash, {
+                        vector,
+                        dims,
+                        model: settings.model,
+                        provider: settings.provider,
+                        text: item.text,
+                    }));
+                    for (const idx of item.indices) {
+                        vectors[idx] = vector;
+                    }
+                    completed += item.indices.length;
+                }
+                await Promise.all(writes);
                 notifyProgress(completed, total, onProgress);
             }
         } else {
@@ -589,9 +676,6 @@ export async function embedTexts(texts, options = {}) {
                 }
                 await Promise.all(writes);
                 notifyProgress(completed, total, onProgress);
-                if (i + BATCH_SIZE < pending.length) {
-                    await sleep(API_BATCH_DELAY_MS);
-                }
             }
         }
     } catch (error) {

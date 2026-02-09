@@ -44,7 +44,7 @@ import {
     isStatsMounted, setStatsCallbacks,
 } from './stats-view.js';
 import {
-    embedText, embedTexts, getCachedEmbeddingForText, hashEmbeddingText, isEmbeddingConfigured,
+    embedText, embedTexts, getCachedEmbeddingForText, getCachedEmbeddingsForTexts, hashEmbeddingText, isEmbeddingConfigured,
 } from './embedding-service.js';
 import { clusterColor, cosineSimilarity, findOptimalK, findOptimalKAsync, kMeans, kMeansAsync, topicShiftScores } from './semantic-engine.js';
 
@@ -580,19 +580,23 @@ async function runEmbeddingGeneration(targetFileNames = null, options = {}) {
     if (onProgress) onProgress(0, totalWork);
 
     const pendingChats = [];
-    for (const item of chatCandidates) {
-        const previousHash = item.entry.chatEmbeddingHash || null;
-        const cached = await getCachedEmbeddingForText(item.text);
-        if (cached) {
-            item.entry.chatEmbedding = cached;
-            item.entry.chatEmbeddingHash = item.hash;
-            if (previousHash !== item.hash) {
-                changedChatEmbeddings += 1;
+    if (chatCandidates.length > 0) {
+        const cachedChatVectors = await getCachedEmbeddingsForTexts(chatCandidates.map(item => item.text));
+        for (let ci = 0; ci < chatCandidates.length; ci++) {
+            const item = chatCandidates[ci];
+            const cached = cachedChatVectors[ci];
+            const previousHash = item.entry.chatEmbeddingHash || null;
+            if (cached) {
+                item.entry.chatEmbedding = cached;
+                item.entry.chatEmbeddingHash = item.hash;
+                if (previousHash !== item.hash) {
+                    changedChatEmbeddings += 1;
+                }
+                completed += 1;
+                if (onProgress) onProgress(completed, totalWork);
+            } else {
+                pendingChats.push(item);
             }
-            completed += 1;
-            if (onProgress) onProgress(completed, totalWork);
-        } else {
-            pendingChats.push(item);
         }
     }
 
@@ -622,14 +626,18 @@ async function runEmbeddingGeneration(targetFileNames = null, options = {}) {
     }
 
     const pendingMessages = [];
-    for (const item of messageCandidates) {
-        const cached = await getCachedEmbeddingForText(item.text);
-        if (cached) {
-            item.entry.messageEmbeddings.set(item.msgIndex, cached);
-            completed += 1;
-            if (onProgress) onProgress(completed, totalWork);
-        } else {
-            pendingMessages.push(item);
+    if (messageCandidates.length > 0) {
+        const cachedMsgVectors = await getCachedEmbeddingsForTexts(messageCandidates.map(item => item.text));
+        for (let mi = 0; mi < messageCandidates.length; mi++) {
+            const item = messageCandidates[mi];
+            const cached = cachedMsgVectors[mi];
+            if (cached) {
+                item.entry.messageEmbeddings.set(item.msgIndex, cached);
+                completed += 1;
+                if (onProgress) onProgress(completed, totalWork);
+            } else {
+                pendingMessages.push(item);
+            }
         }
     }
 
@@ -769,7 +777,7 @@ function canEmbedNodeFromTimeline(chatFiles) {
     return Array.isArray(chatFiles) && chatFiles.some(f => threadNeedsEmbeddings(f));
 }
 
-async function handleTimelineEmbedNode(chatFiles) {
+async function handleTimelineEmbedNode(chatFiles, onProgress) {
     if (!Array.isArray(chatFiles) || chatFiles.length === 0) return null;
 
     const settings = getEmbeddingSettings();
@@ -800,6 +808,7 @@ async function handleTimelineEmbedNode(chatFiles) {
         rerender: true,
         silent: false,
         ignoreScope: true,
+        onProgress,
     }));
 
     const messagePart = Number.isFinite(result?.messageVectors) && result.messageVectors > 0
