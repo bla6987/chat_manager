@@ -198,17 +198,31 @@ function getEmbeddingCache() {
 }
 
 /**
- * FNV-1a hash for stable content keys.
+ * FNV-1a 32-bit hash for stable content keys.
  * @param {string} input
+ * @param {number} [seed]
  * @returns {string}
  */
-function fnv1aHash(input) {
-    let hash = 0x811c9dc5;
+function fnv1aHash32(input, seed = 0x811c9dc5) {
+    let hash = seed >>> 0;
     for (let i = 0; i < input.length; i++) {
         hash ^= input.charCodeAt(i);
         hash = Math.imul(hash, 0x01000193);
     }
-    return `txt_${(hash >>> 0).toString(16).padStart(8, '0')}`;
+    return (hash >>> 0).toString(16).padStart(8, '0');
+}
+
+/**
+ * Build a cache key with two independent 32-bit hashes + length.
+ * This sharply reduces collision risk compared with a single 32-bit hash.
+ * @param {string} text
+ * @returns {string}
+ */
+function makeTextCacheKey(text) {
+    const normalized = String(text ?? '');
+    const h1 = fnv1aHash32(normalized, 0x811c9dc5);
+    const h2 = fnv1aHash32(normalized, 0x9e3779b1);
+    return `txt_${h1}${h2}_${normalized.length.toString(16)}`;
 }
 
 /**
@@ -217,7 +231,7 @@ function fnv1aHash(input) {
  * @returns {string}
  */
 export function hashEmbeddingText(text) {
-    return fnv1aHash(String(text ?? ''));
+    return makeTextCacheKey(String(text ?? ''));
 }
 
 /**
@@ -423,12 +437,15 @@ function updateDimensionState(dims, state) {
  * @param {any} cachedValue
  * @param {typeof DEFAULT_EMBEDDING_SETTINGS} settings
  * @param {number|null} expectedDims
- * @returns {cachedValue is { vector: number[], dims: number, model: string, provider?: string }}
+ * @param {string} text
+ * @returns {cachedValue is { vector: number[], dims: number, model: string, provider?: string, text: string }}
  */
-function isUsableCacheEntry(cachedValue, settings, expectedDims) {
+function isUsableCacheEntry(cachedValue, settings, expectedDims, text) {
     if (!cachedValue || typeof cachedValue !== 'object') return false;
     if (cachedValue.model !== settings.model) return false;
     if (cachedValue.provider && cachedValue.provider !== settings.provider) return false;
+    // Require exact text match to prevent accidental hash collision reuse.
+    if (typeof cachedValue.text !== 'string' || cachedValue.text !== text) return false;
     if (!Array.isArray(cachedValue.vector) || cachedValue.vector.length === 0) return false;
     if (!Number.isInteger(cachedValue.dims) || cachedValue.dims <= 0) return false;
     if (cachedValue.dims !== cachedValue.vector.length) return false;
@@ -443,14 +460,15 @@ function isUsableCacheEntry(cachedValue, settings, expectedDims) {
  */
 export async function getCachedEmbeddingForText(text) {
     const settings = ensureEmbeddingSettings();
+    const normalizedText = String(text ?? '');
     const expectedDims = Number.isInteger(settings.dimensions) && settings.dimensions > 0
         ? settings.dimensions
         : null;
 
     const cache = getEmbeddingCache();
-    const key = fnv1aHash(String(text ?? ''));
+    const key = makeTextCacheKey(normalizedText);
     const cached = await cache.getItem(key);
-    if (!isUsableCacheEntry(cached, settings, expectedDims)) {
+    if (!isUsableCacheEntry(cached, settings, expectedDims, normalizedText)) {
         return null;
     }
     return cached.vector;
@@ -493,15 +511,15 @@ export async function embedTexts(texts, options = {}) {
     notifyProgress(completed, total, onProgress);
 
     /** @type {Map<string, {hash:string, text:string, indices:number[]}>} */
-    const uniqueByHash = new Map();
+    const uniqueByText = new Map();
     for (let i = 0; i < normalizedTexts.length; i++) {
         const text = normalizedTexts[i];
-        const hash = fnv1aHash(text);
-        const existing = uniqueByHash.get(hash);
+        const hash = makeTextCacheKey(text);
+        const existing = uniqueByText.get(text);
         if (existing) {
             existing.indices.push(i);
         } else {
-            uniqueByHash.set(hash, { hash, text, indices: [i] });
+            uniqueByText.set(text, { hash, text, indices: [i] });
         }
     }
 
@@ -512,9 +530,9 @@ export async function embedTexts(texts, options = {}) {
         observed: null,
     };
 
-    for (const item of uniqueByHash.values()) {
+    for (const item of uniqueByText.values()) {
         const cached = await cache.getItem(item.hash);
-        if (isUsableCacheEntry(cached, settings, dimensionState.expected)) {
+        if (isUsableCacheEntry(cached, settings, dimensionState.expected, item.text)) {
             updateDimensionState(cached.dims, dimensionState);
             for (const idx of item.indices) {
                 vectors[idx] = cached.vector;
@@ -538,6 +556,7 @@ export async function embedTexts(texts, options = {}) {
                     dims,
                     model: settings.model,
                     provider: settings.provider,
+                    text: item.text,
                 });
                 for (const idx of item.indices) {
                     vectors[idx] = vector;
@@ -561,6 +580,7 @@ export async function embedTexts(texts, options = {}) {
                         dims,
                         model: settings.model,
                         provider: settings.provider,
+                        text: item.text,
                     }));
                     for (const idx of item.indices) {
                         vectors[idx] = vector;

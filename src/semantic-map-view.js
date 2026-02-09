@@ -238,10 +238,26 @@ export function unmountSemanticMap() {
 export async function updateSemanticMapData() {
     if (!mounted || !container) return;
 
+    const prevRefs = messageRefs;
+    const prevLookup = messageLookup;
+    const prevDims = dims;
     const data = collectMessageVectors();
     if (data.count === 0) {
+        const hydrationInProgress = Object.values(getIndex()).some(entry => entry && !entry.isLoaded);
+        if (prevRefs.length > 0 && hydrationInProgress) {
+            messageRefs = prevRefs;
+            messageLookup = prevLookup;
+            dims = prevDims;
+            hideLoading();
+            hideEmpty();
+            setInfo('Indexing chats… keeping existing map');
+            queueRender();
+            return;
+        }
         hideLoading();
+        clearMapDataState();
         showEmpty('No message embeddings found. Generate message embeddings to use Semantic Map.');
+        setInfo('0 points');
         return;
     }
 
@@ -295,6 +311,11 @@ function ensureWorker() {
                 setInfo('Failed to build semantic map.');
             }
             if (msg.jobId === workerScoreJobId) {
+                scoreValues = null;
+                scoreMin = 0;
+                scoreMax = 0;
+                rebuildRenderBuffers();
+                queueRender();
                 setInfo('Semantic query scoring failed.');
             }
         }
@@ -427,6 +448,26 @@ function handleQueryScoresReady(msg) {
     rebuildRenderBuffers();
     const count = getPointCount();
     setInfo(`Scored ${count.toLocaleString()} points for "${queryText}"`);
+    queueRender();
+}
+
+function clearMapDataState() {
+    points2d = new Float32Array(0);
+    labels = new Uint16Array(0);
+    centroids2d = new Float32Array(0);
+    clusterSizes = new Uint32Array(0);
+    bounds = { minX: -1, maxX: 1, minY: -1, maxY: 1 };
+
+    scoreValues = null;
+    scoreMin = 0;
+    scoreMax = 0;
+
+    selectedPointIndices = new Set();
+    activePointIndex = -1;
+    hoveredPointIndex = -1;
+
+    rebuildRenderBuffers();
+    updateJumpButtonState();
     queueRender();
 }
 
@@ -718,6 +759,11 @@ async function runSemanticQuery(query) {
     }
 
     if (!isEmbeddingConfigured()) {
+        scoreValues = null;
+        scoreMin = 0;
+        scoreMax = 0;
+        rebuildRenderBuffers();
+        queueRender();
         setInfo('Embeddings are not configured for semantic query scoring.');
         return;
     }
@@ -729,6 +775,11 @@ async function runSemanticQuery(query) {
             queryVector = await embedText(requestedQuery, { level: 'query' });
         } catch (err) {
             console.warn(`[${MODULE_NAME}] Failed to embed map query:`, err);
+            scoreValues = null;
+            scoreMin = 0;
+            scoreMax = 0;
+            rebuildRenderBuffers();
+            queueRender();
             setInfo('Failed to embed query.');
             return;
         }
@@ -748,7 +799,14 @@ async function runSemanticQuery(query) {
         return;
     }
 
-    if (!worker) return;
+    if (!worker) {
+        scoreValues = null;
+        scoreMin = 0;
+        scoreMax = 0;
+        rebuildRenderBuffers();
+        queueRender();
+        return;
+    }
 
     workerScoreJobId += 1;
     const jobId = workerScoreJobId;

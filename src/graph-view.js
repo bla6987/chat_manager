@@ -237,14 +237,45 @@ export function unmountGraphView() {
 
 export function updateGraphViewData() {
     if (!mounted || !container) return;
+    const prevRefs = messageRefs;
+    const prevVectors = messageVectors;
+    const prevNorms = messageNorms;
+    const prevDims = messageDims;
     collectMessageVectors();
     if (messageRefs.length === 0) {
+        const hydrationInProgress = Object.values(getIndex()).some(entry => entry && !entry.isLoaded);
+        if (prevRefs.length > 0 && hydrationInProgress) {
+            messageRefs = prevRefs;
+            messageVectors = prevVectors;
+            messageNorms = prevNorms;
+            messageDims = prevDims;
+            hideEmpty();
+            setInfo('Indexing chats… keeping existing graph');
+            queueRender();
+            return;
+        }
+        clearGraphDataState();
         showEmpty('No message embeddings found. Generate message embeddings first.');
+        setInfo('No message embeddings available.');
         return;
     }
     hideEmpty();
     // Re-score existing pins against new data
     rebuildSimulation();
+    queueRender();
+}
+
+function clearGraphDataState() {
+    pins = [];
+    nextColorIndex = 0;
+    simNodes = [];
+    simRunning = false;
+    settleCounter = 0;
+    hoveredNodeIndex = -1;
+    selectedNodeIndex = -1;
+    tooltipVisible = false;
+    const existing = container?.querySelector?.('.chat-manager-graph-view-context');
+    if (existing) existing.remove();
     queueRender();
 }
 
