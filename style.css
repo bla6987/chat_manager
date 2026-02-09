@@ -2341,6 +2341,56 @@
 }
 
 /* ══════════════════════════════════════════════
+   Embedding Status & Trigger
+   ══════════════════════════════════════════════ */
+
+/* ── Status Badge ── */
+
+.chat-manager-emb-status {
+    display: inline-flex;
+    align-items: center;
+    font-size: 0.85em;
+    cursor: default;
+}
+
+.chat-manager-emb-status-full {
+    color: rgba(100, 220, 100, 0.85);
+}
+
+.chat-manager-emb-status-partial {
+    color: rgba(255, 200, 50, 0.85);
+}
+
+.chat-manager-emb-status-none {
+    color: rgba(160, 160, 160, 0.5);
+}
+
+/* ── Embed Trigger Button (toolbar) ── */
+
+.chat-manager-emb-trigger-btn {
+    color: rgba(130, 220, 160, 0.95);
+    border-color: rgba(100, 200, 140, 0.35);
+    background: rgba(80, 180, 120, 0.12);
+}
+
+.chat-manager-emb-trigger-btn:hover {
+    background: rgba(80, 180, 120, 0.24);
+    border-color: rgba(100, 200, 140, 0.55);
+}
+
+.chat-manager-emb-trigger-btn:disabled {
+    opacity: 0.45;
+    cursor: default;
+}
+
+/* ── Per-card embed button spinner state ── */
+
+.chat-manager-icon-btn.chat-manager-embedding-active {
+    opacity: 0.8;
+    pointer-events: none;
+}
+
+/* ══════════════════════════════════════════════
    Touch Device Overrides
    Targets devices with coarse pointers (touchscreens)
    ══════════════════════════════════════════════ */

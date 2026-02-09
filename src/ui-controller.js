@@ -118,6 +118,10 @@ export function isBranchContextActive() {
     return branchContextActive;
 }
 
+function isAnyViewActive() {
+    return timelineActive || semanticMapActive || graphViewActive || statsActive;
+}
+
 function canSemanticSearch() {
     const settings = getEmbeddingSettings();
     return isEmbeddingLevelOn(settings, 'message')
@@ -237,6 +241,26 @@ function updateEmbeddingSelectionControls(toolbar = null) {
     clearVisibleBtn.disabled = !selectedScope || selectedVisible === 0;
     selectVisibleBtn.title = `Select ${visibleFiles.length} visible chat${visibleFiles.length !== 1 ? 's' : ''} for embedding scope`;
     clearVisibleBtn.title = `Clear ${selectedVisible} selected visible chat${selectedVisible !== 1 ? 's' : ''}`;
+
+    const triggerBtn = root.querySelector('.chat-manager-emb-trigger-btn');
+    if (triggerBtn) {
+        const chatOn = isEmbeddingLevelOn(settings, 'chat');
+        const msgOn = isEmbeddingLevelOn(settings, 'message');
+        const embEnabled = settings.enabled && (chatOn || msgOn);
+
+        if (!embEnabled) {
+            triggerBtn.style.display = 'none';
+        } else {
+            triggerBtn.style.display = '';
+            const targetFiles = selectedScope ? getSelectedEmbeddingChats() : visibleFiles;
+            const needWork = targetFiles.filter(f => threadNeedsEmbeddings(f));
+            triggerBtn.textContent = selectedScope ? 'Embed Selected' : 'Embed Visible';
+            triggerBtn.disabled = needWork.length === 0;
+            triggerBtn.title = needWork.length > 0
+                ? `Generate embeddings for ${needWork.length} thread${needWork.length !== 1 ? 's' : ''}`
+                : 'All target threads are fully embedded';
+        }
+    }
 }
 
 function shouldUseSemanticSearch(query) {
@@ -503,6 +527,43 @@ function threadNeedsEmbeddings(fileName) {
     if (chatLevelEnabled && !hasChatEmbedding(entry)) return true;
     if (messageLevelEnabled && !hasMessageEmbeddingsForAllTextMessages(entry)) return true;
     return false;
+}
+
+function getEmbeddingStatus(entry) {
+    const settings = getEmbeddingSettings();
+    const chatOn = isEmbeddingLevelOn(settings, 'chat');
+    const msgOn = isEmbeddingLevelOn(settings, 'message');
+    if (!chatOn && !msgOn) return 'disabled';
+    if (!entry?.isLoaded) return 'unknown';
+
+    let enabledCount = 0;
+    let satisfiedCount = 0;
+
+    if (chatOn) {
+        enabledCount++;
+        if (hasChatEmbedding(entry)) satisfiedCount++;
+    }
+    if (msgOn) {
+        enabledCount++;
+        if (hasMessageEmbeddingsForAllTextMessages(entry)) satisfiedCount++;
+    }
+
+    if (satisfiedCount === enabledCount) return 'full';
+    if (satisfiedCount > 0) return 'partial';
+
+    // Check for any partial message embeddings
+    if (msgOn && entry.messageEmbeddings instanceof Map && entry.messageEmbeddings.size > 0) return 'partial';
+
+    return 'none';
+}
+
+function embStatusTitle(status) {
+    switch (status) {
+        case 'full': return 'Fully embedded';
+        case 'partial': return 'Partially embedded';
+        case 'none': return 'Not embedded';
+        default: return '';
+    }
 }
 
 async function recomputeEmbeddingClusters(options = {}) {
@@ -972,6 +1033,92 @@ async function handleTimelineEmbedNode(chatFiles, onProgress) {
         : '';
     toastr.success(`Embeddings updated for ${filesToEmbed.length} thread${filesToEmbed.length > 1 ? 's' : ''}${messagePart}${queuedSwipePart} (${result.clusters} clusters).`);
     return result;
+}
+
+async function handleEmbedSingleCard(e) {
+    e.stopPropagation();
+    const btn = e.currentTarget;
+    const filename = btn?.dataset?.filename;
+    if (!filename) return;
+
+    const settings = getEmbeddingSettings();
+    if (!settings.enabled || (!isEmbeddingLevelOn(settings, 'chat') && !isEmbeddingLevelOn(settings, 'message'))) {
+        toastr.info('Enable semantic embeddings and at least one vector level first.');
+        return;
+    }
+    if (!isEmbeddingConfigured()) {
+        toastr.info('Configure provider/model settings before generating embeddings.');
+        return;
+    }
+    if (!threadNeedsEmbeddings(filename)) {
+        toastr.info('This thread is already fully embedded.');
+        return;
+    }
+
+    btn.classList.remove('fa-bolt');
+    btn.classList.add('fa-spinner', 'fa-spin', 'chat-manager-embedding-active');
+
+    try {
+        const result = await queueEmbeddingRun(() => runEmbeddingGeneration([filename], {
+            ensureIndex: false,
+            rerender: true,
+            silent: false,
+            ignoreScope: true,
+        }));
+
+        const messagePart = Number.isFinite(result?.messageVectors) && result.messageVectors > 0
+            ? `, ${result.messageVectors} messages` : '';
+        const queuedSwipePart = Number.isFinite(result?.queuedSwipeVectors) && result.queuedSwipeVectors > 0
+            ? `, ${result.queuedSwipeVectors} swipe variants queued` : '';
+        toastr.success(`Embeddings generated${messagePart}${queuedSwipePart} (${result.clusters} clusters).`);
+    } catch (err) {
+        console.error(`[${MODULE_NAME}] Per-card embedding failed:`, err);
+        toastr.error(`Embedding failed: ${err.message || err}`);
+        btn.classList.remove('fa-spinner', 'fa-spin', 'chat-manager-embedding-active');
+        btn.classList.add('fa-bolt');
+    }
+}
+
+async function handleToolbarEmbedTrigger() {
+    const settings = getEmbeddingSettings();
+    if (!settings.enabled || (!isEmbeddingLevelOn(settings, 'chat') && !isEmbeddingLevelOn(settings, 'message'))) {
+        toastr.info('Enable semantic embeddings and at least one vector level first.');
+        return;
+    }
+    if (!isEmbeddingConfigured()) {
+        toastr.info('Configure provider/model settings before generating embeddings.');
+        return;
+    }
+
+    const targetFiles = settings.scopeMode === 'selected'
+        ? getSelectedEmbeddingChats()
+        : getVisibleEntryFileNames();
+    const filesToEmbed = targetFiles.filter(f => threadNeedsEmbeddings(f));
+
+    if (filesToEmbed.length === 0) {
+        toastr.info('All target threads are already fully embedded.');
+        return;
+    }
+
+    toastr.info(`Generating embeddings for ${filesToEmbed.length} thread${filesToEmbed.length !== 1 ? 's' : ''}…`);
+
+    try {
+        const result = await queueEmbeddingRun(() => runEmbeddingGeneration(filesToEmbed, {
+            ensureIndex: false,
+            rerender: true,
+            silent: false,
+            ignoreScope: true,
+        }));
+
+        const messagePart = Number.isFinite(result?.messageVectors) && result.messageVectors > 0
+            ? `, ${result.messageVectors} messages` : '';
+        const queuedSwipePart = Number.isFinite(result?.queuedSwipeVectors) && result.queuedSwipeVectors > 0
+            ? `, ${result.queuedSwipeVectors} swipe variants queued` : '';
+        toastr.success(`Embeddings updated for ${filesToEmbed.length} thread${filesToEmbed.length !== 1 ? 's' : ''}${messagePart}${queuedSwipePart} (${result.clusters} clusters).`);
+    } catch (err) {
+        console.error(`[${MODULE_NAME}] Toolbar embedding failed:`, err);
+        toastr.error(`Embedding failed: ${err.message || err}`);
+    }
 }
 
 /**
@@ -1862,7 +2009,7 @@ export async function refreshPanel() {
             searchState = null;
         }
         renderedFromMetadata = true;
-        if (!panelOpen) return;
+        if (!panelOpen || isAnyViewActive()) return;
         renderFromLatestIndex();
     });
 
@@ -1871,7 +2018,7 @@ export async function refreshPanel() {
         searchState = null;
     }
 
-    if (!renderedFromMetadata) {
+    if (!renderedFromMetadata && !isAnyViewActive()) {
         renderFromLatestIndex();
     }
 }
@@ -2113,6 +2260,13 @@ export function renderThreadCardsFromEntries(entries, container, status, totalCo
             ? `<button type="button" class="chat-manager-drift-jump" data-filename="${escapeAttr(entry.fileName)}" data-msg-index="${driftSummary.firstMsgIndex}" title="Topic shifts near messages: ${escapeAttr(driftSummary.positions.join(', '))}">${driftSummary.count} topic shift${driftSummary.count !== 1 ? 's' : ''}</button>`
             : '';
         const indexingInfo = entry.isLoaded ? '' : '<span>Indexing...</span>';
+        const embStatus = getEmbeddingStatus(entry);
+        const embBadge = (embStatus === 'full' || embStatus === 'partial' || embStatus === 'none')
+            ? `<span class="chat-manager-emb-status chat-manager-emb-status-${embStatus}" title="${escapeAttr(embStatusTitle(embStatus))}"><i class="fa-solid fa-vector-square"></i></span>`
+            : '';
+        const embedCardBtn = (embStatus !== 'disabled' && embStatus !== 'full' && embStatus !== 'unknown' && entry.isLoaded)
+            ? `<i class="chat-manager-icon-btn chat-manager-embed-card-btn fa-fw fa-solid fa-bolt" data-filename="${escapeAttr(entry.fileName)}" title="Generate embeddings for this thread" tabindex="0"></i>`
+            : '';
         const aiTitleClasses = `chat-manager-icon-btn chat-manager-ai-title-btn fa-fw fa-solid fa-robot${entry.isLoaded ? '' : ' disabled'}`;
         const regenSummaryClasses = `chat-manager-icon-btn chat-manager-regen-summary-btn fa-fw fa-solid fa-rotate${entry.isLoaded ? '' : ' disabled'}`;
         const aiTitle = entry.isLoaded
@@ -2148,6 +2302,7 @@ export function renderThreadCardsFromEntries(entries, container, status, totalCo
                     <i class="chat-manager-icon-btn chat-manager-edit-name-btn fa-fw fa-solid fa-pen" data-filename="${escapeAttr(entry.fileName)}" title="Edit display name" tabindex="0"></i>
                     <i class="${aiTitleClasses}" data-filename="${escapeAttr(entry.fileName)}" title="${escapeAttr(aiTitle)}" tabindex="0"></i>
                     <i class="chat-manager-icon-btn chat-manager-rename-file-btn fa-fw fa-solid fa-file-pen" data-filename="${escapeAttr(entry.fileName)}" title="Rename original file" tabindex="0"></i>
+                    ${embedCardBtn}
                 </div>
             </div>
             ${tagChipsHtml}
@@ -2156,6 +2311,7 @@ export function renderThreadCardsFromEntries(entries, container, status, totalCo
                 <span>${firstDate} – ${lastDate}</span>
                 <span>${lastActive}</span>
                 ${indexingInfo}
+                ${embBadge}
                 ${driftInfo}
                 ${branchInfo}
             </div>
@@ -2332,11 +2488,17 @@ function ensureFilterToolbar() {
             renderThreadCards();
         });
 
+        const embedTriggerBtn = document.createElement('button');
+        embedTriggerBtn.className = 'chat-manager-btn chat-manager-emb-scope-btn chat-manager-emb-trigger-btn';
+        embedTriggerBtn.textContent = 'Embed Visible';
+        embedTriggerBtn.addEventListener('click', () => handleToolbarEmbedTrigger());
+
         filterDiv.appendChild(tagFilterBtn);
         filterDiv.appendChild(advFilterBtn);
         filterDiv.appendChild(clearBtn);
         filterDiv.appendChild(selectVisibleEmbBtn);
         filterDiv.appendChild(clearVisibleEmbBtn);
+        filterDiv.appendChild(embedTriggerBtn);
 
         toolbar.appendChild(sortDiv);
         toolbar.appendChild(filterDiv);
@@ -3079,6 +3241,9 @@ function handleCardContainerClick(e) {
 
     const renameBtn = target.closest('.chat-manager-rename-file-btn');
     if (renameBtn) { handleRenameFile({ stopPropagation: () => e.stopPropagation(), currentTarget: renameBtn }); return; }
+
+    const embedCardBtn = target.closest('.chat-manager-embed-card-btn');
+    if (embedCardBtn) { handleEmbedSingleCard({ stopPropagation: () => e.stopPropagation(), currentTarget: embedCardBtn }); return; }
 
     const editSummaryBtn = target.closest('.chat-manager-edit-summary-btn');
     if (editSummaryBtn) { handleEditSummary({ stopPropagation: () => e.stopPropagation(), currentTarget: editSummaryBtn }); return; }
