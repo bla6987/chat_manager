@@ -6,7 +6,7 @@
 import { clearIndex, getIndexCharacterAvatar, updateActiveChat } from './src/chat-reader.js';
 import {
     togglePanel, closePanel, refreshPanel, renderThreadCards, onSearchInput, isPanelOpen, resetSearchState,
-    toggleTimeline, isTimelineActive, toggleSemanticMap, isSemanticMapActive, toggleStats, isStatsActive, toggleBranchContext, isBranchContextActive,
+    toggleTimeline, isTimelineActive, toggleSemanticMap, isSemanticMapActive, toggleGraphView, isGraphViewActive, toggleStats, isStatsActive, toggleBranchContext, isBranchContextActive,
     clearInMemoryEmbeddings, generateEmbeddingsForCurrentIndex, scheduleEmbeddingBootstrap, scheduleIncrementalEmbedding,
 } from './src/ui-controller.js';
 import {
@@ -1142,6 +1142,15 @@ function bindPanelEvents() {
     const semanticMapToggleBtn = document.getElementById('chat-manager-semantic-map-toggle');
     if (semanticMapToggleBtn) {
         semanticMapToggleBtn.addEventListener('click', handleSemanticMapToggle);
+    }
+
+    // Graph view toggle button
+    const graphViewToggleBtn = document.getElementById('chat-manager-graph-view-toggle');
+    if (graphViewToggleBtn) {
+        graphViewToggleBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            toggleGraphView();
+        });
     }
 
     const content = document.getElementById('chat-manager-content');

@@ -36,6 +36,10 @@ import {
     focusMessageInSemanticMap, isSemanticMapMounted, setSemanticMapCallbacks,
 } from './semantic-map-view.js';
 import {
+    mountGraphView, unmountGraphView, updateGraphViewData,
+    isGraphViewMounted, setGraphViewCallbacks,
+} from './graph-view.js';
+import {
     mountStatsView, unmountStatsView, updateStatsView,
     isStatsMounted, setStatsCallbacks,
 } from './stats-view.js';
@@ -54,6 +58,7 @@ const RECLUSTER_CHAT_DELTA_RATIO = 0.2;
 let panelOpen = false;
 let timelineActive = false;
 let semanticMapActive = false;
+let graphViewActive = false;
 let statsActive = false;
 let branchContextActive = false;
 const RESULTS_PAGE_SIZE = 50;
@@ -496,6 +501,13 @@ function refreshAfterEmbeddingUpdate() {
         return;
     }
 
+    if (graphViewActive) {
+        if (isGraphViewMounted()) {
+            updateGraphViewData();
+        }
+        return;
+    }
+
     const query = getCurrentSearchQuery();
     if (query.length >= 2) {
         performSearch(query);
@@ -812,6 +824,9 @@ export function toggleSemanticMap() {
         if (statsActive) {
             deactivateStats();
         }
+        if (graphViewActive) {
+            deactivateGraphView();
+        }
 
         const searchWrapper = document.querySelector('.chat-manager-search-wrapper');
         const toolbar = document.querySelector('.chat-manager-filter-toolbar');
@@ -846,6 +861,54 @@ export function toggleSemanticMap() {
 }
 
 /**
+ * Toggle graph view on/off.
+ */
+export function toggleGraphView() {
+    graphViewActive = !graphViewActive;
+
+    const btn = document.getElementById('chat-manager-graph-view-toggle');
+    if (btn) btn.classList.toggle('active', graphViewActive);
+
+    if (graphViewActive) {
+        if (timelineActive) deactivateTimeline();
+        if (semanticMapActive) deactivateSemanticMap();
+        if (statsActive) deactivateStats();
+
+        const searchWrapper = document.querySelector('.chat-manager-search-wrapper');
+        const toolbar = document.querySelector('.chat-manager-filter-toolbar');
+        const content = document.getElementById('chat-manager-content');
+        if (searchWrapper) searchWrapper.style.display = 'none';
+        if (toolbar) toolbar.style.display = 'none';
+        dismissDropdown();
+        if (content) {
+            content.classList.add('timeline-active');
+            content.innerHTML = '<div class="chat-manager-loading"><div class="chat-manager-spinner"></div> Preparing graph view…</div>';
+        }
+
+        setGraphViewCallbacks({
+            onJump: handleTimelineJumpToMessage,
+            getActive: getActiveFilename,
+        });
+
+        requestAnimationFrame(() => {
+            requestAnimationFrame(() => {
+                if (!graphViewActive) return;
+                if (content) mountGraphView(content);
+                const status = document.getElementById('chat-manager-status');
+                if (status) status.textContent = 'Graph view';
+            });
+        });
+    } else {
+        deactivateGraphView();
+        renderThreadCards();
+    }
+}
+
+export function isGraphViewActive() {
+    return graphViewActive;
+}
+
+/**
  * Toggle timeline view on/off. Called from index.js when the toggle button is clicked.
  * Expects Cytoscape libs to be loaded before this is called.
  */
@@ -862,6 +925,9 @@ export function toggleTimeline() {
     }
     if (timelineActive && semanticMapActive) {
         deactivateSemanticMap();
+    }
+    if (timelineActive && graphViewActive) {
+        deactivateGraphView();
     }
 
     const searchWrapper = document.querySelector('.chat-manager-search-wrapper');
@@ -939,6 +1005,9 @@ export function toggleStats() {
         }
         if (semanticMapActive) {
             deactivateSemanticMap();
+        }
+        if (graphViewActive) {
+            deactivateGraphView();
         }
 
         // Hide search and toolbar
@@ -1040,6 +1109,26 @@ function deactivateSemanticMap() {
     unmountSemanticMap();
 
     const btn = document.getElementById('chat-manager-semantic-map-toggle');
+    if (btn) btn.classList.remove('active');
+
+    const searchWrapper = document.querySelector('.chat-manager-search-wrapper');
+    if (searchWrapper) searchWrapper.style.display = '';
+    const toolbar = document.querySelector('.chat-manager-filter-toolbar');
+    if (toolbar) toolbar.style.display = '';
+
+    const content = document.getElementById('chat-manager-content');
+    if (content) {
+        content.classList.remove('timeline-active');
+        content.innerHTML = '';
+    }
+}
+
+function deactivateGraphView() {
+    if (!graphViewActive && !isGraphViewMounted()) return;
+    graphViewActive = false;
+    unmountGraphView();
+
+    const btn = document.getElementById('chat-manager-graph-view-toggle');
     if (btn) btn.classList.remove('active');
 
     const searchWrapper = document.querySelector('.chat-manager-search-wrapper');
