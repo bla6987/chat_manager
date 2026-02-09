@@ -119,6 +119,9 @@ let activeTopicDrift = null;
 let activeTopicDriftChatFile = null;
 const topicDriftCache = new Map();
 
+// Cached active chat file for hitTest() (updated each render)
+let cachedActiveChatFile = null;
+
 // rAF coalescing for drag/wheel rendering
 let renderPending = false;
 
@@ -390,6 +393,7 @@ export function unmountIcicle() {
     legendSelectedCluster = null;
     activeTopicDrift = null;
     activeTopicDriftChatFile = null;
+    cachedActiveChatFile = null;
     mounted = false;
 }
 
@@ -1014,6 +1018,7 @@ function render() {
     ctx.clearRect(0, 0, canvasWidth, canvasHeight);
 
     const activeChatFile = getActiveChatFile ? getActiveChatFile() : null;
+    cachedActiveChatFile = activeChatFile;
     if (activeChatFile !== activeTopicDriftChatFile) {
         refreshActiveTopicDrift(activeChatFile);
     }
@@ -1031,6 +1036,54 @@ function render() {
     const ySpan = yEnd - yStart;
     if (ySpan <= 0) return;
 
+    // ── Active-path spine line & gutter marker ──
+    // Collect visible active-path nodes, draw a continuous line behind blocks
+    const MIN_ACTIVE_HEIGHT = 6;
+    let activeNodes = [];
+    if (activeChatFile) {
+        for (const node of flatNodes) {
+            if (!node.chatFiles.includes(activeChatFile)) continue;
+            if (node.depth < minVisibleDepth || node.depth > maxVisibleDepth) continue;
+            if (node.y1 <= yStart || node.y0 >= yEnd) continue;
+            activeNodes.push(node);
+        }
+        activeNodes.sort((a, b) => a.depth - b.depth);
+    }
+
+    if (activeNodes.length >= 2) {
+        ctx.save();
+        ctx.strokeStyle = 'rgba(100, 180, 255, 0.35)';
+        ctx.lineWidth = 3;
+        ctx.beginPath();
+        for (let i = 0; i < activeNodes.length; i++) {
+            const n = activeNodes[i];
+            const relY0 = (Math.max(n.y0, yStart) - yStart) / ySpan;
+            const relY1 = (Math.min(n.y1, yEnd) - yStart) / ySpan;
+            const cx = (n.depth - exploreDepthOffset) * COL_WIDTH - viewX + (COL_WIDTH - 2) / 2;
+            const cy = ((relY0 + relY1) / 2) * canvasHeight;
+            if (i === 0) ctx.moveTo(cx, cy);
+            else ctx.lineTo(cx, cy);
+        }
+        ctx.stroke();
+        ctx.restore();
+    }
+
+    // Gutter marker: 3px stripe along left edge spanning active nodes' Y range
+    if (activeNodes.length > 0) {
+        let gutterMinY = Infinity, gutterMaxY = -Infinity;
+        for (const n of activeNodes) {
+            const relY0 = (Math.max(n.y0, yStart) - yStart) / ySpan;
+            const relY1 = (Math.min(n.y1, yEnd) - yStart) / ySpan;
+            const py0 = relY0 * canvasHeight;
+            const py1 = relY1 * canvasHeight;
+            if (py0 < gutterMinY) gutterMinY = py0;
+            if (py1 > gutterMaxY) gutterMaxY = py1;
+        }
+        const gutterH = Math.max(gutterMaxY - gutterMinY, 4);
+        ctx.fillStyle = 'rgba(100, 180, 255, 0.5)';
+        ctx.fillRect(0, gutterMinY, 3, gutterH);
+    }
+
     for (const node of flatNodes) {
         if (node.depth < minVisibleDepth || node.depth > maxVisibleDepth) continue;
 
@@ -1042,15 +1095,20 @@ function render() {
         const relY1 = (Math.min(node.y1, yEnd) - yStart) / ySpan;
 
         const x = (node.depth - exploreDepthOffset) * COL_WIDTH - viewX;
-        const y = relY0 * canvasHeight;
         const w = COL_WIDTH - 2;
-        const h = Math.max((relY1 - relY0) * canvasHeight - GAP, MIN_BLOCK_HEIGHT);
+        const isActive = activeChatFile && node.chatFiles.includes(activeChatFile);
+        let y = relY0 * canvasHeight;
+        let h = Math.max((relY1 - relY0) * canvasHeight - GAP, MIN_BLOCK_HEIGHT);
+
+        // Active-path nodes get a minimum visual height, centered on original midpoint
+        if (isActive && h < MIN_ACTIVE_HEIGHT) {
+            const mid = y + h / 2;
+            h = MIN_ACTIVE_HEIGHT;
+            y = mid - h / 2;
+        }
 
         if (x + w < 0 || x > canvasWidth) continue;
         if (y + h < 0 || y > canvasHeight) continue;
-
-        // Color
-        const isActive = activeChatFile && node.chatFiles.includes(activeChatFile);
         const isDivergence = node.children.size > 1;
         const isHovered = node === hoveredNode;
         const driftScore = isActive && activeDriftScoresByDepth
@@ -1124,11 +1182,15 @@ function render() {
             }
         }
 
-        // Active thread outline — the only outline indicator
+        // Active thread outline — glow effect visible even on tiny nodes
         if (isActive && !isHovered) {
+            ctx.save();
             ctx.strokeStyle = 'rgba(100, 180, 255, 0.8)';
-            ctx.lineWidth = 1.5;
+            ctx.lineWidth = 2;
+            ctx.shadowColor = 'rgba(80, 160, 255, 0.7)';
+            ctx.shadowBlur = 6;
             ctx.strokeRect(x + 0.5, y + 0.5, w - 1, h - 1);
+            ctx.restore();
         }
 
         // Search match highlight (outline, since it's a transient indicator)
@@ -1274,10 +1336,18 @@ function hitTest(px, py) {
         const relY0 = (Math.max(node.y0, yStart) - yStart) / ySpan;
         const relY1 = (Math.min(node.y1, yEnd) - yStart) / ySpan;
 
-        const y = relY0 * canvasHeight;
-        const h = Math.max((relY1 - relY0) * canvasHeight - GAP, MIN_BLOCK_HEIGHT);
+        let y = relY0 * canvasHeight;
+        let h = Math.max((relY1 - relY0) * canvasHeight - GAP, MIN_BLOCK_HEIGHT);
         const x = (node.depth - exploreDepthOffset) * COL_WIDTH - viewX;
         const w = COL_WIDTH - 2;
+
+        // Match render's expanded hit area for active-path nodes
+        const isActive = cachedActiveChatFile && node.chatFiles.includes(cachedActiveChatFile);
+        if (isActive && h < 6) {
+            const mid = y + h / 2;
+            h = 6;
+            y = mid - h / 2;
+        }
 
         if (px >= x && px <= x + w && py >= y && py <= y + h) {
             return node;
@@ -1792,6 +1862,16 @@ function scrollToActiveLeaf(activeChatFile) {
 
     // Position so the leaf column's right edge aligns with the canvas right edge
     viewX = Math.max(0, ((deepest.depth - exploreDepthOffset) + 1) * COL_WIDTH - canvasWidth);
+
+    // Center viewport vertically on the active leaf (instant, no animation)
+    const viewSpan = viewY1 - viewY0;
+    const nodeMidY = (deepest.y0 + deepest.y1) / 2;
+    let targetY0 = nodeMidY - viewSpan / 2;
+    let targetY1 = nodeMidY + viewSpan / 2;
+    if (targetY0 < 0) { targetY1 -= targetY0; targetY0 = 0; }
+    if (targetY1 > 1) { targetY0 -= (targetY1 - 1); targetY1 = 1; }
+    viewY0 = Math.max(0, targetY0);
+    viewY1 = Math.min(1, targetY1);
 }
 
 /**
