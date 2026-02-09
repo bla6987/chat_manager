@@ -710,6 +710,11 @@
     min-height: 0;
 }
 
+.chat-manager-popup .chat-manager-content.timeline-active {
+    flex: 1 1 auto;
+    min-height: clamp(240px, 45vh, 560px);
+}
+
 /* ══════════════════════════════════════════════
    Settings Panel
    ══════════════════════════════════════════════ */
@@ -1209,8 +1214,10 @@
 }
 
 .chat-manager-content.timeline-active {
+    position: relative;
     padding: 0;
     overflow: hidden;
+    min-height: clamp(240px, 45vh, 560px);
 }
 
 /* ── Icicle Breadcrumbs ── */

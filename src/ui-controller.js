@@ -67,6 +67,7 @@ let refreshFromHydrationTimer = null;
 let refreshSearchFromHydrationTimer = null;
 let refreshTimelineFromHydrationTimer = null;
 let refreshSemanticMapFromHydrationTimer = null;
+let refreshGraphViewFromHydrationTimer = null;
 let refreshStatsFromHydrationTimer = null;
 let embedBootstrapTimer = null;
 let embedIncrementalTimer = null;
@@ -1353,6 +1354,18 @@ function scheduleSemanticMapRefresh() {
     }, 600);
 }
 
+function scheduleGraphViewRefresh() {
+    if (refreshGraphViewFromHydrationTimer) return;
+
+    refreshGraphViewFromHydrationTimer = setTimeout(() => {
+        refreshGraphViewFromHydrationTimer = null;
+        if (!panelOpen || !graphViewActive) return;
+        if (isGraphViewMounted()) {
+            updateGraphViewData();
+        }
+    }, 600);
+}
+
 function ensureHydrationSubscription() {
     if (hydrationSubscriptionReady) return;
 
@@ -1370,6 +1383,10 @@ function ensureHydrationSubscription() {
         }
         if (semanticMapActive) {
             scheduleSemanticMapRefresh();
+            return;
+        }
+        if (graphViewActive) {
+            scheduleGraphViewRefresh();
             return;
         }
 
@@ -1442,6 +1459,7 @@ function closeSidePanel() {
     deactivateStats();
     deactivateTimeline();
     deactivateSemanticMap();
+    deactivateGraphView();
 }
 
 // ── Popup ──
@@ -1483,6 +1501,7 @@ function closePopup() {
     deactivateStats();
     deactivateTimeline();
     deactivateSemanticMap();
+    deactivateGraphView();
 }
 
 /**
@@ -1540,6 +1559,8 @@ export async function refreshPanel() {
     if (statsBtn) statsBtn.classList.toggle('active', statsActive);
     const semanticMapBtn = document.getElementById('chat-manager-semantic-map-toggle');
     if (semanticMapBtn) semanticMapBtn.classList.toggle('active', semanticMapActive);
+    const graphViewBtn = document.getElementById('chat-manager-graph-view-toggle');
+    if (graphViewBtn) graphViewBtn.classList.toggle('active', graphViewActive);
 
     // Guard: no character selected or group chat
     if (context.characterId === undefined) {
@@ -1604,6 +1625,37 @@ export async function refreshPanel() {
             }
         }
         if (status) status.textContent = 'Semantic map view';
+
+        const activeFile = getActiveFilename();
+        if (activeFile) prioritizeInQueue(activeFile);
+        await buildIndex(null, null);
+        return;
+    }
+
+    if (graphViewActive) {
+        const content = document.getElementById('chat-manager-content');
+        const status = document.getElementById('chat-manager-status');
+        const searchWrapper = document.querySelector('.chat-manager-search-wrapper');
+        const toolbar = document.querySelector('.chat-manager-filter-toolbar');
+        if (searchWrapper) searchWrapper.style.display = 'none';
+        if (toolbar) toolbar.style.display = 'none';
+        if (content) {
+            content.classList.add('timeline-active');
+            if (isGraphViewMounted()) {
+                requestAnimationFrame(() => updateGraphViewData());
+            } else {
+                content.innerHTML = '<div class="chat-manager-loading"><div class="chat-manager-spinner"></div> Preparing graph view\u2026</div>';
+                setGraphViewCallbacks({
+                    onJump: handleTimelineJumpToMessage,
+                    getActive: getActiveFilename,
+                });
+                requestAnimationFrame(() => {
+                    if (!graphViewActive) return;
+                    mountGraphView(content);
+                });
+            }
+        }
+        if (status) status.textContent = 'Graph view';
 
         const activeFile = getActiveFilename();
         if (activeFile) prioritizeInQueue(activeFile);
@@ -2146,7 +2198,7 @@ function ensureFilterToolbar() {
 
     // Hide toolbar when search or alternate visualization modes are active
     const query = getCurrentSearchQuery();
-    toolbar.style.display = (query.length >= 2 || timelineActive || semanticMapActive || statsActive) ? 'none' : '';
+    toolbar.style.display = (query.length >= 2 || timelineActive || semanticMapActive || graphViewActive || statsActive) ? 'none' : '';
 }
 
 function updateSortDirIcon(btn, direction) {
@@ -3371,7 +3423,7 @@ function escapeAttr(str) {
  * @param {string} query
  */
 export function onSearchInput(query) {
-    if (timelineActive || statsActive || semanticMapActive) {
+    if (timelineActive || statsActive || semanticMapActive || graphViewActive) {
         return;
     }
 

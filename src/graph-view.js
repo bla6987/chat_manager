@@ -64,6 +64,7 @@ let loadingEl = null;
 let dpr = 1;
 let canvasWidth = 0;
 let canvasHeight = 0;
+let resizeObserver = null;
 
 let onJumpToChat = null;
 let getActiveChatFile = null;
@@ -181,6 +182,7 @@ export async function mountGraphView(containerEl) {
     setInfo(`${messageRefs.length.toLocaleString()} messages available · Pin a search term to begin`);
 
     bindEvents();
+    bindResizeObserver();
     resizeCanvas();
     queueRender();
 }
@@ -194,6 +196,7 @@ export function unmountGraphView() {
     simRunning = false;
 
     unbindEvents();
+    unbindResizeObserver();
 
     if (overlayEl) { overlayEl.remove(); overlayEl = null; }
     if (canvas) { canvas.remove(); canvas = null; }
@@ -226,6 +229,8 @@ export function unmountGraphView() {
     camera.x = 0;
     camera.y = 0;
     camera.zoom = 1;
+    canvasWidth = 0;
+    canvasHeight = 0;
 
     mounted = false;
 }
@@ -671,10 +676,10 @@ function resizeCanvas() {
     if (!canvas || !container) return;
     dpr = window.devicePixelRatio || 1;
     const rect = container.getBoundingClientRect();
-    canvasWidth = rect.width;
-    canvasHeight = rect.height;
-    canvas.width = canvasWidth * dpr;
-    canvas.height = canvasHeight * dpr;
+    canvasWidth = Math.max(1, rect.width);
+    canvasHeight = Math.max(1, rect.height);
+    canvas.width = Math.round(canvasWidth * dpr);
+    canvas.height = Math.round(canvasHeight * dpr);
     canvas.style.width = canvasWidth + 'px';
     canvas.style.height = canvasHeight + 'px';
     queueRender();
@@ -1043,6 +1048,20 @@ function unbindEvents() {
         window.removeEventListener('resize', boundHandlers.onResize);
     }
     boundHandlers = {};
+}
+
+function bindResizeObserver() {
+    if (!container || typeof ResizeObserver !== 'function') return;
+    resizeObserver = new ResizeObserver(() => {
+        resizeCanvas();
+    });
+    resizeObserver.observe(container);
+}
+
+function unbindResizeObserver() {
+    if (!resizeObserver) return;
+    resizeObserver.disconnect();
+    resizeObserver = null;
 }
 
 function handlePointerDown(e) {
