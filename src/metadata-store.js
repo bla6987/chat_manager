@@ -35,6 +35,7 @@ const DEFAULT_EMBEDDING_SETTINGS = {
     scopeMode: 'all',
     selectedChatsByAvatar: {},
     includeAlternateSwipes: false,
+    showAlternateSwipesInResults: false,
     maxSwipesPerMessage: 8,
     swipeBackgroundBatchSize: 24,
     swipeBackgroundDelayMs: 650,
@@ -139,6 +140,9 @@ function normalizeEmbeddingSettings(embeddings) {
 
     if (typeof embeddings.includeAlternateSwipes !== 'boolean') {
         embeddings.includeAlternateSwipes = DEFAULT_EMBEDDING_SETTINGS.includeAlternateSwipes;
+    }
+    if (typeof embeddings.showAlternateSwipesInResults !== 'boolean') {
+        embeddings.showAlternateSwipesInResults = DEFAULT_EMBEDDING_SETTINGS.showAlternateSwipesInResults;
     }
 
     const maxSwipesPerMessage = Number(embeddings.maxSwipesPerMessage);
@@ -573,7 +577,7 @@ export function setSortState(partial) {
 
 /**
  * Get embedding settings (global, persisted).
- * @returns {{ enabled: boolean, provider: string, apiKey: string, ollamaUrl: string, model: string, dimensions: number|null, colorMode: string, mapEnabled: boolean, mapLodMode: string, mapPointSize: number, mapSimilarityChannel: string, embeddingLevels: { chat: boolean, message: boolean, query: boolean }, scopeMode: string, selectedChatsByAvatar: Record<string, string[]>, includeAlternateSwipes: boolean, maxSwipesPerMessage: number, swipeBackgroundBatchSize: number, swipeBackgroundDelayMs: number }}
+ * @returns {{ enabled: boolean, provider: string, apiKey: string, ollamaUrl: string, model: string, dimensions: number|null, colorMode: string, mapEnabled: boolean, mapLodMode: string, mapPointSize: number, mapSimilarityChannel: string, embeddingLevels: { chat: boolean, message: boolean, query: boolean }, scopeMode: string, selectedChatsByAvatar: Record<string, string[]>, includeAlternateSwipes: boolean, showAlternateSwipesInResults: boolean, maxSwipesPerMessage: number, swipeBackgroundBatchSize: number, swipeBackgroundDelayMs: number }}
  */
 export function getEmbeddingSettings() {
     const settings = getSettings();
@@ -595,7 +599,7 @@ export function getEmbeddingSettings() {
 
 /**
  * Merge and persist embedding settings.
- * @param {Partial<{ enabled: boolean, provider: string, apiKey: string, ollamaUrl: string, model: string, dimensions: number|null, colorMode: string, mapEnabled: boolean, mapLodMode: string, mapPointSize: number, mapSimilarityChannel: string, embeddingLevels: { chat: boolean, message: boolean, query: boolean }, scopeMode: string, selectedChatsByAvatar: Record<string, string[]>, includeAlternateSwipes: boolean, maxSwipesPerMessage: number, swipeBackgroundBatchSize: number, swipeBackgroundDelayMs: number }>} partial
+ * @param {Partial<{ enabled: boolean, provider: string, apiKey: string, ollamaUrl: string, model: string, dimensions: number|null, colorMode: string, mapEnabled: boolean, mapLodMode: string, mapPointSize: number, mapSimilarityChannel: string, embeddingLevels: { chat: boolean, message: boolean, query: boolean }, scopeMode: string, selectedChatsByAvatar: Record<string, string[]>, includeAlternateSwipes: boolean, showAlternateSwipesInResults: boolean, maxSwipesPerMessage: number, swipeBackgroundBatchSize: number, swipeBackgroundDelayMs: number }>} partial
  */
 export function setEmbeddingSettings(partial) {
     const settings = getSettings();

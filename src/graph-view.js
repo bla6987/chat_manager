@@ -10,7 +10,7 @@
  * node repulsion, and velocity damping.
  */
 
-import { getIndex, getMessageEmbedding } from './chat-reader.js';
+import { getIndex, getMessageEmbedding, getMessageActiveSwipeIndex } from './chat-reader.js';
 import { embedText, isEmbeddingConfigured } from './embedding-service.js';
 import { clusterColor, cosineSimilarity } from './semantic-engine.js';
 import { getDisplayName, getEmbeddingSettings } from './metadata-store.js';
@@ -71,7 +71,7 @@ let getActiveChatFile = null;
 
 /* ── Embedding Data ── */
 
-let messageRefs = [];     // { fileName, displayName, msgIndex, role, timestamp, text }
+let messageRefs = [];     // { fileName, displayName, msgIndex, swipeIndex, isActiveSwipe, role, timestamp, text }
 let messageVectors = [];  // number[][] — parallel to messageRefs
 let messageDims = 0;
 let messageNorms = [];    // precomputed L2 norms
@@ -285,6 +285,11 @@ function clearGraphDataState() {
 
 function collectMessageVectors() {
     const index = getIndex();
+    const settings = getEmbeddingSettings();
+    const showAlternateSwipes = settings.includeAlternateSwipes === true && settings.showAlternateSwipesInResults === true;
+    const maxSwipesPerMessage = Number.isFinite(Number(settings.maxSwipesPerMessage))
+        ? Math.max(1, Math.min(64, Math.floor(Number(settings.maxSwipesPerMessage))))
+        : 8;
     const refs = [];
     const vecs = [];
     const norms = [];
@@ -297,27 +302,52 @@ function collectMessageVectors() {
 
         const displayName = getDisplayName(fileName) || fileName;
         for (const msg of entry.messages || []) {
-            const vec = getMessageEmbedding(entry, msg);
-            if (!Array.isArray(vec) || vec.length === 0) continue;
-
-            if (!detectedDims) detectedDims = vec.length;
-            if (vec.length !== detectedDims) continue;
-
-            // Precompute norm
-            let normSq = 0;
-            for (let d = 0; d < detectedDims; d++) normSq += vec[d] * vec[d];
-            const n = Math.sqrt(normSq);
-
-            vecs.push(vec);
-            norms.push(n);
-            refs.push({
-                fileName,
-                displayName,
-                msgIndex: msg.index,
-                role: msg.role,
-                timestamp: msg.timestamp || '',
+            const activeSwipeIndex = getMessageActiveSwipeIndex(msg);
+            const variants = [{
+                swipeIndex: activeSwipeIndex,
                 text: typeof msg.text === 'string' ? msg.text : '',
-            });
+                isActiveSwipe: true,
+            }];
+
+            if (showAlternateSwipes && Array.isArray(msg.swipes) && msg.swipes.length > 0) {
+                const limit = Math.min(msg.swipes.length, maxSwipesPerMessage);
+                for (let swipeIndex = 0; swipeIndex < limit; swipeIndex++) {
+                    if (swipeIndex === activeSwipeIndex) continue;
+                    const swipeText = typeof msg.swipes[swipeIndex] === 'string' ? msg.swipes[swipeIndex] : '';
+                    if (!swipeText.trim()) continue;
+                    variants.push({
+                        swipeIndex,
+                        text: swipeText,
+                        isActiveSwipe: false,
+                    });
+                }
+            }
+
+            for (const variant of variants) {
+                const vec = getMessageEmbedding(entry, msg, variant.swipeIndex);
+                if (!Array.isArray(vec) || vec.length === 0) continue;
+
+                if (!detectedDims) detectedDims = vec.length;
+                if (vec.length !== detectedDims) continue;
+
+                // Precompute norm
+                let normSq = 0;
+                for (let d = 0; d < detectedDims; d++) normSq += vec[d] * vec[d];
+                const n = Math.sqrt(normSq);
+
+                vecs.push(vec);
+                norms.push(n);
+                refs.push({
+                    fileName,
+                    displayName,
+                    msgIndex: msg.index,
+                    swipeIndex: variant.swipeIndex,
+                    isActiveSwipe: variant.isActiveSwipe,
+                    role: msg.role,
+                    timestamp: msg.timestamp || '',
+                    text: variant.text,
+                });
+            }
         }
     }
 
@@ -880,11 +910,12 @@ function drawTooltip(index) {
         const ref = messageRefs[node.msgRefIndex];
         const roleBadge = ref.role === 'user' ? 'User' : 'AI';
         const simPct = (node.similarity * 100).toFixed(1);
+        const swipeBadge = ref.isActiveSwipe ? 'Active' : `Alt #${Number(ref.swipeIndex) + 1}`;
         text = `[${roleBadge}] ${truncate(ref.text, TOOLTIP_MAX_CHARS)}`;
         if (!node.isPin) {
-            text += `\nSimilarity: ${simPct}% · ${ref.displayName}`;
+            text += `\nSimilarity: ${simPct}% · ${ref.displayName} · ${swipeBadge}`;
         } else {
-            text += `\n${ref.displayName}`;
+            text += `\n${ref.displayName} · ${swipeBadge}`;
         }
     }
 

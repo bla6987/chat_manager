@@ -7,7 +7,7 @@ import { clearIndex, getIndexCharacterAvatar, updateActiveChat } from './src/cha
 import {
     togglePanel, closePanel, refreshPanel, renderThreadCards, onSearchInput, isPanelOpen, resetSearchState,
     toggleTimeline, isTimelineActive, toggleSemanticMap, isSemanticMapActive, toggleGraphView, isGraphViewActive, toggleStats, isStatsActive, toggleBranchContext, isBranchContextActive,
-    clearInMemoryEmbeddings, generateEmbeddingsForCurrentIndex, scheduleEmbeddingBootstrap, scheduleIncrementalEmbedding,
+    clearInMemoryEmbeddings, generateEmbeddingsForCurrentIndex, scheduleEmbeddingBootstrap, scheduleIncrementalEmbedding, performSearch,
 } from './src/ui-controller.js';
 import {
     getDisplayMode, setDisplayMode, getBranchContextEnabled, getAIConnectionProfile, setAIConnectionProfile,
@@ -16,6 +16,7 @@ import {
 import { updateBranchContextInjection, clearBranchContextInjection } from './src/branch-context.js';
 import { attachMomentumScroll } from './src/momentum-scroll.js';
 import { acknowledgeEmbeddingModelChange, clearEmbeddingCache, getCacheStats } from './src/embedding-service.js';
+import { updateGraphViewData, isGraphViewMounted } from './src/graph-view.js';
 
 const MODULE_NAME = 'chat_manager';
 const EXTENSION_PATH = '/scripts/extensions/third-party/chat_manager';
@@ -437,6 +438,7 @@ function bindEmbeddingSettingsUI(container) {
     const colorModeEl = container.querySelector('#chat-manager-emb-color-mode');
     const scopeModeEl = container.querySelector('#chat-manager-emb-scope-mode');
     const includeAltSwipesEl = container.querySelector('#chat-manager-emb-include-alt-swipes');
+    const showAltResultsEl = container.querySelector('#chat-manager-emb-show-alt-results');
     const maxSwipesEl = container.querySelector('#chat-manager-emb-max-swipes');
     const swipeBatchEl = container.querySelector('#chat-manager-emb-swipe-batch');
     const swipeDelayEl = container.querySelector('#chat-manager-emb-swipe-delay');
@@ -448,7 +450,7 @@ function bindEmbeddingSettingsUI(container) {
     const progressText = container.querySelector('#chat-manager-emb-progress-text');
     const cacheStatsEl = container.querySelector('#chat-manager-emb-cache-stats');
 
-    if (!enabledEl || !levelChatEl || !levelMessageEl || !levelQueryEl || !providerEl || !apiKeyEl || !ollamaUrlEl || !modelEl || !colorModeEl || !scopeModeEl || !includeAltSwipesEl || !maxSwipesEl || !swipeBatchEl || !swipeDelayEl || !generateBtn || !clearCacheBtn || !clearVectorsBtn) {
+    if (!enabledEl || !levelChatEl || !levelMessageEl || !levelQueryEl || !providerEl || !apiKeyEl || !ollamaUrlEl || !modelEl || !colorModeEl || !scopeModeEl || !includeAltSwipesEl || !showAltResultsEl || !maxSwipesEl || !swipeBatchEl || !swipeDelayEl || !generateBtn || !clearCacheBtn || !clearVectorsBtn) {
         return;
     }
 
@@ -669,9 +671,33 @@ function bindEmbeddingSettingsUI(container) {
 
     const updateSwipeEmbeddingControls = () => {
         const includeAltSwipes = includeAltSwipesEl.checked === true;
+        showAltResultsEl.disabled = !includeAltSwipes;
         maxSwipesEl.disabled = !includeAltSwipes;
         swipeBatchEl.disabled = !includeAltSwipes;
         swipeDelayEl.disabled = !includeAltSwipes;
+    };
+
+    const refreshSearchOrGraphForAltDisplayToggle = () => {
+        if (!isPanelOpen()) return;
+
+        if (isSemanticMapActive()) {
+            void refreshPanel();
+            return;
+        }
+
+        if (isGraphViewActive() && isGraphViewMounted()) {
+            updateGraphViewData();
+            return;
+        }
+
+        if (!isTimelineActive() && !isStatsActive() && !isSemanticMapActive()) {
+            const query = String(document.getElementById('chat-manager-search')?.value || '').trim();
+            if (query.length >= 2) {
+                void performSearch(query);
+            } else {
+                renderThreadCards();
+            }
+        }
     };
 
     const loadToForm = () => {
@@ -688,6 +714,7 @@ function bindEmbeddingSettingsUI(container) {
         colorModeEl.value = settings.colorMode || 'cluster';
         scopeModeEl.value = settings.scopeMode || 'all';
         includeAltSwipesEl.checked = settings.includeAlternateSwipes === true;
+        showAltResultsEl.checked = settings.showAlternateSwipesInResults === true;
         maxSwipesEl.value = Number.isFinite(Number(settings.maxSwipesPerMessage)) ? String(settings.maxSwipesPerMessage) : '8';
         swipeBatchEl.value = Number.isFinite(Number(settings.swipeBackgroundBatchSize)) ? String(settings.swipeBackgroundBatchSize) : '24';
         swipeDelayEl.value = Number.isFinite(Number(settings.swipeBackgroundDelayMs)) ? String(settings.swipeBackgroundDelayMs) : '650';
@@ -710,6 +737,7 @@ function bindEmbeddingSettingsUI(container) {
             colorMode: colorModeEl.value,
             scopeMode: scopeModeEl.value,
             includeAlternateSwipes: includeAltSwipesEl.checked,
+            showAlternateSwipesInResults: showAltResultsEl.checked,
             maxSwipesPerMessage: Number(maxSwipesEl.value) || 8,
             swipeBackgroundBatchSize: Number(swipeBatchEl.value) || 24,
             swipeBackgroundDelayMs: Number(swipeDelayEl.value) || 650,
@@ -814,6 +842,11 @@ function bindEmbeddingSettingsUI(container) {
     includeAltSwipesEl.addEventListener('change', () => {
         updateSwipeEmbeddingControls();
         persistForm();
+        refreshSearchOrGraphForAltDisplayToggle();
+    });
+    showAltResultsEl.addEventListener('change', () => {
+        persistForm();
+        refreshSearchOrGraphForAltDisplayToggle();
     });
     maxSwipesEl.addEventListener('change', persistForm);
     swipeBatchEl.addEventListener('change', persistForm);

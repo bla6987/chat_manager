@@ -2,7 +2,7 @@
  * Semantic Map View — WebGL-first 2D semantic projection of message embeddings.
  */
 
-import { getIndex, getMessageEmbedding } from './chat-reader.js';
+import { getIndex, getMessageEmbedding, getMessageActiveSwipeIndex } from './chat-reader.js';
 import { embedText, isEmbeddingConfigured } from './embedding-service.js';
 import { clusterColor } from './semantic-engine.js';
 import { getDisplayName, getEmbeddingSettings, setEmbeddingSettings } from './metadata-store.js';
@@ -331,6 +331,11 @@ function ensureWorker() {
 
 function collectMessageVectors() {
     const index = getIndex();
+    const settings = getEmbeddingSettings();
+    const showAlternateSwipes = settings.includeAlternateSwipes === true && settings.showAlternateSwipesInResults === true;
+    const maxSwipesPerMessage = Number.isFinite(Number(settings.maxSwipesPerMessage))
+        ? Math.max(1, Math.min(64, Math.floor(Number(settings.maxSwipesPerMessage))))
+        : 8;
     const refs = [];
     const vectors = [];
     let detectedDims = 0;
@@ -342,23 +347,48 @@ function collectMessageVectors() {
 
         const displayName = getDisplayName(fileName) || fileName;
         for (const msg of entry.messages || []) {
-            const vec = getMessageEmbedding(entry, msg);
-            if (!Array.isArray(vec) || vec.length === 0) continue;
-
-            if (!detectedDims) {
-                detectedDims = vec.length;
-            }
-            if (vec.length !== detectedDims) continue;
-
-            vectors.push(vec);
-            refs.push({
-                fileName,
-                displayName,
-                msgIndex: msg.index,
-                role: msg.role,
-                timestamp: msg.timestamp || '',
+            const activeSwipeIndex = getMessageActiveSwipeIndex(msg);
+            const variants = [{
+                swipeIndex: activeSwipeIndex,
                 text: typeof msg.text === 'string' ? msg.text : '',
-            });
+                isActiveSwipe: true,
+            }];
+
+            if (showAlternateSwipes && Array.isArray(msg.swipes) && msg.swipes.length > 0) {
+                const limit = Math.min(msg.swipes.length, maxSwipesPerMessage);
+                for (let swipeIndex = 0; swipeIndex < limit; swipeIndex++) {
+                    if (swipeIndex === activeSwipeIndex) continue;
+                    const swipeText = typeof msg.swipes[swipeIndex] === 'string' ? msg.swipes[swipeIndex] : '';
+                    if (!swipeText.trim()) continue;
+                    variants.push({
+                        swipeIndex,
+                        text: swipeText,
+                        isActiveSwipe: false,
+                    });
+                }
+            }
+
+            for (const variant of variants) {
+                const vec = getMessageEmbedding(entry, msg, variant.swipeIndex);
+                if (!Array.isArray(vec) || vec.length === 0) continue;
+
+                if (!detectedDims) {
+                    detectedDims = vec.length;
+                }
+                if (vec.length !== detectedDims) continue;
+
+                vectors.push(vec);
+                refs.push({
+                    fileName,
+                    displayName,
+                    msgIndex: msg.index,
+                    swipeIndex: variant.swipeIndex,
+                    isActiveSwipe: variant.isActiveSwipe,
+                    role: msg.role,
+                    timestamp: msg.timestamp || '',
+                    text: variant.text,
+                });
+            }
         }
     }
 
@@ -383,7 +413,10 @@ function collectMessageVectors() {
     dims = detectedDims;
     messageLookup = new Map();
     for (let i = 0; i < refs.length; i++) {
-        messageLookup.set(makePointKey(refs[i].fileName, refs[i].msgIndex), i);
+        // Jump/focus should resolve to active swipe for a message.
+        if (refs[i].isActiveSwipe === true || !messageLookup.has(makePointKey(refs[i].fileName, refs[i].msgIndex))) {
+            messageLookup.set(makePointKey(refs[i].fileName, refs[i].msgIndex), i);
+        }
     }
 
     return { count, dims: detectedDims, vectorsFlat };
@@ -1343,8 +1376,11 @@ function formatPointInfo(idx) {
     const scorePart = (scoreValues && scoreValues.length > idx)
         ? ` · sim ${Math.round(scoreValues[idx] * 100)}%`
         : '';
+    const swipePart = ref.isActiveSwipe === false
+        ? ` · Alt #${Number(ref.swipeIndex) + 1}`
+        : ' · Active';
 
-    return `${ref.displayName} · #${ref.msgIndex}${scorePart} · ${snippet}`;
+    return `${ref.displayName} · #${ref.msgIndex}${swipePart}${scorePart} · ${snippet}`;
 }
 
 function drawFallbackRing(idx, color, size) {

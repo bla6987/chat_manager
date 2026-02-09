@@ -2684,11 +2684,12 @@ async function performSemanticSearch(trimmed, requestId) {
 
     const index = getIndex();
     const embeddingSettings = getEmbeddingSettings();
+    const showAlternateMatches = embeddingSettings.showAlternateSwipesInResults === true;
     const scored = [];
     for (const msg of searchable) {
         const entry = index[msg.filename];
         if (!entry || !(entry.messageEmbeddings instanceof Map)) continue;
-        const variants = collectMessageVariantsForEmbedding(msg, embeddingSettings, 'all');
+        const variants = collectMessageVariantsForEmbedding(msg, embeddingSettings, showAlternateMatches ? 'all' : 'active');
         if (variants.length === 0) continue;
 
         const activeSwipeIndex = getMessageActiveSwipeIndex(msg);
@@ -2754,6 +2755,7 @@ async function performSemanticSearch(trimmed, requestId) {
         totalMatches: deduped.length,
         exhausted: true,
         mode: 'semantic',
+        showAlternateMatches,
     };
 
     setSearchModeBadge('semantic');
@@ -2912,7 +2914,7 @@ function renderSearchPage(container, fromIndex) {
         }
 
         let swipeBadge = '';
-        if (isSemantic && typeof result.isActiveSwipeMatch === 'boolean') {
+        if (isSemantic && searchState.showAlternateMatches === true && typeof result.isActiveSwipeMatch === 'boolean') {
             if (result.isActiveSwipeMatch) {
                 swipeBadge = '<span class="chat-manager-swipe-hit-badge is-active">Active Swipe</span>';
             } else if (Number.isFinite(result.matchedSwipeIndex)) {
