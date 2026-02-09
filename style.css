@@ -2092,6 +2092,227 @@
 }
 
 /* ══════════════════════════════════════════════
+   Graph View (Force-Directed Semantic Graph)
+   ══════════════════════════════════════════════ */
+
+/* ── Toggle Button ── */
+
+.chat-manager-graph-view-toggle {
+    font-size: 1.05em;
+    line-height: 1;
+    width: 32px;
+    height: 32px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+}
+
+.chat-manager-graph-view-toggle.active {
+    background: rgba(155, 114, 207, 0.22);
+    border-color: rgba(155, 114, 207, 0.52);
+    color: rgba(185, 150, 230, 0.95);
+}
+
+/* ── Canvas ── */
+
+.chat-manager-graph-view-canvas {
+    display: block;
+    width: 100%;
+    height: 100%;
+    cursor: crosshair;
+    position: absolute;
+    inset: 0;
+}
+
+/* ── Overlay ── */
+
+.chat-manager-graph-view-overlay {
+    position: absolute;
+    inset: 0;
+    pointer-events: none;
+    z-index: 12;
+}
+
+/* ── Toolbar ── */
+
+.chat-manager-graph-view-toolbar {
+    position: absolute;
+    top: 8px;
+    left: 8px;
+    right: 8px;
+    display: flex;
+    gap: 6px;
+    align-items: center;
+    pointer-events: auto;
+    padding: 6px;
+    border-radius: 10px;
+    background: rgba(14, 17, 22, 0.82);
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    backdrop-filter: blur(2px);
+}
+
+.chat-manager-graph-view-query {
+    flex: 1;
+    min-width: 0;
+    height: 30px;
+    border-radius: 6px;
+    border: 1px solid rgba(255, 255, 255, 0.16);
+    background: rgba(0, 0, 0, 0.28);
+    color: inherit;
+    padding: 0 9px;
+    font-size: 0.84em;
+    outline: none;
+}
+
+.chat-manager-graph-view-query:focus {
+    border-color: rgba(155, 114, 207, 0.5);
+    box-shadow: 0 0 0 2px rgba(155, 114, 207, 0.18);
+}
+
+.chat-manager-graph-view-btn {
+    height: 30px;
+    padding: 0 9px;
+    font-size: 0.76em;
+    white-space: nowrap;
+}
+
+/* ── Slider ── */
+
+.chat-manager-graph-view-slider-wrap {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    pointer-events: auto;
+}
+
+.chat-manager-graph-view-slider-label {
+    font-size: 0.72em;
+    color: rgba(230, 236, 244, 0.7);
+    min-width: 22px;
+    text-align: right;
+}
+
+.chat-manager-graph-view-slider {
+    width: 60px;
+    height: 4px;
+    -webkit-appearance: none;
+    appearance: none;
+    background: rgba(255, 255, 255, 0.15);
+    border-radius: 2px;
+    outline: none;
+    cursor: pointer;
+}
+
+.chat-manager-graph-view-slider::-webkit-slider-thumb {
+    -webkit-appearance: none;
+    width: 12px;
+    height: 12px;
+    border-radius: 50%;
+    background: rgba(155, 114, 207, 0.85);
+    border: 1px solid rgba(255, 255, 255, 0.3);
+    cursor: pointer;
+}
+
+.chat-manager-graph-view-slider::-moz-range-thumb {
+    width: 12px;
+    height: 12px;
+    border-radius: 50%;
+    background: rgba(155, 114, 207, 0.85);
+    border: 1px solid rgba(255, 255, 255, 0.3);
+    cursor: pointer;
+}
+
+/* ── Info Bar ── */
+
+.chat-manager-graph-view-info {
+    position: absolute;
+    left: 8px;
+    right: 8px;
+    bottom: 8px;
+    padding: 6px 9px;
+    border-radius: 8px;
+    background: rgba(14, 17, 22, 0.82);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    font-size: 0.75em;
+    line-height: 1.35;
+    color: rgba(230, 236, 244, 0.92);
+    pointer-events: none;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+/* ── Empty & Loading ── */
+
+.chat-manager-graph-view-empty {
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    padding: 10px 14px;
+    border-radius: 8px;
+    background: rgba(14, 17, 22, 0.86);
+    border: 1px solid rgba(255, 255, 255, 0.12);
+    font-size: 0.83em;
+    color: rgba(230, 236, 244, 0.9);
+    text-align: center;
+    max-width: min(88%, 460px);
+    pointer-events: none;
+}
+
+.chat-manager-graph-view-loading {
+    position: absolute;
+    top: 50%;
+    left: 50%;
+    transform: translate(-50%, -50%);
+    min-width: 220px;
+    max-width: min(90%, 460px);
+    padding: 12px 14px;
+    border-radius: 10px;
+    background: rgba(14, 17, 22, 0.9);
+    border: 1px solid rgba(255, 255, 255, 0.14);
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    pointer-events: none;
+}
+
+.chat-manager-graph-view-loading .chat-manager-spinner {
+    width: 16px;
+    height: 16px;
+    flex: 0 0 16px;
+}
+
+.chat-manager-graph-view-loading-text {
+    font-size: 0.8em;
+    color: rgba(230, 236, 244, 0.92);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+/* ── Context Menu ── */
+
+.chat-manager-graph-view-context {
+    background: rgba(20, 20, 30, 0.95);
+    border: 1px solid rgba(255, 255, 255, 0.15);
+    border-radius: 8px;
+    padding: 6px;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    box-shadow: 0 6px 20px rgba(0, 0, 0, 0.5);
+    pointer-events: auto;
+}
+
+.chat-manager-graph-view-ctx-btn {
+    font-size: 0.78em;
+    padding: 5px 10px;
+    text-align: left;
+    white-space: nowrap;
+}
+
+/* ══════════════════════════════════════════════
    Touch Device Overrides
    Targets devices with coarse pointers (touchscreens)
    ══════════════════════════════════════════════ */
@@ -2309,6 +2530,36 @@
     .chat-manager-semantic-map-toggle {
         width: 44px;
         height: 44px;
+    }
+
+    .chat-manager-graph-view-toggle {
+        width: 44px;
+        height: 44px;
+    }
+
+    .chat-manager-graph-view-toolbar {
+        gap: 6px;
+        padding: 8px;
+    }
+
+    .chat-manager-graph-view-btn {
+        min-height: 44px;
+        padding: 8px 10px;
+        font-size: 0.8em;
+    }
+
+    .chat-manager-graph-view-query {
+        height: 44px;
+        font-size: 0.9em;
+    }
+
+    .chat-manager-graph-view-slider {
+        width: 80px;
+    }
+
+    .chat-manager-graph-view-ctx-btn {
+        min-height: 44px;
+        padding: 10px 14px;
     }
 
     .chat-manager-dropdown-item {
