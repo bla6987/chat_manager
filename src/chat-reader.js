@@ -856,10 +856,12 @@ export async function loadEntryNow(fileName) {
  * Update only the active chat's entry in the index (lightweight, no full rebuild).
  * Reads from SillyTavern's in-memory chat array when possible, avoiding an HTTP request.
  * @param {string} fileName - The chat file to update
+ * @param {{ resetEmbeddings?: boolean }} [options]
  * @returns {Promise<boolean>} Whether the entry was actually updated
  */
-export async function updateActiveChat(fileName) {
+export async function updateActiveChat(fileName, options = {}) {
     if (!fileName || !chatIndex[fileName]) return false;
+    const resetEmbeddings = options.resetEmbeddings !== false;
 
     try {
         // Prefer in-memory chat data over HTTP fetch
@@ -891,7 +893,10 @@ export async function updateActiveChat(fileName) {
             sortTimestamp: hasValidLastModified ? parsedLastModified : cached.sortTimestamp,
             branchPoint: null,
             isLoaded: true,
-            messageEmbeddings: null,
+            chatEmbedding: resetEmbeddings ? null : cached.chatEmbedding,
+            chatEmbeddingHash: resetEmbeddings ? null : cached.chatEmbeddingHash,
+            clusterLabel: resetEmbeddings ? null : cached.clusterLabel,
+            messageEmbeddings: resetEmbeddings ? null : cached.messageEmbeddings,
         };
         bumpIndexVersion();
 

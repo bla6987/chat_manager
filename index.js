@@ -57,7 +57,11 @@ const onMessageUpdate = (() => {
 
             let updated = false;
             if (activeChatFile && (isPanelOpen() || embeddingGenerationEnabled)) {
-                updated = await updateActiveChat(activeChatFile);
+                updated = await updateActiveChat(activeChatFile, {
+                    // Keep vectors only when embeddings are disabled so semantic views do not
+                    // unexpectedly "drop out" while the user is not auto-regenerating vectors.
+                    resetEmbeddings: embeddingGenerationEnabled,
+                });
             }
 
             if (isPanelOpen() && activeChatFile) {
@@ -117,8 +121,7 @@ const onMessageUpdate = (() => {
         for (const evtName of profileEvents) {
             if (eventTypes[evtName]) {
                 eventSource.on(eventTypes[evtName], () => {
-                    const select = document.getElementById('chat-manager-ai-profile');
-                    if (select) populateAIProfileDropdown(select);
+                    refreshAIProfileDropdowns();
                 });
             }
         }
@@ -171,7 +174,7 @@ function bindTopBarClickInterceptor() {
         if (topBarButton.classList.contains('not-in-chat')) return;
 
         event.preventDefault();
-        event.stopImmediatePropagation();
+        // Avoid suppressing other capture listeners on the same element.
         event.stopPropagation();
         void handleTogglePanel(event);
     }, true);
@@ -408,6 +411,43 @@ function populateAIProfileDropdown(selectEl) {
         selectEl.value = '';
         if (savedId) setAIConnectionProfile('');
     }
+}
+
+function getAIProfileSelectElements(root = document) {
+    if (!root || typeof root.querySelectorAll !== 'function') return [];
+    return Array.from(root.querySelectorAll('.chat-manager-ai-profile-select'));
+}
+
+function refreshAIProfileDropdowns(root = document) {
+    for (const selectEl of getAIProfileSelectElements(root)) {
+        populateAIProfileDropdown(selectEl);
+    }
+}
+
+function syncAIProfileSelection(profileId, sourceEl = null) {
+    const desired = profileId || '';
+    for (const selectEl of getAIProfileSelectElements()) {
+        if (sourceEl && selectEl === sourceEl) continue;
+        const hasOption = Array.from(selectEl.options).some(opt => opt.value === desired);
+        selectEl.value = hasOption ? desired : '';
+    }
+}
+
+/**
+ * Bind profile dropdown UI to persisted AI profile setting.
+ * @param {HTMLSelectElement|null} selectEl
+ */
+function bindAIProfileDropdown(selectEl) {
+    if (!selectEl) return;
+    populateAIProfileDropdown(selectEl);
+    if (selectEl.dataset.chatManagerAiProfileBound === '1') return;
+
+    selectEl.addEventListener('change', () => {
+        const nextProfileId = selectEl.value || '';
+        setAIConnectionProfile(nextProfileId);
+        syncAIProfileSelection(nextProfileId, selectEl);
+    });
+    selectEl.dataset.chatManagerAiProfileBound = '1';
 }
 
 function formatCacheStatsLine(stats) {
@@ -1035,12 +1075,7 @@ async function injectSettingsPanel() {
 
         // AI Connection Profile dropdown
         const aiProfileSelect = container.querySelector('#chat-manager-ai-profile');
-        if (aiProfileSelect) {
-            populateAIProfileDropdown(aiProfileSelect);
-            aiProfileSelect.addEventListener('change', () => {
-                setAIConnectionProfile(aiProfileSelect.value);
-            });
-        }
+        bindAIProfileDropdown(aiProfileSelect);
 
         bindEmbeddingSettingsUI(container);
     })().finally(() => {
@@ -1176,6 +1211,9 @@ function bindPanelEvents() {
             debouncedSearch(e.target.value);
         });
     }
+
+    const searchAIProfileSelect = document.getElementById('chat-manager-search-ai-profile');
+    bindAIProfileDropdown(searchAIProfileSelect);
 
     // Branch context toggle button
     const branchCtxToggleBtn = document.getElementById('chat-manager-branch-context-toggle');

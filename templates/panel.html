@@ -11,7 +11,15 @@
         </div>
     </div>
     <div class="chat-manager-search-wrapper">
-        <input type="text" id="chat-manager-search" class="chat-manager-search-input" placeholder="Search messages across all threads..." />
+        <div class="chat-manager-search-row">
+            <input type="text" id="chat-manager-search" class="chat-manager-search-input" placeholder="Search messages across all threads..." />
+        </div>
+        <div class="chat-manager-search-ai-row">
+            <label for="chat-manager-search-ai-profile" class="chat-manager-search-ai-label">AI Profile</label>
+            <select id="chat-manager-search-ai-profile" class="chat-manager-search-ai-profile chat-manager-ai-profile-select">
+                <option value="">Current Connection</option>
+            </select>
+        </div>
     </div>
     <div id="chat-manager-status" class="chat-manager-status">Showing summaries</div>
     <div id="chat-manager-branch-context-indicator" class="chat-manager-branch-ctx-indicator" style="display:none;"></div>

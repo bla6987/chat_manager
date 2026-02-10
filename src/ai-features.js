@@ -6,6 +6,22 @@ import { getAIConnectionProfile } from './metadata-store.js';
 
 const MODULE_NAME = 'chat_manager';
 
+function notifyWarning(message) {
+    if (typeof toastr !== 'undefined' && typeof toastr.warning === 'function') {
+        toastr.warning(message);
+        return;
+    }
+    console.warn(`[${MODULE_NAME}] ${message}`);
+}
+
+function notifyError(message) {
+    if (typeof toastr !== 'undefined' && typeof toastr.error === 'function') {
+        toastr.error(message);
+        return;
+    }
+    console.error(`[${MODULE_NAME}] ${message}`);
+}
+
 /**
  * Check if LLM API is available.
  * @returns {boolean}
@@ -21,7 +37,7 @@ export function isLLMAvailable() {
  */
 export function requireLLM() {
     if (!isLLMAvailable()) {
-        toastr.warning("Connect to an LLM API in SillyTavern's API settings to use AI-powered features.");
+        notifyWarning("Connect to an LLM API in SillyTavern's API settings to use AI-powered features.");
         return false;
     }
     return true;
@@ -124,14 +140,14 @@ export async function generateTitleForActiveChat() {
 
             const title = cleanGeneratedText(result, 200);
             if (!title) {
-                toastr.warning('AI returned an empty or invalid title.');
+                notifyWarning('AI returned an empty or invalid title.');
                 return null;
             }
 
             return title;
         } catch (err) {
             console.error(`[${MODULE_NAME}] Title generation failed:`, err);
-            toastr.error('Failed to generate title. Check API connection.');
+            notifyError('Failed to generate title. Check API connection.');
             return null;
         }
     });
@@ -175,14 +191,14 @@ export async function generateTitleForChat(messages, characterName) {
 
             const title = cleanGeneratedText(result, 200);
             if (!title) {
-                toastr.warning('AI returned an empty or invalid title.');
+                notifyWarning('AI returned an empty or invalid title.');
                 return null;
             }
 
             return title;
         } catch (err) {
             console.error(`[${MODULE_NAME}] Title generation failed:`, err);
-            toastr.error('Failed to generate title. Check API connection.');
+            notifyError('Failed to generate title. Check API connection.');
             return null;
         }
     });
@@ -205,14 +221,14 @@ export async function generateSummaryForActiveChat() {
 
             const summary = cleanGeneratedText(result, 1000);
             if (!summary) {
-                toastr.warning('AI returned an empty or invalid summary.');
+                notifyWarning('AI returned an empty or invalid summary.');
                 return null;
             }
 
             return summary;
         } catch (err) {
             console.error(`[${MODULE_NAME}] Summary generation failed:`, err);
-            toastr.error('Failed to generate summary. Check API connection.');
+            notifyError('Failed to generate summary. Check API connection.');
             return null;
         }
     });
@@ -280,14 +296,14 @@ export async function generateSummaryForChat(messages, characterName, branchPoin
 
             const summary = cleanGeneratedText(result, 1000);
             if (!summary) {
-                toastr.warning('AI returned an empty or invalid summary.');
+                notifyWarning('AI returned an empty or invalid summary.');
                 return null;
             }
 
             return summary;
         } catch (err) {
             console.error(`[${MODULE_NAME}] Summary generation failed:`, err);
-            toastr.error('Failed to generate summary. Check API connection.');
+            notifyError('Failed to generate summary. Check API connection.');
             return null;
         }
     });

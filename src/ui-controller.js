@@ -131,16 +131,16 @@ function canSemanticSearch() {
 }
 
 function ensureSearchModeBadge() {
-    const wrapper = document.querySelector('.chat-manager-search-wrapper');
-    if (!wrapper) return null;
+    const row = document.querySelector('.chat-manager-search-row');
+    if (!row) return null;
 
-    let badge = wrapper.querySelector('.chat-manager-search-mode-badge');
+    let badge = row.querySelector('.chat-manager-search-mode-badge');
     if (!badge) {
         badge = document.createElement('span');
         badge.className = 'chat-manager-search-mode-badge';
         badge.textContent = 'Keyword';
         badge.addEventListener('click', onSearchModeBadgeClick);
-        wrapper.appendChild(badge);
+        row.appendChild(badge);
     }
     return badge;
 }
