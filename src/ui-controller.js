@@ -2132,6 +2132,12 @@ function patchCardData() {
                 aiTitleBtn.title = 'Generate AI title';
             }
 
+            const aiSummaryTitleBtn = card.querySelector('.chat-manager-ai-summarize-title-btn');
+            if (aiSummaryTitleBtn && aiSummaryTitleBtn.classList.contains('disabled')) {
+                aiSummaryTitleBtn.classList.remove('disabled');
+                aiSummaryTitleBtn.title = 'Generate summary and set AI title';
+            }
+
             const regenBtn = card.querySelector('.chat-manager-regen-summary-btn');
             if (regenBtn && regenBtn.classList.contains('disabled')) {
                 regenBtn.classList.remove('disabled');
@@ -2267,8 +2273,12 @@ export function renderThreadCardsFromEntries(entries, container, status, totalCo
         const embedCardBtn = (embStatus !== 'disabled' && embStatus !== 'full' && embStatus !== 'unknown' && entry.isLoaded)
             ? `<i class="chat-manager-icon-btn chat-manager-embed-card-btn fa-fw fa-solid fa-bolt" data-filename="${escapeAttr(entry.fileName)}" title="Generate embeddings for this thread" tabindex="0"></i>`
             : '';
+        const aiSummaryTitleClasses = `chat-manager-icon-btn chat-manager-ai-summarize-title-btn fa-fw fa-solid fa-wand-magic-sparkles${entry.isLoaded ? '' : ' disabled'}`;
         const aiTitleClasses = `chat-manager-icon-btn chat-manager-ai-title-btn fa-fw fa-solid fa-robot${entry.isLoaded ? '' : ' disabled'}`;
         const regenSummaryClasses = `chat-manager-icon-btn chat-manager-regen-summary-btn fa-fw fa-solid fa-rotate${entry.isLoaded ? '' : ' disabled'}`;
+        const aiSummaryTitle = entry.isLoaded
+            ? 'Generate summary and set AI title'
+            : 'AI summary/title will be available once indexing finishes';
         const aiTitle = entry.isLoaded
             ? 'Generate AI title'
             : 'AI title will be available once indexing finishes';
@@ -2300,6 +2310,7 @@ export function renderThreadCardsFromEntries(entries, container, status, totalCo
                 <div class="chat-manager-card-actions">
                     <i class="chat-manager-icon-btn chat-manager-tag-btn fa-fw fa-solid fa-tag" data-filename="${escapeAttr(entry.fileName)}" title="Manage tags" tabindex="0"></i>
                     <i class="chat-manager-icon-btn chat-manager-edit-name-btn fa-fw fa-solid fa-pen" data-filename="${escapeAttr(entry.fileName)}" title="Edit display name" tabindex="0"></i>
+                    <i class="${aiSummaryTitleClasses}" data-filename="${escapeAttr(entry.fileName)}" title="${escapeAttr(aiSummaryTitle)}" tabindex="0"></i>
                     <i class="${aiTitleClasses}" data-filename="${escapeAttr(entry.fileName)}" title="${escapeAttr(aiTitle)}" tabindex="0"></i>
                     <i class="chat-manager-icon-btn chat-manager-rename-file-btn fa-fw fa-solid fa-file-pen" data-filename="${escapeAttr(entry.fileName)}" title="Rename original file" tabindex="0"></i>
                     ${embedCardBtn}
@@ -3239,6 +3250,9 @@ function handleCardContainerClick(e) {
     const aiTitleBtn = target.closest('.chat-manager-ai-title-btn');
     if (aiTitleBtn) { handleAITitle({ stopPropagation: () => e.stopPropagation(), currentTarget: aiTitleBtn }); return; }
 
+    const aiSummaryTitleBtn = target.closest('.chat-manager-ai-summarize-title-btn');
+    if (aiSummaryTitleBtn) { handleAISummaryAndTitle({ stopPropagation: () => e.stopPropagation(), currentTarget: aiSummaryTitleBtn }); return; }
+
     const renameBtn = target.closest('.chat-manager-rename-file-btn');
     if (renameBtn) { handleRenameFile({ stopPropagation: () => e.stopPropagation(), currentTarget: renameBtn }); return; }
 
@@ -3398,6 +3412,89 @@ async function handleAITitle(e) {
     } finally {
         btn.classList.remove('disabled', 'fa-spin', 'fa-gear');
         btn.classList.add('fa-robot');
+    }
+}
+
+async function handleAISummaryAndTitle(e) {
+    e.stopPropagation();
+    const btn = e.currentTarget;
+    const filename = btn.dataset.filename;
+    if (btn.classList.contains('disabled')) return;
+
+    const index = getIndex();
+    const entry = index[filename];
+    if (!entry || !entry.isLoaded) {
+        toastr.info('This thread is still indexing. Try again in a moment.');
+        return;
+    }
+
+    btn.classList.add('disabled', 'fa-spin');
+    btn.classList.remove('fa-wand-magic-sparkles');
+    btn.classList.add('fa-gear');
+
+    try {
+        const activeChatFile = getActiveFilename();
+        let summary;
+        let title;
+
+        if (filename === activeChatFile) {
+            // Keep branch-context prompt in sync for active-thread AI actions.
+            if (branchContextActive && activeChatFile) {
+                const result = updateBranchContextInjection(activeChatFile);
+                updateBranchContextStatusUI(result);
+            }
+
+            summary = await generateSummaryForActiveChat();
+            title = await generateTitleForActiveChat();
+        } else {
+            const chatData = index[filename];
+            if (!chatData || !chatData.messages.length) {
+                toastr.warning('No messages in this chat.');
+                return;
+            }
+            const context = SillyTavern.getContext();
+            summary = await generateSummaryForChat(chatData.messages, context.name2, chatData.branchPoint);
+            title = await generateTitleForChat(chatData.messages, context.name2);
+        }
+
+        if (summary) {
+            setSummary(filename, summary, false);
+        }
+        if (title) {
+            setDisplayName(filename, title);
+        }
+
+        if (summary || title) {
+            const card = document.querySelector(`.chat-manager-card[data-filename="${CSS.escape(filename)}"]`);
+            if (card) {
+                if (title) {
+                    const nameEl = card.querySelector('.chat-manager-display-name');
+                    if (nameEl) nameEl.textContent = title;
+                }
+                if (summary) {
+                    const textEl = card.querySelector('.chat-manager-summary-text');
+                    if (textEl) {
+                        patchSummaryTextElement(textEl, entry || { fileName: filename, isLoaded: false, messages: [] });
+                    }
+                }
+            }
+        }
+
+        if (summary && title) {
+            toastr.success('Summary and title generated!');
+        } else if (summary) {
+            toastr.success('Summary generated; AI title was empty.');
+        } else if (title) {
+            toastr.success('Title generated; AI summary was empty.');
+        } else {
+            toastr.warning('AI did not return a summary or title.');
+        }
+    } catch (err) {
+        console.error(`[${MODULE_NAME}] AI summary+title generation failed:`, err);
+        toastr.error('Failed to generate summary and title.');
+    } finally {
+        btn.classList.remove('disabled', 'fa-spin', 'fa-gear');
+        btn.classList.add('fa-wand-magic-sparkles');
     }
 }
 
