@@ -321,7 +321,7 @@ export async function mountIcicle(containerEl, mode) {
     resizeCanvas();
     scrollToActiveLeaf(activeChatFile);
     updateColorModeControl();
-    updateClusterLegend();
+    updateColorLegend();
     render();
 
     // Bind events
@@ -432,7 +432,7 @@ export async function updateIcicleData() {
 
     scrollToActiveLeaf(activeChatFile);
     updateColorModeControl();
-    updateClusterLegend();
+    updateColorLegend();
     render();
     updateBreadcrumbs();
     updateResetButton();
@@ -631,10 +631,12 @@ function executeSearch(raw) {
 }
 
 function clearSemanticSearchState() {
+    const wasActive = semanticSearchActive;
     semanticSearchScores = new Map();
     semanticSearchActive = false;
     semanticSearchMin = 0;
     semanticSearchMax = 0;
+    if (wasActive) updateColorLegend();
 }
 
 async function executeSemanticSearch(query) {
@@ -715,6 +717,7 @@ async function executeSemanticSearch(query) {
     }
 
     updateSearchUI();
+    updateColorLegend();
     render();
 }
 
@@ -903,7 +906,7 @@ function cycleColorMode() {
     legendSelectedCluster = null;
     setEmbeddingSettings({ colorMode });
     updateColorModeControl();
-    updateClusterLegend();
+    updateColorLegend();
     render();
 }
 
@@ -926,55 +929,96 @@ function updateColorModeControl() {
     colorModeBtnEl.classList.toggle('active', semanticReady && effective !== 'structural');
 }
 
-function updateClusterLegend() {
+function updateColorLegend() {
     if (!clusterLegendEl) return;
 
-    const semanticReady = hasSemanticData();
+    // Semantic search heatmap overrides all color modes
+    if (semanticSearchActive) {
+        clusterLegendEl.innerHTML =
+            '<div class="chat-manager-icicle-legend-title">Match</div>' +
+            '<div class="chat-manager-icicle-legend-gradient-bar" style="background:linear-gradient(to right,hsla(220,30%,35%,0.6),hsla(140,75%,55%,0.95))"></div>' +
+            '<div class="chat-manager-icicle-legend-range"><span>Low</span><span>High</span></div>';
+        clusterLegendEl.style.display = '';
+        legendSelectedCluster = null;
+        return;
+    }
+
     const effective = getEffectiveColorMode();
-    if (!semanticReady || effective !== 'cluster') {
-        clusterLegendEl.style.display = 'none';
-        clusterLegendEl.innerHTML = '';
+
+    if (effective === 'structural') {
+        clusterLegendEl.innerHTML =
+            '<div class="chat-manager-icicle-legend-row">' +
+                '<span class="chat-manager-icicle-legend-swatch" style="background:rgba(70,145,220,0.7)"></span>' +
+                '<span class="chat-manager-icicle-legend-label">Active</span>' +
+            '</div>' +
+            '<div class="chat-manager-icicle-legend-row">' +
+                '<span class="chat-manager-icicle-legend-swatch" style="background:rgba(200,170,80,0.65)"></span>' +
+                '<span class="chat-manager-icicle-legend-label">Branch</span>' +
+            '</div>' +
+            '<div class="chat-manager-icicle-legend-row">' +
+                '<span class="chat-manager-icicle-legend-swatch" style="background:rgba(100,130,170,0.5)"></span>' +
+                '<span class="chat-manager-icicle-legend-label">Other</span>' +
+            '</div>';
+        clusterLegendEl.style.display = '';
         legendSelectedCluster = null;
         return;
     }
 
-    const labels = new Set();
-    for (const node of flatNodes) {
-        if (Number.isFinite(node.clusterLabel)) {
-            labels.add(Math.floor(node.clusterLabel));
+    if (effective === 'gradient') {
+        clusterLegendEl.innerHTML =
+            '<div class="chat-manager-icicle-legend-title">Semantic</div>' +
+            '<div class="chat-manager-icicle-legend-gradient-bar" style="background:linear-gradient(to right,hsl(0,70%,50%),hsl(60,70%,50%),hsl(120,70%,50%),hsl(200,70%,50%),hsl(280,70%,50%))"></div>' +
+            '<div class="chat-manager-icicle-legend-range"><span>Similar</span><span>Different</span></div>';
+        clusterLegendEl.style.display = '';
+        legendSelectedCluster = null;
+        return;
+    }
+
+    if (effective === 'cluster') {
+        const labels = new Set();
+        for (const node of flatNodes) {
+            if (Number.isFinite(node.clusterLabel)) {
+                labels.add(Math.floor(node.clusterLabel));
+            }
         }
-    }
 
-    const ordered = [...labels].sort((a, b) => a - b);
-    if (ordered.length === 0) {
-        clusterLegendEl.style.display = 'none';
-        clusterLegendEl.innerHTML = '';
-        legendSelectedCluster = null;
+        const ordered = [...labels].sort((a, b) => a - b);
+        if (ordered.length === 0) {
+            clusterLegendEl.style.display = 'none';
+            clusterLegendEl.innerHTML = '';
+            legendSelectedCluster = null;
+            return;
+        }
+
+        let html = '<div class="chat-manager-icicle-legend-title">Clusters</div>';
+        for (const label of ordered) {
+            const active = legendSelectedCluster === label;
+            html += `
+                <button class="chat-manager-icicle-legend-item${active ? ' active' : ''}" data-cluster="${label}" style="--cluster-color:${escapeAttr(clusterColor(label))}">
+                    <span class="chat-manager-icicle-legend-dot"></span>
+                </button>
+            `;
+        }
+        clusterLegendEl.innerHTML = html;
+        clusterLegendEl.style.display = '';
+
+        clusterLegendEl.querySelectorAll('.chat-manager-icicle-legend-item').forEach(btn => {
+            btn.addEventListener('click', (e) => {
+                e.stopPropagation();
+                const label = Number(btn.dataset.cluster);
+                if (!Number.isFinite(label)) return;
+                legendSelectedCluster = legendSelectedCluster === label ? null : label;
+                updateColorLegend();
+                render();
+            });
+        });
         return;
     }
 
-    let html = '<div class="chat-manager-icicle-legend-title">Clusters</div>';
-    for (const label of ordered) {
-        const active = legendSelectedCluster === label;
-        html += `
-            <button class="chat-manager-icicle-legend-item${active ? ' active' : ''}" data-cluster="${label}" style="--cluster-color:${escapeAttr(clusterColor(label))}">
-                <span class="chat-manager-icicle-legend-dot"></span>
-            </button>
-        `;
-    }
-    clusterLegendEl.innerHTML = html;
-    clusterLegendEl.style.display = '';
-
-    clusterLegendEl.querySelectorAll('.chat-manager-icicle-legend-item').forEach(btn => {
-        btn.addEventListener('click', (e) => {
-            e.stopPropagation();
-            const label = Number(btn.dataset.cluster);
-            if (!Number.isFinite(label)) return;
-            legendSelectedCluster = legendSelectedCluster === label ? null : label;
-            updateClusterLegend();
-            render();
-        });
-    });
+    // Fallback: hide
+    clusterLegendEl.style.display = 'none';
+    clusterLegendEl.innerHTML = '';
+    legendSelectedCluster = null;
 }
 
 // ──────────────────────────────────────────────

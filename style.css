@@ -1234,6 +1234,7 @@
     bottom: 46px;
     z-index: 10;
     display: flex;
+    flex-wrap: wrap;
     align-items: center;
     gap: 4px;
     padding: 4px 6px;
@@ -1270,6 +1271,41 @@
 
 .chat-manager-icicle-legend-item.active {
     box-shadow: 0 0 0 2px var(--cluster-color, #999);
+}
+
+.chat-manager-icicle-legend-row {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+}
+
+.chat-manager-icicle-legend-swatch {
+    display: inline-block;
+    width: 10px;
+    height: 10px;
+    border-radius: 2px;
+    flex-shrink: 0;
+}
+
+.chat-manager-icicle-legend-label {
+    font-size: 0.7em;
+    opacity: 0.85;
+    white-space: nowrap;
+}
+
+.chat-manager-icicle-legend-gradient-bar {
+    width: 64px;
+    height: 8px;
+    border-radius: 4px;
+}
+
+.chat-manager-icicle-legend-range {
+    display: flex;
+    justify-content: space-between;
+    font-size: 0.6em;
+    opacity: 0.6;
+    width: 64px;
+    margin-top: -1px;
 }
 
 .chat-manager-content.timeline-active {
