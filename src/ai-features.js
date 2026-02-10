@@ -5,6 +5,97 @@
 import { getAIConnectionProfile } from './metadata-store.js';
 
 const MODULE_NAME = 'chat_manager';
+// Keep this window short so repeated user actions are still counted separately.
+const TOKEN_USAGE_DEDUPE_TTL_MS = 2000;
+const recentTokenUsageKeys = new Map();
+
+function hashText(text) {
+    const value = typeof text === 'string' ? text : '';
+    let hash = 2166136261;
+    for (let i = 0; i < value.length; i += 1) {
+        hash ^= value.charCodeAt(i);
+        hash = Math.imul(hash, 16777619);
+    }
+    return (hash >>> 0).toString(16);
+}
+
+function pruneUsageKeyCache(now = Date.now()) {
+    for (const [key, timestamp] of recentTokenUsageKeys.entries()) {
+        if ((now - timestamp) > TOKEN_USAGE_DEDUPE_TTL_MS) {
+            recentTokenUsageKeys.delete(key);
+        }
+    }
+}
+
+function buildUsageKey(operation, profileId, modelId, sourceId, inputText, outputText) {
+    return [
+        operation || 'unknown',
+        profileId || 'current',
+        modelId || 'unknown-model',
+        sourceId || 'unknown-source',
+        hashText(inputText),
+        hashText(outputText),
+    ].join(':');
+}
+
+/**
+ * Report token usage for an AI feature call when TokenUsageTracker is available.
+ * For quiet generations, prefer consuming pending quiet usage from the tracker so
+ * input tokens come from the full prompt context instead of a local estimate.
+ * @param {Object} params
+ * @param {string} params.operation
+ * @param {string} [params.inputText]
+ * @param {string} [params.outputText]
+ * @param {boolean} [params.preferQuietFlush]
+ * @returns {Promise<boolean>} true if usage was recorded by this helper
+ */
+async function reportTokenUsageIfNeeded({ operation, inputText = '', outputText = '', preferQuietFlush = false }) {
+    try {
+        const tracker = window['TokenUsageTracker'];
+        if (!tracker || typeof outputText !== 'string' || outputText.length === 0) return false;
+
+        if (preferQuietFlush && typeof tracker.flushPendingQuietGeneration === 'function') {
+            const flushed = await tracker.flushPendingQuietGeneration(outputText);
+            if (flushed) return true;
+            // If pending quiet usage was not flushed, avoid fallback counting here.
+            // The tracker may have already recorded this generation via core events.
+            return false;
+        }
+
+        if (typeof tracker.countTokens !== 'function' || typeof tracker.recordUsage !== 'function') return false;
+
+        const promptText = typeof inputText === 'string' ? inputText : '';
+        const inputTokens = promptText ? await tracker.countTokens(promptText) : 0;
+        const outputTokens = await tracker.countTokens(outputText);
+        if (inputTokens <= 0 && outputTokens <= 0) return false;
+
+        const modelId = typeof tracker.getCurrentModelId === 'function' ? tracker.getCurrentModelId() : null;
+        const sourceId = typeof tracker.getCurrentSourceId === 'function' ? tracker.getCurrentSourceId() : null;
+        const usageKey = buildUsageKey(
+            operation,
+            getAIConnectionProfile(),
+            modelId,
+            sourceId,
+            promptText,
+            outputText,
+        );
+
+        const now = Date.now();
+        pruneUsageKeyCache(now);
+
+        const seenAt = recentTokenUsageKeys.get(usageKey);
+        if (typeof seenAt === 'number' && (now - seenAt) <= TOKEN_USAGE_DEDUPE_TTL_MS) {
+            return false;
+        }
+        recentTokenUsageKeys.set(usageKey, now);
+
+        tracker.recordUsage(inputTokens, outputTokens, null, modelId, sourceId, 0);
+        return true;
+    } catch (e) {
+        console.warn(`[${MODULE_NAME}] Token usage reporting failed:`, e);
+        return false;
+    }
+}
 
 function notifyWarning(message) {
     if (typeof toastr !== 'undefined' && typeof toastr.warning === 'function') {
@@ -132,10 +223,17 @@ export async function generateTitleForActiveChat() {
         if (!requireLLM()) return null;
 
         const context = SillyTavern.getContext();
+        const quietPrompt = 'Based on the recent messages, generate a short title (3-10 words) capturing the most recent key event or theme. Output ONLY the title text. No quotes, no explanation.';
 
         try {
             const result = await context.generateQuietPrompt({
-                quietPrompt: 'Based on the recent messages, generate a short title (3-10 words) capturing the most recent key event or theme. Output ONLY the title text. No quotes, no explanation.',
+                quietPrompt,
+            });
+            await reportTokenUsageIfNeeded({
+                operation: 'active-title-quiet',
+                inputText: quietPrompt,
+                outputText: result,
+                preferQuietFlush: true,
             });
 
             const title = cleanGeneratedText(result, 200);
@@ -174,20 +272,11 @@ export async function generateTitleForChat(messages, characterName) {
 
         try {
             const result = await context.generateRaw({ prompt, systemPrompt });
-
-            // Report token usage
-            try {
-                const tracker = window['TokenUsageTracker'];
-                if (tracker && result) {
-                    const inputTokens = await tracker.countTokens(systemPrompt + '\n' + prompt);
-                    const outputTokens = await tracker.countTokens(result);
-                    const modelId = tracker.getCurrentModelId();
-                    const sourceId = tracker.getCurrentSourceId();
-                    tracker.recordUsage(inputTokens, outputTokens, null, modelId, sourceId, 0);
-                }
-            } catch (e) {
-                console.warn(`[${MODULE_NAME}] Token usage reporting failed:`, e);
-            }
+            await reportTokenUsageIfNeeded({
+                operation: 'thread-title-raw',
+                inputText: `${systemPrompt}\n${prompt}`,
+                outputText: result,
+            });
 
             const title = cleanGeneratedText(result, 200);
             if (!title) {
@@ -213,10 +302,17 @@ export async function generateSummaryForActiveChat() {
         if (!requireLLM()) return null;
 
         const context = SillyTavern.getContext();
+        const quietPrompt = 'Summarize this roleplay conversation with emphasis on recent events. 2-4 sentences. Focus on what happened, key actions, and current situation. Output ONLY the summary.';
 
         try {
             const result = await context.generateQuietPrompt({
-                quietPrompt: 'Summarize this roleplay conversation with emphasis on recent events. 2-4 sentences. Focus on what happened, key actions, and current situation. Output ONLY the summary.',
+                quietPrompt,
+            });
+            await reportTokenUsageIfNeeded({
+                operation: 'active-summary-quiet',
+                inputText: quietPrompt,
+                outputText: result,
+                preferQuietFlush: true,
             });
 
             const summary = cleanGeneratedText(result, 1000);
@@ -285,20 +381,11 @@ export async function generateSummaryForChat(messages, characterName, branchPoin
 
         try {
             const result = await context.generateRaw({ prompt, systemPrompt });
-
-            // Report token usage
-            try {
-                const tracker = window['TokenUsageTracker'];
-                if (tracker && result) {
-                    const inputTokens = await tracker.countTokens(systemPrompt + '\n' + prompt);
-                    const outputTokens = await tracker.countTokens(result);
-                    const modelId = tracker.getCurrentModelId();
-                    const sourceId = tracker.getCurrentSourceId();
-                    tracker.recordUsage(inputTokens, outputTokens, null, modelId, sourceId, 0);
-                }
-            } catch (e) {
-                console.warn(`[${MODULE_NAME}] Token usage reporting failed:`, e);
-            }
+            await reportTokenUsageIfNeeded({
+                operation: 'thread-summary-raw',
+                inputText: `${systemPrompt}\n${prompt}`,
+                outputText: result,
+            });
 
             const summary = cleanGeneratedText(result, 1000);
             if (!summary) {
