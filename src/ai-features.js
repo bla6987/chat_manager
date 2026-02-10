@@ -239,9 +239,10 @@ export async function generateSummaryForActiveChat() {
  * @param {Array} messages - Array of {role, text} message objects
  * @param {string} characterName
  * @param {number|null} branchPoint - Message index where this chat diverges from another
+ * @param {string} [branchContextText=''] - Optional sibling branch context for contrastive summary
  * @returns {Promise<string|null>}
  */
-export async function generateSummaryForChat(messages, characterName, branchPoint = null) {
+export async function generateSummaryForChat(messages, characterName, branchPoint = null, branchContextText = '') {
     return withAIProfile(async () => {
         if (!requireLLM()) return null;
 
@@ -274,7 +275,12 @@ export async function generateSummaryForChat(messages, characterName, branchPoin
             }
         }
 
-        const prompt = `Given these recent roleplay messages:\n\n${messageContext}\n\nSummarize this roleplay conversation with emphasis on recent events. 2-4 sentences. Focus on what happened, key actions, and current situation.${branchHint} Output ONLY the summary.`;
+        const trimmedBranchContext = typeof branchContextText === 'string' ? branchContextText.trim() : '';
+        const siblingContextBlock = trimmedBranchContext
+            ? `\n\nHere is sibling branch context for comparison:\n\n${trimmedBranchContext}\n\nUse this only to highlight what is unique in the target thread compared to sibling branches.`
+            : '';
+
+        const prompt = `Given these recent roleplay messages:\n\n${messageContext}${siblingContextBlock}\n\nSummarize this roleplay conversation with emphasis on recent events. 2-4 sentences. Focus on what happened, key actions, and current situation.${branchHint} Output ONLY the summary.`;
         const systemPrompt = 'You are a concise summarizer. Output only the requested summary.';
 
         try {

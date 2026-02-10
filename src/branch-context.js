@@ -89,3 +89,42 @@ export function formatBranchContext(siblings, characterName) {
 
     return lines.join('\n');
 }
+
+/**
+ * Format sibling branch data for non-active summary generation.
+ * Keeps the structure compact so the model can focus on differences.
+ * @param {Array<{ fileName: string, branchPoint: number, messages: Array }>} siblings
+ * @param {string} characterName
+ * @param {string} [targetDisplayName='this thread']
+ * @returns {string}
+ */
+export function formatBranchContextForSummary(siblings, characterName, targetDisplayName = 'this thread') {
+    if (!Array.isArray(siblings) || siblings.length === 0) return '';
+
+    const lines = [];
+    lines.push('[Sibling Branch Context]');
+    lines.push(`These are sibling branches relative to "${targetDisplayName}".`);
+    lines.push('Use them to highlight what is unique in the target thread.');
+    lines.push('');
+
+    for (const sibling of siblings) {
+        const displayName = getDisplayName(sibling.fileName) || sibling.fileName;
+        lines.push(`=== Sibling Branch: "${displayName}" ===`);
+        lines.push(`Diverged at message #${sibling.branchPoint}. ${sibling.messages.length} messages after branch point.`);
+        lines.push('');
+
+        for (const msg of sibling.messages) {
+            const role = msg.role === 'user' ? 'User' : characterName;
+            let text = msg.text || '';
+            if (text.length > MSG_TRUNCATE) {
+                text = text.substring(0, MSG_TRUNCATE) + '…';
+            }
+            lines.push(`${role}: ${text}`);
+        }
+
+        lines.push('');
+    }
+
+    lines.push('[End Sibling Branch Context]');
+    return lines.join('\n');
+}

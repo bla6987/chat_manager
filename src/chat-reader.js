@@ -940,24 +940,48 @@ function detectBranches(index, activeFilename) {
         if (entry.fileName === activeFilename) continue;
         if (!entry.isLoaded || entry.messages.length < 2) continue;
 
-        // Check if first messages match
-        if (entry.messages[0]?.text !== activeEntry.messages[0]?.text) continue;
-
-        // Compare ALL shared messages to find actual divergence point
-        const maxCompare = Math.min(entry.messages.length, activeEntry.messages.length);
-        let divergeAt = maxCompare;
-
-        for (let k = 1; k < maxCompare; k++) {
-            if (entry.messages[k]?.text !== activeEntry.messages[k]?.text) {
-                divergeAt = k;
-                break;
-            }
-        }
-
-        if (divergeAt > 0) {
-            entry.branchPoint = divergeAt;
+        const branchPoint = computeBranchPoint(activeEntry.messages, entry.messages);
+        if (branchPoint !== null) {
+            entry.branchPoint = branchPoint;
         }
     }
+}
+
+/**
+ * Compute where two threads diverge.
+ * Returns the first differing message index, or the shared-length boundary if one is a strict
+ * prefix of the other. Returns null when threads do not share the same starting message.
+ * @param {IndexMessage[]} baseMessages
+ * @param {IndexMessage[]} candidateMessages
+ * @returns {number|null}
+ */
+export function computeBranchPoint(baseMessages, candidateMessages) {
+    if (!Array.isArray(baseMessages) || !Array.isArray(candidateMessages)) return null;
+    if (baseMessages.length < 2 || candidateMessages.length < 2) return null;
+
+    if (candidateMessages[0]?.text !== baseMessages[0]?.text) return null;
+
+    const maxCompare = Math.min(candidateMessages.length, baseMessages.length);
+    let divergeAt = maxCompare;
+
+    for (let k = 1; k < maxCompare; k++) {
+        if (candidateMessages[k]?.text !== baseMessages[k]?.text) {
+            divergeAt = k;
+            break;
+        }
+    }
+
+    return divergeAt > 0 ? divergeAt : null;
+}
+
+function sortSiblingContextByRecency(siblings) {
+    siblings.sort((a, b) => {
+        const aLast = a.messages[a.messages.length - 1];
+        const bLast = b.messages[b.messages.length - 1];
+        const aTime = aLast?.timestamp ? new Date(aLast.timestamp).getTime() : 0;
+        const bTime = bLast?.timestamp ? new Date(bLast.timestamp).getTime() : 0;
+        return (Number.isFinite(bTime) ? bTime : 0) - (Number.isFinite(aTime) ? aTime : 0);
+    });
 }
 
 /**
@@ -989,14 +1013,44 @@ export function getSiblingBranchContext(activeFilename, maxBranches = 3) {
     }
 
     // Sort by most recent activity (newest first), then cap
-    siblings.sort((a, b) => {
-        const aLast = a.messages[a.messages.length - 1];
-        const bLast = b.messages[b.messages.length - 1];
-        const aTime = aLast?.timestamp ? new Date(aLast.timestamp).getTime() : 0;
-        const bTime = bLast?.timestamp ? new Date(bLast.timestamp).getTime() : 0;
-        return (Number.isFinite(bTime) ? bTime : 0) - (Number.isFinite(aTime) ? aTime : 0);
-    });
+    sortSiblingContextByRecency(siblings);
 
+    return siblings.slice(0, maxBranches);
+}
+
+/**
+ * Get sibling branch context relative to an arbitrary base thread.
+ * Unlike active-chat branch detection, this helper never mutates global entry.branchPoint values.
+ * @param {string} baseFilename - Filename of the thread being summarized
+ * @param {number} [maxBranches=3] - Maximum number of sibling branches to return
+ * @returns {Array<{ fileName: string, branchPoint: number, messages: IndexMessage[] }>}
+ */
+export function getSiblingBranchContextForThread(baseFilename, maxBranches = 3) {
+    if (!baseFilename) return [];
+
+    const baseEntry = chatIndex[baseFilename];
+    if (!baseEntry || !baseEntry.isLoaded || baseEntry.messages.length < 2) return [];
+
+    const siblings = [];
+
+    for (const entry of Object.values(chatIndex)) {
+        if (entry.fileName === baseFilename) continue;
+        if (!entry.isLoaded || entry.messages.length < 2) continue;
+
+        const branchPoint = computeBranchPoint(baseEntry.messages, entry.messages);
+        if (branchPoint === null) continue;
+
+        const postBranchMessages = entry.messages.slice(branchPoint);
+        if (postBranchMessages.length === 0) continue;
+
+        siblings.push({
+            fileName: entry.fileName,
+            branchPoint,
+            messages: postBranchMessages,
+        });
+    }
+
+    sortSiblingContextByRecency(siblings);
     return siblings.slice(0, maxBranches);
 }
 

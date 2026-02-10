@@ -6,6 +6,7 @@ import {
     buildIndex, getHydrationProgress, getIndex, getSearchableMessages, getSortedEntries,
     getFilteredSortedEntries, getIndexVersion,
     isHydrationComplete, onHydrationUpdate, prioritizeInQueue, runDeferredBranchDetection,
+    getSiblingBranchContextForThread,
     ensureMessageEmbeddingMap, getMessageActiveSwipeIndex, getMessageEmbedding, setMessageEmbedding, makeMessageEmbeddingKey,
 } from './chat-reader.js';
 import {
@@ -21,7 +22,7 @@ import {
     isEmbeddingChatSelected, setEmbeddingChatSelected,
 } from './metadata-store.js';
 import {
-    updateBranchContextInjection, clearBranchContextInjection,
+    updateBranchContextInjection, clearBranchContextInjection, formatBranchContextForSummary,
 } from './branch-context.js';
 import {
     generateTitleForActiveChat, generateTitleForChat,
@@ -56,6 +57,7 @@ const RECLUSTER_IDLE_MS = 60000;
 const RECLUSTER_IMMEDIATE_THRESHOLD = 5;
 const RECLUSTER_CHAT_DELTA_RATIO = 0.2;
 const SWIPE_BACKGROUND_EMBED_DELAY_MS = 650;
+const SUMMARY_SIBLING_BRANCH_LIMIT = 3;
 
 let panelOpen = false;
 let timelineActive = false;
@@ -3453,7 +3455,8 @@ async function handleAISummaryAndTitle(e) {
                 return;
             }
             const context = SillyTavern.getContext();
-            summary = await generateSummaryForChat(chatData.messages, context.name2, chatData.branchPoint);
+            const siblingContext = getSummarySiblingContextText(filename, context.name2);
+            summary = await generateSummaryForChat(chatData.messages, context.name2, chatData.branchPoint, siblingContext);
             title = await generateTitleForChat(chatData.messages, context.name2);
         }
 
@@ -3637,7 +3640,8 @@ async function handleRegenSummary(e) {
                 return;
             }
             const context = SillyTavern.getContext();
-            summary = await generateSummaryForChat(chatData.messages, context.name2, chatData.branchPoint);
+            const siblingContext = getSummarySiblingContextText(filename, context.name2);
+            summary = await generateSummaryForChat(chatData.messages, context.name2, chatData.branchPoint, siblingContext);
         }
 
         if (summary) {
@@ -3657,6 +3661,17 @@ async function handleRegenSummary(e) {
     } finally {
         btn.classList.remove('disabled', 'fa-spin');
     }
+}
+
+function getSummarySiblingContextText(fileName, characterName) {
+    if (!branchContextActive) return '';
+    if (!fileName) return '';
+
+    const siblings = getSiblingBranchContextForThread(fileName, SUMMARY_SIBLING_BRANCH_LIMIT);
+    if (siblings.length === 0) return '';
+
+    const targetDisplayName = getDisplayName(fileName) || fileName;
+    return formatBranchContextForSummary(siblings, characterName || 'Character', targetDisplayName);
 }
 
 async function handleJumpToMessage(e) {
