@@ -262,6 +262,7 @@ export function updateGraphViewData() {
     hideEmpty();
     // Re-score existing pins against new data
     rebuildSimulation();
+    updatePinInfo();
     queueRender();
 }
 
@@ -357,6 +358,12 @@ function collectMessageVectors() {
     messageDims = detectedDims;
 }
 
+function isPinVectorCompatible(pin) {
+    if (!Array.isArray(pin?.vector) || pin.vector.length === 0) return false;
+    if (messageDims > 0 && pin.vector.length !== messageDims) return false;
+    return true;
+}
+
 /* ══════════════════════════════════════════════
    Pin Management
    ══════════════════════════════════════════════ */
@@ -392,6 +399,10 @@ async function addSearchTermPin(query) {
 
     if (!Array.isArray(vector) || vector.length === 0) {
         setInfo('Embedding returned empty vector.');
+        return;
+    }
+    if (messageDims > 0 && vector.length !== messageDims) {
+        setInfo(`Query embedding is ${vector.length}D but message vectors are ${messageDims}D. Rebuild message embeddings for the active model.`);
         return;
     }
 
@@ -487,7 +498,13 @@ function updatePinInfo() {
         setInfo(`${messageRefs.length.toLocaleString()} messages available · Pin a search term to begin`);
     } else {
         const neighborCount = simNodes.filter(n => !n.isPin).length;
-        setInfo(`${pins.length} pin${pins.length > 1 ? 's' : ''} · ${neighborCount} neighbors`);
+        const incompatiblePinCount = messageDims > 0
+            ? pins.filter(pin => !isPinVectorCompatible(pin)).length
+            : 0;
+        const incompatSuffix = incompatiblePinCount > 0
+            ? ` · ${incompatiblePinCount} incompatible pin${incompatiblePinCount !== 1 ? 's' : ''}`
+            : '';
+        setInfo(`${pins.length} pin${pins.length > 1 ? 's' : ''} · ${neighborCount} neighbors${incompatSuffix}`);
     }
 }
 
@@ -522,16 +539,28 @@ function rebuildSimulation() {
         });
     }
 
+    const pinnedMessageIndices = new Set();
+    const compatiblePinIndices = [];
+    for (let p = 0; p < pins.length; p++) {
+        const pin = pins[p];
+        if (pin.kind === 'message' && Number.isInteger(pin.msgRefIndex) && pin.msgRefIndex >= 0) {
+            pinnedMessageIndices.add(pin.msgRefIndex);
+        }
+        if (isPinVectorCompatible(pin)) {
+            compatiblePinIndices.push(p);
+        }
+    }
+
     // Score all messages against all pins, find best pin + similarity
     const scored = [];
     for (let i = 0; i < messageRefs.length; i++) {
         // Skip messages that are already pins
-        if (pins.some(p => p.kind === 'message' && p.msgRefIndex === i)) continue;
+        if (pinnedMessageIndices.has(i)) continue;
 
         let bestPin = -1;
         let bestSim = -Infinity;
 
-        for (let p = 0; p < pins.length; p++) {
+        for (const p of compatiblePinIndices) {
             const sim = fastCosineSim(pins[p].vector, messageVectors[i], messageNorms[i]);
             if (sim > bestSim) {
                 bestSim = sim;
@@ -589,7 +618,7 @@ function rebuildSimulation() {
 }
 
 function fastCosineSim(vecA, vecB, normB) {
-    if (!vecA || !vecB || vecA.length !== vecB.length) return 0;
+    if (!vecA || !vecB || vecA.length !== vecB.length) return Number.NEGATIVE_INFINITY;
     let dot = 0;
     let normASq = 0;
     for (let d = 0; d < vecA.length; d++) {

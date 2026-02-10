@@ -61,7 +61,7 @@ const onMessageUpdate = (() => {
             }
 
             if (isPanelOpen() && activeChatFile) {
-                if (updated && !isTimelineActive() && !isStatsActive() && !isSemanticMapActive()) {
+                if (updated && !isTimelineActive() && !isStatsActive() && !isSemanticMapActive() && !isGraphViewActive()) {
                     renderThreadCards();
                 }
             }
@@ -690,7 +690,7 @@ function bindEmbeddingSettingsUI(container) {
             return;
         }
 
-        if (!isTimelineActive() && !isStatsActive() && !isSemanticMapActive()) {
+        if (!isTimelineActive() && !isStatsActive() && !isSemanticMapActive() && !isGraphViewActive()) {
             const query = String(document.getElementById('chat-manager-search')?.value || '').trim();
             if (query.length >= 2) {
                 void performSearch(query);
@@ -835,7 +835,7 @@ function bindEmbeddingSettingsUI(container) {
     colorModeEl.addEventListener('change', persistForm);
     scopeModeEl.addEventListener('change', () => {
         persistForm();
-        if (isPanelOpen() && !isTimelineActive() && !isStatsActive() && !isSemanticMapActive()) {
+        if (isPanelOpen() && !isTimelineActive() && !isStatsActive() && !isSemanticMapActive() && !isGraphViewActive()) {
             renderThreadCards();
         }
     });
