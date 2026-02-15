@@ -36,8 +36,13 @@ const PIN_RADIUS = 12;
 const NEIGHBOR_MIN_RADIUS = 3;
 const NEIGHBOR_MAX_RADIUS = 7;
 const LABEL_FONT = '11px sans-serif';
-const LABEL_MAX_CHARS = 36;
+const LABEL_MAX_CHARS = 120;
 const TOOLTIP_MAX_CHARS = 300;
+
+const TEXT_ZOOM_MIN = 0.5;
+const TEXT_ZOOM_MAX = 0.85;
+const TEXT_FONT_SIZE = 10;
+const TEXT_AVG_CHAR_WIDTH = 5.8;
 
 const PALETTE = [
     '#E05252', '#5294E0', '#52B788', '#E0A052',
@@ -855,19 +860,42 @@ function drawEdges() {
     }
 }
 
+function getTextBlend() {
+    return Math.max(0, Math.min(1, (camera.zoom - TEXT_ZOOM_MIN) / (TEXT_ZOOM_MAX - TEXT_ZOOM_MIN)));
+}
+
 function drawNeighborNodes() {
+    const textBlend = getTextBlend();
+    const drawDots = textBlend < 1;
+    const drawText = textBlend > 0;
+
+    if (drawText) {
+        ctx.font = `${TEXT_FONT_SIZE}px sans-serif`;
+        ctx.textBaseline = 'middle';
+        ctx.textAlign = 'left';
+    }
+
     for (let i = 0; i < simNodes.length; i++) {
         const node = simNodes[i];
         if (node.isPin) continue;
 
         const color = PALETTE[node.colorIndex % PALETTE.length];
-        const radius = NEIGHBOR_MIN_RADIUS + node.similarity * (NEIGHBOR_MAX_RADIUS - NEIGHBOR_MIN_RADIUS);
         const alpha = 0.3 + node.similarity * 0.55;
 
-        ctx.fillStyle = hexToRgba(color, alpha);
-        ctx.beginPath();
-        ctx.arc(node.x, node.y, radius, 0, Math.PI * 2);
-        ctx.fill();
+        // Dots (fade out as text fades in)
+        if (drawDots) {
+            const radius = NEIGHBOR_MIN_RADIUS + node.similarity * (NEIGHBOR_MAX_RADIUS - NEIGHBOR_MIN_RADIUS);
+            ctx.fillStyle = hexToRgba(color, alpha * (1 - textBlend));
+            ctx.beginPath();
+            ctx.arc(node.x, node.y, radius, 0, Math.PI * 2);
+            ctx.fill();
+        }
+
+        // Text labels (fade in as dots fade out)
+        if (drawText) {
+            ctx.fillStyle = hexToRgba(color, alpha * textBlend);
+            ctx.fillText(node.label, node.x + 4, node.y);
+        }
     }
 }
 
@@ -909,8 +937,36 @@ function drawPinNodes() {
 
 function drawNodeHighlight(index) {
     const node = simNodes[index];
-    const radius = node.isPin ? PIN_RADIUS + 4 : NEIGHBOR_MIN_RADIUS + node.similarity * (NEIGHBOR_MAX_RADIUS - NEIGHBOR_MIN_RADIUS) + 3;
     const color = PALETTE[node.colorIndex % PALETTE.length];
+    const textBlend = getTextBlend();
+
+    // Text-mode highlight: rounded rectangle behind the label
+    if (!node.isPin && textBlend > 0.5) {
+        const pad = 3;
+        const textW = node.label.length * TEXT_AVG_CHAR_WIDTH;
+        const rx = node.x + 4 - pad;
+        const ry = node.y - TEXT_FONT_SIZE / 2 - pad;
+        const rw = textW + pad * 2;
+        const rh = TEXT_FONT_SIZE + pad * 2;
+
+        ctx.strokeStyle = hexToRgba(color, 0.7);
+        ctx.lineWidth = 1.5 / camera.zoom;
+        ctx.beginPath();
+        ctx.roundRect(rx, ry, rw, rh, 3 / camera.zoom);
+        ctx.stroke();
+
+        ctx.shadowColor = color;
+        ctx.shadowBlur = 8;
+        ctx.strokeStyle = hexToRgba(color, 0.3);
+        ctx.beginPath();
+        ctx.roundRect(rx, ry, rw, rh, 3 / camera.zoom);
+        ctx.stroke();
+        ctx.shadowBlur = 0;
+        return;
+    }
+
+    // Circle highlight (pins and zoomed-out neighbor dots)
+    const radius = node.isPin ? PIN_RADIUS + 4 : NEIGHBOR_MIN_RADIUS + node.similarity * (NEIGHBOR_MAX_RADIUS - NEIGHBOR_MIN_RADIUS) + 3;
 
     ctx.strokeStyle = hexToRgba(color, 0.7);
     ctx.lineWidth = 2 / camera.zoom;
@@ -1342,18 +1398,33 @@ function hitTest(wx, wy) {
     // Test pins first (priority), then neighbors
     let bestDist = Infinity;
     let bestIndex = -1;
+    const textBlend = getTextBlend();
+    const useTextHit = textBlend > 0.5;
 
     for (let i = 0; i < simNodes.length; i++) {
         const node = simNodes[i];
         const dx = wx - node.x;
         const dy = wy - node.y;
-        const distSq = dx * dx + dy * dy;
 
-        const hitRadius = node.isPin
-            ? (PIN_RADIUS + 6) / camera.zoom
-            : (NEIGHBOR_MAX_RADIUS + 4) / camera.zoom;
+        let hit = false;
+        let distSq = dx * dx + dy * dy;
 
-        if (distSq < hitRadius * hitRadius && distSq < bestDist) {
+        if (node.isPin) {
+            const hitRadius = (PIN_RADIUS + 6) / camera.zoom;
+            hit = distSq < hitRadius * hitRadius;
+        } else if (useTextHit) {
+            // Rectangular hit area for text labels
+            const textW = node.label.length * TEXT_AVG_CHAR_WIDTH;
+            const pad = 4;
+            hit = dx >= -pad && dx <= textW + pad + 4
+                && dy >= -(TEXT_FONT_SIZE / 2 + pad) && dy <= (TEXT_FONT_SIZE / 2 + pad);
+            if (hit) distSq = dx * dx + dy * dy; // keep distance for priority
+        } else {
+            const hitRadius = (NEIGHBOR_MAX_RADIUS + 4) / camera.zoom;
+            hit = distSq < hitRadius * hitRadius;
+        }
+
+        if (hit && distSq < bestDist) {
             // Prefer pins over neighbors when overlapping
             if (node.isPin || bestIndex < 0 || !simNodes[bestIndex]?.isPin) {
                 bestDist = distSq;
