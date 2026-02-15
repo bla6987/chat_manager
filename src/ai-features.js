@@ -225,9 +225,15 @@ export async function generateTitleForActiveChat() {
         const context = SillyTavern.getContext();
         const quietPrompt = 'Based on the recent messages, generate a short title (3-10 words) capturing the most recent key event or theme. Output ONLY the title text. No quotes, no explanation.';
 
+        // Inject as user-role message instead of system-role quiet prompt.
+        // The quiet prompt mechanism creates a trailing system message which
+        // violates Claude's "conversation must end with user message" constraint.
+        // extension_prompt_types.IN_CHAT = 1, extension_prompt_roles.USER = 1
+        const INJECT_KEY = 'cm_quiet_inject';
+        context.setExtensionPrompt(INJECT_KEY, quietPrompt, 1 /* IN_CHAT */, 0, false, 1 /* USER */);
         try {
             const result = await context.generateQuietPrompt({
-                quietPrompt,
+                quietPrompt: '',
             });
             await reportTokenUsageIfNeeded({
                 operation: 'active-title-quiet',
@@ -247,6 +253,8 @@ export async function generateTitleForActiveChat() {
             console.error(`[${MODULE_NAME}] Title generation failed:`, err);
             notifyError('Failed to generate title. Check API connection.');
             return null;
+        } finally {
+            context.setExtensionPrompt(INJECT_KEY, '', 1, 0, false, 1);
         }
     });
 }
@@ -304,9 +312,13 @@ export async function generateSummaryForActiveChat() {
         const context = SillyTavern.getContext();
         const quietPrompt = 'Summarize this roleplay conversation with emphasis on recent events. 2-4 sentences. Focus on what happened, key actions, and current situation. Output ONLY the summary.';
 
+        // Inject as user-role message instead of system-role quiet prompt.
+        // extension_prompt_types.IN_CHAT = 1, extension_prompt_roles.USER = 1
+        const INJECT_KEY = 'cm_quiet_inject';
+        context.setExtensionPrompt(INJECT_KEY, quietPrompt, 1 /* IN_CHAT */, 0, false, 1 /* USER */);
         try {
             const result = await context.generateQuietPrompt({
-                quietPrompt,
+                quietPrompt: '',
             });
             await reportTokenUsageIfNeeded({
                 operation: 'active-summary-quiet',
@@ -326,6 +338,8 @@ export async function generateSummaryForActiveChat() {
             console.error(`[${MODULE_NAME}] Summary generation failed:`, err);
             notifyError('Failed to generate summary. Check API connection.');
             return null;
+        } finally {
+            context.setExtensionPrompt(INJECT_KEY, '', 1, 0, false, 1);
         }
     });
 }
