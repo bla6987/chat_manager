@@ -1,3 +1,23 @@
 node_modules/
 *.log
 .DS_Store
+.ai-notes/
+
+# >>> agent_rules.sh managed >>>
+# Generated from AGENTS.md — do not edit these directly
+CLAUDE.md
+CONVENTIONS.md
+GEMINI.md
+.cursorrules
+.windsurfrules
+.continuerules
+.rules
+.cursor/rules/project.mdc
+.windsurf/rules/
+.github/copilot-instructions.md
+.clinerules/
+.gemini/styleguide.md
+.aiassistant/
+.amazonq/
+.plandex/
+# <<< agent_rules.sh managed <<<
