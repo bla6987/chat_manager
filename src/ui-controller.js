@@ -98,6 +98,58 @@ let searchState = null;
 /** @type {null|'keyword'|'semantic'} — null = auto, otherwise forced mode */
 let searchModeOverride = null;
 
+/* ── DOM element cache — avoids repeated querySelector calls ── */
+const _domCache = {
+    searchWrapper: null,
+    filterToolbar: null,
+    content: null,
+    status: null,
+    searchInput: null,
+};
+
+function _getSearchWrapper() {
+    if (!_domCache.searchWrapper || !_domCache.searchWrapper.isConnected) {
+        _domCache.searchWrapper = document.querySelector('.chat-manager-search-wrapper');
+    }
+    return _domCache.searchWrapper;
+}
+
+function _getFilterToolbar() {
+    if (!_domCache.filterToolbar || !_domCache.filterToolbar.isConnected) {
+        _domCache.filterToolbar = document.querySelector('.chat-manager-filter-toolbar');
+    }
+    return _domCache.filterToolbar;
+}
+
+function _getContent() {
+    if (!_domCache.content || !_domCache.content.isConnected) {
+        _domCache.content = document.getElementById('chat-manager-content');
+    }
+    return _domCache.content;
+}
+
+function _getStatus() {
+    if (!_domCache.status || !_domCache.status.isConnected) {
+        _domCache.status = document.getElementById('chat-manager-status');
+    }
+    return _domCache.status;
+}
+
+function _getSearchInput() {
+    if (!_domCache.searchInput || !_domCache.searchInput.isConnected) {
+        _domCache.searchInput = document.getElementById('chat-manager-search');
+    }
+    return _domCache.searchInput;
+}
+
+function _invalidateDomCache() {
+    _domCache.searchWrapper = null;
+    _domCache.filterToolbar = null;
+    _domCache.content = null;
+    _domCache.status = null;
+    _domCache.searchInput = null;
+}
+
 export function resetSearchState() {
     latestSearchRequestId += 1;
     searchState = null;
@@ -224,7 +276,7 @@ function getScopeFilteredEntries(entries, settings) {
 }
 
 function updateEmbeddingSelectionControls(toolbar = null) {
-    const root = toolbar || document.querySelector('.chat-manager-filter-toolbar');
+    const root = toolbar || _getFilterToolbar();
     if (!root) return;
 
     const selectVisibleBtn = root.querySelector('.chat-manager-emb-select-visible-btn');
@@ -1143,9 +1195,9 @@ export function toggleSemanticMap() {
             deactivateGraphView();
         }
 
-        const searchWrapper = document.querySelector('.chat-manager-search-wrapper');
-        const toolbar = document.querySelector('.chat-manager-filter-toolbar');
-        const content = document.getElementById('chat-manager-content');
+        const searchWrapper = _getSearchWrapper();
+        const toolbar = _getFilterToolbar();
+        const content = _getContent();
         if (searchWrapper) searchWrapper.style.display = 'none';
         if (toolbar) toolbar.style.display = 'none';
         dismissDropdown();
@@ -1160,14 +1212,12 @@ export function toggleSemanticMap() {
         });
 
         requestAnimationFrame(() => {
-            requestAnimationFrame(() => {
-                if (!semanticMapActive) return;
-                if (content) {
-                    mountSemanticMap(content, 'mini');
-                }
-                const status = document.getElementById('chat-manager-status');
-                if (status) status.textContent = 'Semantic map view';
-            });
+            if (!semanticMapActive) return;
+            if (content) {
+                mountSemanticMap(content, 'mini');
+            }
+            const status = _getStatus();
+            if (status) status.textContent = 'Semantic map view';
         });
     } else {
         deactivateSemanticMap();
@@ -1189,9 +1239,9 @@ export function toggleGraphView() {
         if (semanticMapActive) deactivateSemanticMap();
         if (statsActive) deactivateStats();
 
-        const searchWrapper = document.querySelector('.chat-manager-search-wrapper');
-        const toolbar = document.querySelector('.chat-manager-filter-toolbar');
-        const content = document.getElementById('chat-manager-content');
+        const searchWrapper = _getSearchWrapper();
+        const toolbar = _getFilterToolbar();
+        const content = _getContent();
         if (searchWrapper) searchWrapper.style.display = 'none';
         if (toolbar) toolbar.style.display = 'none';
         dismissDropdown();
@@ -1206,12 +1256,10 @@ export function toggleGraphView() {
         });
 
         requestAnimationFrame(() => {
-            requestAnimationFrame(() => {
-                if (!graphViewActive) return;
-                if (content) mountGraphView(content);
-                const status = document.getElementById('chat-manager-status');
-                if (status) status.textContent = 'Graph view';
-            });
+            if (!graphViewActive) return;
+            if (content) mountGraphView(content);
+            const status = _getStatus();
+            if (status) status.textContent = 'Graph view';
         });
     } else {
         deactivateGraphView();
@@ -1245,13 +1293,13 @@ export function toggleTimeline() {
         deactivateGraphView();
     }
 
-    const searchWrapper = document.querySelector('.chat-manager-search-wrapper');
-    const content = document.getElementById('chat-manager-content');
+    const searchWrapper = _getSearchWrapper();
+    const content = _getContent();
 
     if (timelineActive) {
         // Hide search and toolbar, switch content to timeline
         if (searchWrapper) searchWrapper.style.display = 'none';
-        const toolbar = document.querySelector('.chat-manager-filter-toolbar');
+        const toolbar = _getFilterToolbar();
         if (toolbar) toolbar.style.display = 'none';
         dismissDropdown();
         if (content) content.classList.add('timeline-active');
@@ -1270,16 +1318,14 @@ export function toggleTimeline() {
 
         // Show loading state immediately so the browser can paint before heavy work
         if (content) content.innerHTML = '<div class="chat-manager-loading"><div class="chat-manager-spinner"></div> Building chart\u2026</div>';
-        const status = document.getElementById('chat-manager-status');
+        const status = _getStatus();
         if (status) status.textContent = 'Loading timeline\u2026';
 
-        // Defer mount past reflow (double-rAF ensures CSS class change has reflowed)
+        // Defer mount past reflow — single rAF is enough after loading state paint
         requestAnimationFrame(() => {
-            requestAnimationFrame(() => {
-                if (!timelineActive) return;
-                if (content) mountIcicle(content, 'mini');
-                if (status) status.textContent = 'Timeline view';
-            });
+            if (!timelineActive) return;
+            if (content) mountIcicle(content, 'mini');
+            if (status) status.textContent = 'Timeline view';
         });
     } else {
         // Dismiss modal if open, then tear down
@@ -1288,7 +1334,7 @@ export function toggleTimeline() {
 
         // Restore search, toolbar, and content
         if (searchWrapper) searchWrapper.style.display = '';
-        const toolbar = document.querySelector('.chat-manager-filter-toolbar');
+        const toolbar = _getFilterToolbar();
         if (toolbar) toolbar.style.display = '';
         if (content) {
             content.classList.remove('timeline-active');
@@ -1309,9 +1355,9 @@ export function toggleStats() {
     const btn = document.getElementById('chat-manager-stats-toggle');
     if (btn) btn.classList.toggle('active', statsActive);
 
-    const searchWrapper = document.querySelector('.chat-manager-search-wrapper');
-    const toolbar = document.querySelector('.chat-manager-filter-toolbar');
-    const content = document.getElementById('chat-manager-content');
+    const searchWrapper = _getSearchWrapper();
+    const toolbar = _getFilterToolbar();
+    const content = _getContent();
 
     if (statsActive) {
         // Deactivate timeline if active
@@ -1343,7 +1389,7 @@ export function toggleStats() {
             mountStatsView(content);
         }
 
-        const status = document.getElementById('chat-manager-status');
+        const status = _getStatus();
         if (status) status.textContent = 'Stats dashboard';
     } else {
         deactivateStats();
@@ -1406,12 +1452,12 @@ function deactivateStats() {
     const btn = document.getElementById('chat-manager-stats-toggle');
     if (btn) btn.classList.remove('active');
 
-    const searchWrapper = document.querySelector('.chat-manager-search-wrapper');
+    const searchWrapper = _getSearchWrapper();
     if (searchWrapper) searchWrapper.style.display = '';
-    const toolbar = document.querySelector('.chat-manager-filter-toolbar');
+    const toolbar = _getFilterToolbar();
     if (toolbar) toolbar.style.display = '';
 
-    const content = document.getElementById('chat-manager-content');
+    const content = _getContent();
     if (content) content.innerHTML = '';
 }
 
@@ -1426,12 +1472,12 @@ function deactivateSemanticMap() {
     const btn = document.getElementById('chat-manager-semantic-map-toggle');
     if (btn) btn.classList.remove('active');
 
-    const searchWrapper = document.querySelector('.chat-manager-search-wrapper');
+    const searchWrapper = _getSearchWrapper();
     if (searchWrapper) searchWrapper.style.display = '';
-    const toolbar = document.querySelector('.chat-manager-filter-toolbar');
+    const toolbar = _getFilterToolbar();
     if (toolbar) toolbar.style.display = '';
 
-    const content = document.getElementById('chat-manager-content');
+    const content = _getContent();
     if (content) {
         content.classList.remove('timeline-active');
         content.innerHTML = '';
@@ -1446,12 +1492,12 @@ function deactivateGraphView() {
     const btn = document.getElementById('chat-manager-graph-view-toggle');
     if (btn) btn.classList.remove('active');
 
-    const searchWrapper = document.querySelector('.chat-manager-search-wrapper');
+    const searchWrapper = _getSearchWrapper();
     if (searchWrapper) searchWrapper.style.display = '';
-    const toolbar = document.querySelector('.chat-manager-filter-toolbar');
+    const toolbar = _getFilterToolbar();
     if (toolbar) toolbar.style.display = '';
 
-    const content = document.getElementById('chat-manager-content');
+    const content = _getContent();
     if (content) {
         content.classList.remove('timeline-active');
         content.innerHTML = '';
@@ -1837,10 +1883,10 @@ function deactivateTimeline() {
     const btn = document.getElementById('chat-manager-timeline-toggle');
     if (btn) btn.classList.remove('active');
 
-    const searchWrapper = document.querySelector('.chat-manager-search-wrapper');
+    const searchWrapper = _getSearchWrapper();
     if (searchWrapper) searchWrapper.style.display = '';
 
-    const content = document.getElementById('chat-manager-content');
+    const content = _getContent();
     if (content) content.classList.remove('timeline-active');
 }
 
@@ -1910,10 +1956,10 @@ export async function refreshPanel() {
     }
 
     if (semanticMapActive) {
-        const content = document.getElementById('chat-manager-content');
-        const status = document.getElementById('chat-manager-status');
-        const searchWrapper = document.querySelector('.chat-manager-search-wrapper');
-        const toolbar = document.querySelector('.chat-manager-filter-toolbar');
+        const content = _getContent();
+        const status = _getStatus();
+        const searchWrapper = _getSearchWrapper();
+        const toolbar = _getFilterToolbar();
         if (searchWrapper) searchWrapper.style.display = 'none';
         if (toolbar) toolbar.style.display = 'none';
         if (content) {
@@ -1941,10 +1987,10 @@ export async function refreshPanel() {
     }
 
     if (graphViewActive) {
-        const content = document.getElementById('chat-manager-content');
-        const status = document.getElementById('chat-manager-status');
-        const searchWrapper = document.querySelector('.chat-manager-search-wrapper');
-        const toolbar = document.querySelector('.chat-manager-filter-toolbar');
+        const content = _getContent();
+        const status = _getStatus();
+        const searchWrapper = _getSearchWrapper();
+        const toolbar = _getFilterToolbar();
         if (searchWrapper) searchWrapper.style.display = 'none';
         if (toolbar) toolbar.style.display = 'none';
         if (content) {
@@ -2167,15 +2213,15 @@ function renderLoading() {
 }
 
 function renderEmptyState(message) {
-    const container = document.getElementById('chat-manager-content');
-    const status = document.getElementById('chat-manager-status');
+    const container = _getContent();
+    const status = _getStatus();
     if (container) container.innerHTML = `<div class="chat-manager-empty">${escapeHtml(message)}</div>`;
     if (status) status.textContent = '';
 }
 
 export function renderThreadCards() {
-    const container = document.getElementById('chat-manager-content');
-    const status = document.getElementById('chat-manager-status');
+    const container = _getContent();
+    const status = _getStatus();
     if (!container) return;
 
     const index = getIndex();
@@ -2401,10 +2447,10 @@ function showDropdown(anchorEl, dropdown) {
  * Creates it once and updates active indicators.
  */
 function ensureFilterToolbar() {
-    const searchWrapper = document.querySelector('.chat-manager-search-wrapper');
+    const searchWrapper = _getSearchWrapper();
     if (!searchWrapper) return;
 
-    let toolbar = document.querySelector('.chat-manager-filter-toolbar');
+    let toolbar = _getFilterToolbar();
     if (!toolbar) {
         toolbar = document.createElement('div');
         toolbar.className = 'chat-manager-filter-toolbar';
@@ -3900,7 +3946,7 @@ export function onSearchInput(query) {
         return;
     }
 
-    const toolbar = document.querySelector('.chat-manager-filter-toolbar');
+    const toolbar = _getFilterToolbar();
     if (!query || query.trim().length < 2) {
         if (toolbar) toolbar.style.display = '';
         renderThreadCards();

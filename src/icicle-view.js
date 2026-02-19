@@ -468,10 +468,8 @@ export async function expandToFullScreen() {
     document.addEventListener('keydown', modal._escHandler);
 
     requestAnimationFrame(() => {
-        requestAnimationFrame(() => {
-            if (!modal.classList.contains('visible')) return;
-            mountIcicle(modalContainer, 'full');
-        });
+        if (!modal.classList.contains('visible')) return;
+        mountIcicle(modalContainer, 'full');
     });
 }
 

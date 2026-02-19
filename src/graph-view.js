@@ -70,6 +70,9 @@ let dpr = 1;
 let canvasWidth = 0;
 let canvasHeight = 0;
 let resizeObserver = null;
+let resizeObserverTimer = null;
+let lastObservedWidth = 0;
+let lastObservedHeight = 0;
 
 let onJumpToChat = null;
 let getActiveChatFile = null;
@@ -1199,16 +1202,34 @@ function unbindEvents() {
 
 function bindResizeObserver() {
     if (!container || typeof ResizeObserver !== 'function') return;
-    resizeObserver = new ResizeObserver(() => {
-        resizeCanvas();
+    resizeObserver = new ResizeObserver((entries) => {
+        for (const entry of entries) {
+            const { width, height } = entry.contentRect;
+            const dw = Math.abs(width - lastObservedWidth);
+            const dh = Math.abs(height - lastObservedHeight);
+            if (dw < 20 && dh < 20) return;
+            lastObservedWidth = width;
+            lastObservedHeight = height;
+        }
+        if (resizeObserverTimer) clearTimeout(resizeObserverTimer);
+        resizeObserverTimer = setTimeout(() => {
+            resizeObserverTimer = null;
+            resizeCanvas();
+        }, 50);
     });
     resizeObserver.observe(container);
 }
 
 function unbindResizeObserver() {
+    if (resizeObserverTimer) {
+        clearTimeout(resizeObserverTimer);
+        resizeObserverTimer = null;
+    }
     if (!resizeObserver) return;
     resizeObserver.disconnect();
     resizeObserver = null;
+    lastObservedWidth = 0;
+    lastObservedHeight = 0;
 }
 
 function handlePointerDown(e) {

@@ -643,6 +643,7 @@
     border-radius: 50%;
     animation: chat-manager-spin 0.6s linear infinite;
     display: inline-block;
+    will-change: transform;
 }
 
 .chat-manager-spinner-small {
@@ -654,6 +655,7 @@
     animation: chat-manager-spin 0.6s linear infinite;
     display: inline-block;
     vertical-align: middle;
+    will-change: transform;
 }
 
 @keyframes chat-manager-spin {
@@ -717,6 +719,14 @@
     backdrop-filter: blur(var(--SmartThemeBlurStrength));
     -webkit-backdrop-filter: blur(var(--SmartThemeBlurStrength));
     transition: opacity 0.3s ease;
+}
+
+@media (hover: none), (pointer: coarse) {
+    .chat-manager-shadow-overlay {
+        backdrop-filter: none;
+        -webkit-backdrop-filter: none;
+        background-color: rgba(0, 0, 0, 0.75);
+    }
 }
 
 .chat-manager-shadow-overlay.visible {
@@ -1032,6 +1042,14 @@
     background: rgba(14, 17, 22, 0.82);
     border: 1px solid rgba(255, 255, 255, 0.12);
     backdrop-filter: blur(2px);
+}
+
+@media (hover: none), (pointer: coarse) {
+    .chat-manager-semantic-map-toolbar {
+        backdrop-filter: none;
+        -webkit-backdrop-filter: none;
+        background: rgba(14, 17, 22, 0.94);
+    }
 }
 
 .chat-manager-semantic-map-query {
@@ -2251,6 +2269,14 @@
     background: rgba(14, 17, 22, 0.82);
     border: 1px solid rgba(255, 255, 255, 0.12);
     backdrop-filter: blur(2px);
+}
+
+@media (hover: none), (pointer: coarse) {
+    .chat-manager-graph-view-toolbar {
+        backdrop-filter: none;
+        -webkit-backdrop-filter: none;
+        background: rgba(14, 17, 22, 0.94);
+    }
 }
 
 .chat-manager-graph-view-query {
