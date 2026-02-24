@@ -23,7 +23,8 @@ const EXTENSION_PATH = '/scripts/extensions/third-party/chat_manager';
 const SETTINGS_CONTAINER_ID = 'chat_manager_settings_container';
 const START_BUTTON_ID = 'chat-manager-start-btn';
 const TOPBAR_CHAT_MANAGER_ID = 'extensionTopBarChatManager';
-const FALLBACK_TOGGLE_ID = 'chat-manager-toggle';
+const TOPBAR_TOGGLE_ID = 'chat-manager-topbar-toggle';
+const FLOATING_TOGGLE_ID = 'chat-manager-floating-toggle';
 
 const templateCache = new Map();
 let settingsInjected = false;
@@ -31,7 +32,6 @@ let pendingSettingsInjection = null;
 let currentInjectedMode = null;
 let pendingUIInjection = null;
 let slashCommandsRegistered = false;
-let topBarInterceptorBound = false;
 let cleanupMomentumScroll = null;
 
 function isEmbeddingGenerationEnabled() {
@@ -102,8 +102,7 @@ const onMessageUpdate = (() => {
         void injectSettingsPanel();
     }, 0);
 
-    bindTopBarClickInterceptor();
-    hijackTopBarButton();
+    mountTopBarToggleButton();
 
     // Listen for SillyTavern events
     if (eventSource && eventTypes) {
@@ -111,7 +110,7 @@ const onMessageUpdate = (() => {
         eventSource.on(eventTypes.MESSAGE_SENT, onMessageUpdate);
         eventSource.on(eventTypes.MESSAGE_RECEIVED, onMessageUpdate);
 
-        // Hijack TopInfoBar's chat manager button once all extensions are ready
+        // Ensure the top bar toggle button exists once all extensions are ready
         if (eventTypes.APP_READY) {
             eventSource.on(eventTypes.APP_READY, onAppReady);
         }
@@ -154,32 +153,11 @@ const onMessageUpdate = (() => {
 
 function onAppReady() {
     registerSlashCommands();
-    hijackTopBarButton();
+    mountTopBarToggleButton();
     void injectSettingsPanel();
     if (isEmbeddingGenerationEnabled()) {
         scheduleEmbeddingBootstrap();
     }
-}
-
-function bindTopBarClickInterceptor() {
-    if (topBarInterceptorBound) return;
-
-    document.addEventListener('click', (event) => {
-        if (!(event.target instanceof Element)) return;
-
-        const topBarButton = event.target.closest(`#${TOPBAR_CHAT_MANAGER_ID}`);
-        if (!topBarButton) return;
-
-        // Respect TopInfoBar's disabled state
-        if (topBarButton.classList.contains('not-in-chat')) return;
-
-        event.preventDefault();
-        // Avoid suppressing other capture listeners on the same element.
-        event.stopPropagation();
-        void handleTogglePanel(event);
-    }, true);
-
-    topBarInterceptorBound = true;
 }
 
 /**
@@ -1097,52 +1075,79 @@ async function switchDisplayMode(newMode) {
 }
 
 /**
- * Hijack TopInfoBar's "manage chat files" button so it opens the Chat Manager
- * panel instead of the native SillyTavern chat selection dialog.
- *
- * Falls back to creating a standalone button if TopInfoBar is not installed.
+ * Sync disabled state to match TopInfoBar's native chat manager button.
+ * @param {HTMLElement|null} toggleEl
  */
-function hijackTopBarButton() {
-    const existingBtn = document.getElementById(TOPBAR_CHAT_MANAGER_ID);
-    const existingFallback = document.getElementById(FALLBACK_TOGGLE_ID);
+function syncTopBarToggleDisabledState(toggleEl = null) {
+    const target = toggleEl || document.getElementById(TOPBAR_TOGGLE_ID);
+    if (!target) return;
 
-    if (existingBtn) {
-        existingBtn.title = 'Toggle Chat Manager';
+    const nativeTopBarBtn = document.getElementById(TOPBAR_CHAT_MANAGER_ID);
+    const isDisabled = !!nativeTopBarBtn?.classList.contains('not-in-chat');
+    target.classList.toggle('disabled', isDisabled);
+    target.setAttribute('aria-disabled', isDisabled ? 'true' : 'false');
+}
 
-        if (existingFallback) {
-            existingFallback.remove();
+/**
+ * Mount a dedicated Chat Manager button in TopInfoBar while preserving
+ * SillyTavern's native chat manager button behavior.
+ */
+function mountTopBarToggleButton() {
+    const topBar = document.getElementById('extensionTopBar');
+    const existingTopBarToggle = document.getElementById(TOPBAR_TOGGLE_ID);
+    const existingFloating = document.getElementById(FLOATING_TOGGLE_ID);
+
+    if (topBar) {
+        if (existingFloating) {
+            existingFloating.remove();
         }
 
-        if (!existingBtn.dataset.chatManagerHijacked) {
-            existingBtn.dataset.chatManagerHijacked = '1';
-            console.log(`[${MODULE_NAME}] Hijacked TopInfoBar chat manager button.`);
+        if (existingTopBarToggle) {
+            syncTopBarToggleDisabledState(existingTopBarToggle);
+            return;
         }
+
+        const icon = document.createElement('i');
+        icon.id = TOPBAR_TOGGLE_ID;
+        icon.className = 'fa-solid fa-address-book chat-manager-icon-btn';
+        icon.title = 'Toggle Chat Manager';
+        icon.tabIndex = 0;
+        icon.setAttribute('role', 'button');
+        icon.setAttribute('aria-label', 'Toggle Chat Manager');
+
+        icon.addEventListener('click', (e) => {
+            if (icon.classList.contains('disabled')) return;
+            void handleTogglePanel(e);
+        });
+
+        icon.addEventListener('keydown', (e) => {
+            if (e.key !== 'Enter' && e.key !== ' ') return;
+            e.preventDefault();
+            if (icon.classList.contains('disabled')) return;
+            void handleTogglePanel(e);
+        });
+
+        const nativeTopBarBtn = document.getElementById(TOPBAR_CHAT_MANAGER_ID);
+        if (nativeTopBarBtn && nativeTopBarBtn.parentElement === topBar) {
+            topBar.insertBefore(icon, nativeTopBarBtn.nextSibling);
+        } else {
+            topBar.appendChild(icon);
+        }
+
+        syncTopBarToggleDisabledState(icon);
+        console.log(`[${MODULE_NAME}] Added dedicated Chat Manager icon to TopInfoBar.`);
         return;
     }
 
-    // Fallback: TopInfoBar bar exists but the button doesn't — add an icon
-    const topBar = document.getElementById('extensionTopBar');
-    if (topBar) {
-        if (existingFallback) return;
-
-        const icon = document.createElement('i');
-        icon.id = FALLBACK_TOGGLE_ID;
-        icon.className = 'fa-solid fa-address-book';
-        icon.title = 'Toggle Chat Manager';
-        icon.tabIndex = 0;
-        icon.addEventListener('click', (e) => {
-            void handleTogglePanel(e);
-        });
-        topBar.appendChild(icon);
-        console.log(`[${MODULE_NAME}] Added Chat Manager icon to TopInfoBar.`);
-        return;
+    if (existingTopBarToggle) {
+        existingTopBarToggle.remove();
     }
 
     // Final fallback: no TopInfoBar at all — floating button
-    if (existingFallback) return;
+    if (existingFloating) return;
 
     const btn = document.createElement('button');
-    btn.id = FALLBACK_TOGGLE_ID;
+    btn.id = FLOATING_TOGGLE_ID;
     btn.textContent = 'Chat Manager';
     btn.title = 'Toggle Chat Manager';
     btn.style.position = 'fixed';
@@ -1270,6 +1275,9 @@ function bindPanelEvents() {
  * If the character changed, clear the index for a full rebuild.
  */
 async function onChatChanged() {
+    mountTopBarToggleButton();
+    syncTopBarToggleDisabledState();
+
     const context = SillyTavern.getContext();
     const character = context.characterId !== undefined ? context.characters[context.characterId] : null;
     const currentAvatar = character ? character.avatar : null;

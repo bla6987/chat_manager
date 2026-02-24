@@ -438,9 +438,9 @@
     text-align: center;
 }
 
-/* ── Toggle Button (injected into TopInfoBar) ── */
+/* ── Floating Toggle Button (fallback when TopInfoBar is unavailable) ── */
 
-#chat-manager-toggle {
+#chat-manager-floating-toggle {
     background: rgba(255, 255, 255, 0.06);
     border: 1px solid rgba(255, 255, 255, 0.1);
     color: inherit;
@@ -451,7 +451,7 @@
     transition: background 0.15s;
 }
 
-#chat-manager-toggle:hover {
+#chat-manager-floating-toggle:hover {
     background: rgba(255, 255, 255, 0.12);
 }
 
