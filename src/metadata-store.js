@@ -49,6 +49,27 @@ function createDefaultEmbeddingSettings() {
     };
 }
 
+function normalizeMessageCountFilterValue(value) {
+    if (value === null || value === undefined || value === '') return null;
+    const parsed = Number(value);
+    if (!Number.isFinite(parsed) || parsed < 0) return null;
+    return Math.floor(parsed);
+}
+
+function normalizeFilterState(filterState) {
+    if (!filterState || typeof filterState !== 'object') {
+        return { ...DEFAULT_FILTER_STATE };
+    }
+
+    return {
+        tags: Array.isArray(filterState.tags) ? filterState.tags.filter(tag => typeof tag === 'string' && tag.length > 0) : [],
+        dateFrom: typeof filterState.dateFrom === 'string' && filterState.dateFrom.length > 0 ? filterState.dateFrom : null,
+        dateTo: typeof filterState.dateTo === 'string' && filterState.dateTo.length > 0 ? filterState.dateTo : null,
+        messageCountMin: normalizeMessageCountFilterValue(filterState.messageCountMin),
+        messageCountMax: normalizeMessageCountFilterValue(filterState.messageCountMax),
+    };
+}
+
 /**
  * Ensure the settings structure exists.
  */
@@ -68,6 +89,8 @@ function ensureSettings() {
     }
     if (!extensionSettings[MODULE_NAME].filterState) {
         extensionSettings[MODULE_NAME].filterState = { ...DEFAULT_FILTER_STATE };
+    } else {
+        extensionSettings[MODULE_NAME].filterState = normalizeFilterState(extensionSettings[MODULE_NAME].filterState);
     }
     if (!extensionSettings[MODULE_NAME].sortState) {
         extensionSettings[MODULE_NAME].sortState = { ...DEFAULT_SORT_STATE };
@@ -537,6 +560,7 @@ export function getFilterState() {
 export function setFilterState(partial) {
     const settings = getSettings();
     Object.assign(settings.filterState, partial);
+    settings.filterState = normalizeFilterState(settings.filterState);
     save();
 }
 
@@ -555,7 +579,7 @@ export function clearFilterState() {
  */
 export function hasActiveFilter() {
     const f = getFilterState();
-    return (f.tags.length > 0) || f.dateFrom || f.dateTo || f.messageCountMin != null || f.messageCountMax != null;
+    return (f.tags.length > 0) || f.dateFrom || f.dateTo || Number.isFinite(f.messageCountMin) || Number.isFinite(f.messageCountMax);
 }
 
 /**

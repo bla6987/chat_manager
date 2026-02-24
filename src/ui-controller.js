@@ -49,6 +49,7 @@ import {
     embedText, embedTexts, getCachedEmbeddingForText, getCachedEmbeddingsForTexts, hashEmbeddingText, isEmbeddingConfigured,
 } from './embedding-service.js';
 import { clusterColor, cosineSimilarity, findOptimalK, findOptimalKAsync, kMeans, kMeansAsync, topicShiftScores } from './semantic-engine.js';
+import { resolveActiveChatFilename } from './active-chat.js';
 
 const MODULE_NAME = 'chat_manager';
 const HYBRID_SEARCH_MIN_CHARS = 5;
@@ -2572,7 +2573,12 @@ function ensureFilterToolbar() {
     const f = getFilterState();
 
     if (tagFilterBtn) tagFilterBtn.classList.toggle('has-active', f.tags.length > 0);
-    if (advFilterBtn) advFilterBtn.classList.toggle('has-active', !!(f.dateFrom || f.dateTo || f.messageCountMin != null || f.messageCountMax != null));
+    if (advFilterBtn) {
+        advFilterBtn.classList.toggle(
+            'has-active',
+            !!(f.dateFrom || f.dateTo || Number.isFinite(f.messageCountMin) || Number.isFinite(f.messageCountMax)),
+        );
+    }
     if (clearBtn) clearBtn.style.display = hasActiveFilter() ? '' : 'none';
     updateEmbeddingSelectionControls(toolbar);
 
@@ -2657,8 +2663,8 @@ function showAdvancedFilterDropdown(anchorEl) {
         setFilterState({
             dateFrom,
             dateTo,
-            messageCountMin: minVal !== '' ? parseInt(minVal, 10) : null,
-            messageCountMax: maxVal !== '' ? parseInt(maxVal, 10) : null,
+            messageCountMin: parseMessageCountFilterInput(minVal),
+            messageCountMax: parseMessageCountFilterInput(maxVal),
         });
         dismissDropdown();
         renderThreadCards();
@@ -3893,36 +3899,22 @@ async function safeSwitchChatFromJump(filename, displayName = filename) {
 }
 
 /**
- * Get the currently active chat filename by matching against the index.
+ * Parse an advanced message-count input value into a safe persisted filter value.
+ * @param {string} value
+ * @returns {number|null}
+ */
+function parseMessageCountFilterInput(value) {
+    if (value === null || value === undefined || value === '') return null;
+    const parsed = Number(value);
+    if (!Number.isFinite(parsed) || parsed < 0) return null;
+    return Math.floor(parsed);
+}
+
+/**
+ * Get the currently active chat filename from authoritative context fields.
  */
 function getActiveFilename() {
-    const context = SillyTavern.getContext();
-
-    // Try chatMetadata first (most reliable)
-    if (context.chatMetadata && context.chatMetadata.chat_file_name) {
-        return context.chatMetadata.chat_file_name;
-    }
-
-    // Fallback: match the current chat's first message against the index
-    const index = getIndex();
-    if (context.chat && context.chat.length > 0) {
-        const firstMsg = context.chat[0];
-        const firstText = firstMsg?.mes;
-        const lastMsg = context.chat[context.chat.length - 1];
-        const lastText = lastMsg?.mes;
-
-        for (const [filename, entry] of Object.entries(index)) {
-            if (!entry.isLoaded) continue;
-            if (entry.messages.length !== context.chat.length) continue;
-            const entryFirst = entry.messages[0]?.text;
-            const entryLast = entry.messages[entry.messages.length - 1]?.text;
-            if (entryFirst === firstText && entryLast === lastText) {
-                return filename;
-            }
-        }
-    }
-
-    return null;
+    return resolveActiveChatFilename(SillyTavern.getContext(), getIndex());
 }
 
 function escapeHtml(str) {

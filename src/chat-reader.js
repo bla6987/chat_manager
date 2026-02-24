@@ -1197,10 +1197,10 @@ export function getFilteredSortedEntries(filterState, sortState, getChatMetaFn) 
     }
 
     // ── Filter: message count range (AND) ──
-    if (filterState.messageCountMin != null) {
+    if (Number.isFinite(filterState.messageCountMin)) {
         entries = entries.filter(entry => entry.messageCount >= filterState.messageCountMin);
     }
-    if (filterState.messageCountMax != null) {
+    if (Number.isFinite(filterState.messageCountMax)) {
         entries = entries.filter(entry => entry.messageCount <= filterState.messageCountMax);
     }
 

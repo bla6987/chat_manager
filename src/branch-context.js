@@ -3,7 +3,7 @@
  * via SillyTavern's setExtensionPrompt API so the AI can compare parallel threads.
  */
 
-import { getSiblingBranchContext } from './chat-reader.js';
+import { getSiblingBranchContextForThread } from './chat-reader.js';
 import { getDisplayName } from './metadata-store.js';
 
 const PROMPT_ID = 'chat_manager_branch_ctx';
@@ -19,7 +19,7 @@ let lastInjectedText = null;
  */
 export function updateBranchContextInjection(activeFilename) {
     const context = SillyTavern.getContext();
-    const siblings = getSiblingBranchContext(activeFilename);
+    const siblings = getSiblingBranchContextForThread(activeFilename);
 
     if (siblings.length === 0) {
         if (lastInjectedText !== null) {

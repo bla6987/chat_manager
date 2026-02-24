@@ -8,11 +8,24 @@ let cachedStatsVersion = -1;
 let cachedHeatmap = null;
 let cachedHeatmapVersion = -1;
 
+function normalizeTimestampMs(value) {
+    if (value === null || value === undefined || value === '') return null;
+    const parsed = new Date(value).getTime();
+    return Number.isFinite(parsed) ? parsed : null;
+}
+
+function resolveComparableTimestamp(rawValue, cachedMs) {
+    const fromRaw = normalizeTimestampMs(rawValue);
+    if (fromRaw !== null) return fromRaw;
+    if (Number.isFinite(cachedMs) && cachedMs > 0) return cachedMs;
+    return null;
+}
+
 /**
  * Compute aggregate stats from the chat index.
  * @param {Object} chatIndex - Map of fileName -> ChatIndexEntry
  * @param {number} indexVersion - Current index version for cache invalidation
- * @returns {{ totalChats: number, loadedChats: number, totalMessages: number, avgMessagesPerChat: number, longestChat: { fileName: string, count: number }|null, mostActiveChat: { fileName: string, count: number }|null, userMessages: number, assistantMessages: number, oldestTimestamp: string|null, newestTimestamp: string|null, isComplete: boolean }}
+ * @returns {{ totalChats: number, loadedChats: number, totalMessages: number, avgMessagesPerChat: number, longestChat: { fileName: string, count: number }|null, mostActiveChat: { fileName: string, count: number }|null, userMessages: number, assistantMessages: number, oldestTimestamp: string|number|null, newestTimestamp: string|number|null, isComplete: boolean }}
  */
 export function computeStats(chatIndex, indexVersion) {
     if (cachedStats && cachedStatsVersion === indexVersion) {
@@ -27,6 +40,8 @@ export function computeStats(chatIndex, indexVersion) {
     let mostActiveChat = null;
     let oldestTs = null;
     let newestTs = null;
+    let oldestMs = null;
+    let newestMs = null;
     let loadedChats = 0;
 
     for (const entry of entries) {
@@ -49,17 +64,16 @@ export function computeStats(chatIndex, indexVersion) {
             mostActiveChat = { fileName: entry.fileName, count: entry.messageCount };
         }
 
-        if (entry.firstMessageTimestamp) {
-            if (!oldestTs || entry.firstMessageTimestamp < oldestTs) {
-                oldestTs = entry.firstMessageTimestamp;
-            }
+        const firstMs = resolveComparableTimestamp(entry.firstMessageTimestamp, entry.firstTimestampMs);
+        if (firstMs !== null && (oldestMs === null || firstMs < oldestMs)) {
+            oldestMs = firstMs;
+            oldestTs = entry.firstMessageTimestamp ?? firstMs;
         }
 
-        const lastTs = entry.lastMessageTimestamp;
-        if (lastTs) {
-            if (!newestTs || lastTs > newestTs) {
-                newestTs = lastTs;
-            }
+        const lastMs = resolveComparableTimestamp(entry.lastMessageTimestamp, entry.lastTimestampMs);
+        if (lastMs !== null && (newestMs === null || lastMs > newestMs)) {
+            newestMs = lastMs;
+            newestTs = entry.lastMessageTimestamp ?? lastMs;
         }
     }
 

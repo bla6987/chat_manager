@@ -3,7 +3,7 @@
  * Lifecycle hooks, event listeners, UI injection.
  */
 
-import { clearIndex, getIndexCharacterAvatar, updateActiveChat } from './src/chat-reader.js';
+import { clearIndex, getIndex, getIndexCharacterAvatar, updateActiveChat } from './src/chat-reader.js';
 import {
     togglePanel, closePanel, refreshPanel, renderThreadCards, onSearchInput, isPanelOpen, resetSearchState,
     toggleTimeline, isTimelineActive, toggleSemanticMap, isSemanticMapActive, toggleGraphView, isGraphViewActive, toggleStats, isStatsActive, toggleBranchContext, isBranchContextActive,
@@ -17,6 +17,7 @@ import { updateBranchContextInjection, clearBranchContextInjection } from './src
 import { attachMomentumScroll } from './src/momentum-scroll.js';
 import { acknowledgeEmbeddingModelChange, clearEmbeddingCache, getCacheStats } from './src/embedding-service.js';
 import { updateGraphViewData, isGraphViewMounted } from './src/graph-view.js';
+import { resolveActiveChatFilename } from './src/active-chat.js';
 
 const MODULE_NAME = 'chat_manager';
 const EXTENSION_PATH = '/scripts/extensions/third-party/chat_manager';
@@ -40,6 +41,10 @@ function isEmbeddingGenerationEnabled() {
     return settings.embeddingLevels?.chat === true || settings.embeddingLevels?.message === true;
 }
 
+function getActiveChatFile(context = null) {
+    return resolveActiveChatFilename(context || SillyTavern.getContext(), getIndex());
+}
+
 /**
  * Handle MESSAGE_SENT / MESSAGE_RECEIVED — lightweight update for active chat only.
  * Debounced to avoid redundant updates during rapid message events (e.g., streaming).
@@ -52,7 +57,7 @@ const onMessageUpdate = (() => {
             timer = null;
 
             const context = SillyTavern.getContext();
-            const activeChatFile = context.chatMetadata?.chat_file_name;
+            const activeChatFile = getActiveChatFile(context);
             const embeddingGenerationEnabled = isEmbeddingGenerationEnabled();
 
             let updated = false;
@@ -77,8 +82,12 @@ const onMessageUpdate = (() => {
             }
 
             // Branch context injection works even when panel is closed
-            if (isBranchContextActive() && activeChatFile) {
-                updateBranchContextInjection(activeChatFile);
+            if (isBranchContextActive()) {
+                if (activeChatFile) {
+                    updateBranchContextInjection(activeChatFile);
+                } else {
+                    clearBranchContextInjection();
+                }
             }
         }, 250);
     };
@@ -141,9 +150,11 @@ const onMessageUpdate = (() => {
     if (getBranchContextEnabled()) {
         setTimeout(() => {
             const ctx = SillyTavern.getContext();
-            const activeFile = ctx.chatMetadata?.chat_file_name;
+            const activeFile = getActiveChatFile(ctx);
             if (activeFile) {
                 updateBranchContextInjection(activeFile);
+            } else {
+                clearBranchContextInjection();
             }
         }, 2000);
     }
@@ -1307,7 +1318,7 @@ async function onChatChanged() {
         setTimeout(() => {
             if (!isBranchContextActive()) return;
             const ctx = SillyTavern.getContext();
-            const activeFile = ctx.chatMetadata?.chat_file_name;
+            const activeFile = getActiveChatFile(ctx);
             if (activeFile) {
                 updateBranchContextInjection(activeFile);
             }
@@ -1315,7 +1326,7 @@ async function onChatChanged() {
     }
 
     if (isEmbeddingGenerationEnabled()) {
-        const activeFile = context.chatMetadata?.chat_file_name;
+        const activeFile = getActiveChatFile(context);
         if (!sameCharacter) {
             scheduleEmbeddingBootstrap();
         } else if (activeFile) {
