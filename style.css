@@ -11,6 +11,7 @@
     right: 0;
     width: 380px;
     height: 100vh;
+    height: 100dvh;
     background-color: var(--SmartThemeBlurTintColor, rgba(20, 20, 30, 0.95));
     color: var(--SmartThemeBodyColor, #ccc);
     font-size: var(--mainFontSize, 14px);

@@ -128,6 +128,9 @@ let renderPending = false;
 // Debounce for explore-exit rebuild
 let rebuildTimer = null;
 
+// Debounce for window resize
+let resizeTimer = null;
+
 // Search state
 let searchBarEl = null;
 let searchInputEl = null;
@@ -1984,8 +1987,11 @@ function updateResetButton() {
 
 function onResize() {
     if (!mounted) return;
-    resizeCanvas();
-    render();
+    clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(() => {
+        resizeCanvas();
+        render();
+    }, 200);
 }
 
 // ──────────────────────────────────────────────

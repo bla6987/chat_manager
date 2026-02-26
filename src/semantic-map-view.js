@@ -32,6 +32,7 @@ let simBtnEl = null;
 let jumpBtnEl = null;
 let emptyEl = null;
 let loadingEl = null;
+let resizeTimer = null;
 
 let gl = null;
 let fallbackCtx = null;
@@ -916,8 +917,11 @@ function unbindEvents() {
 }
 
 function onResize() {
-    resizeCanvas();
-    queueRender();
+    clearTimeout(resizeTimer);
+    resizeTimer = setTimeout(() => {
+        resizeCanvas();
+        queueRender();
+    }, 200);
 }
 
 function resizeCanvas() {

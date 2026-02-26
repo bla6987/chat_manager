@@ -1170,15 +1170,12 @@ function bindEvents() {
     const onPointerMove = handlePointerMove.bind(null);
     const onPointerUp = handlePointerUp.bind(null);
     const onWheel = handleWheel.bind(null);
-    const onResize = resizeCanvas.bind(null);
-
     canvas.addEventListener('pointerdown', onPointerDown);
-    window.addEventListener('pointermove', onPointerMove);
+    canvas.addEventListener('pointermove', onPointerMove);
     window.addEventListener('pointerup', onPointerUp);
     canvas.addEventListener('wheel', onWheel, { passive: false });
-    window.addEventListener('resize', onResize);
 
-    boundHandlers = { onPointerDown, onPointerMove, onPointerUp, onWheel, onResize };
+    boundHandlers = { onPointerDown, onPointerMove, onPointerUp, onWheel };
 }
 
 function unbindEvents() {
@@ -1189,13 +1186,11 @@ function unbindEvents() {
         canvas.removeEventListener('wheel', boundHandlers.onWheel);
     }
     if (boundHandlers.onPointerMove) {
+        canvas.removeEventListener('pointermove', boundHandlers.onPointerMove);
         window.removeEventListener('pointermove', boundHandlers.onPointerMove);
     }
     if (boundHandlers.onPointerUp) {
         window.removeEventListener('pointerup', boundHandlers.onPointerUp);
-    }
-    if (boundHandlers.onResize) {
-        window.removeEventListener('resize', boundHandlers.onResize);
     }
     boundHandlers = {};
 }
@@ -1248,12 +1243,14 @@ function handlePointerDown(e) {
         interaction.mode = 'dragPin';
         interaction.dragNodeIndex = hitIndex;
         canvas.setPointerCapture(e.pointerId);
+        window.addEventListener('pointermove', boundHandlers.onPointerMove);
     } else {
         // Start panning
         interaction.mode = 'pan';
         interaction.cameraStartX = camera.x;
         interaction.cameraStartY = camera.y;
         canvas.setPointerCapture(e.pointerId);
+        window.addEventListener('pointermove', boundHandlers.onPointerMove);
     }
 }
 
@@ -1301,6 +1298,8 @@ function handlePointerMove(e) {
 
 function handlePointerUp(e) {
     if (!mounted) return;
+
+    window.removeEventListener('pointermove', boundHandlers.onPointerMove);
 
     const wasDrag = interaction.moved;
     const mode = interaction.mode;

@@ -164,7 +164,7 @@ export function attachMomentumScroll(container) {
         }
     };
 
-    container.addEventListener('wheel', onWheel, { passive: false });
+    container.addEventListener('wheel', onWheel, { passive: true });
     container.addEventListener('pointerdown', onUserInteraction, { passive: true });
     container.addEventListener('touchstart', onUserInteraction, { passive: true });
 
