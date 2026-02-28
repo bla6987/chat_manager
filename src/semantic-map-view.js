@@ -33,6 +33,7 @@ let jumpBtnEl = null;
 let emptyEl = null;
 let loadingEl = null;
 let resizeTimer = null;
+let runtimeResizeUnsubscribe = null;
 
 let gl = null;
 let fallbackCtx = null;
@@ -901,7 +902,12 @@ function bindEvents() {
     canvas.addEventListener('mouseleave', onMouseLeave);
     canvas.addEventListener('wheel', onWheel, { passive: false });
     canvas.addEventListener('dblclick', onDoubleClick);
-    window.addEventListener('resize', onResize);
+    const runtimeBus = window.STRuntimeBus;
+    if (runtimeBus?.viewport?.subscribe) {
+        runtimeResizeUnsubscribe = runtimeBus.viewport.subscribe('layout', onResize);
+    } else {
+        window.addEventListener('resize', onResize);
+    }
 }
 
 function unbindEvents() {
@@ -913,6 +919,10 @@ function unbindEvents() {
     canvas.removeEventListener('mouseleave', onMouseLeave);
     canvas.removeEventListener('wheel', onWheel);
     canvas.removeEventListener('dblclick', onDoubleClick);
+    if (runtimeResizeUnsubscribe) {
+        runtimeResizeUnsubscribe();
+        runtimeResizeUnsubscribe = null;
+    }
     window.removeEventListener('resize', onResize);
 }
 

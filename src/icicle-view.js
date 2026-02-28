@@ -130,6 +130,7 @@ let rebuildTimer = null;
 
 // Debounce for window resize
 let resizeTimer = null;
+let runtimeResizeUnsubscribe = null;
 
 // Search state
 let searchBarEl = null;
@@ -1431,7 +1432,12 @@ function bindEvents() {
     canvas.addEventListener('touchmove', boundHandlers.onTouchMove, { passive: false });
     canvas.addEventListener('touchend', boundHandlers.onTouchEnd, { passive: false });
     window.addEventListener('mouseup', boundHandlers.onMouseUp);
-    window.addEventListener('resize', boundHandlers.onResize);
+    const runtimeBus = window.STRuntimeBus;
+    if (runtimeBus?.viewport?.subscribe) {
+        runtimeResizeUnsubscribe = runtimeBus.viewport.subscribe('layout', boundHandlers.onResize);
+    } else {
+        window.addEventListener('resize', boundHandlers.onResize);
+    }
 }
 
 function unbindEvents() {
@@ -1446,6 +1452,10 @@ function unbindEvents() {
         canvas.removeEventListener('touchend', boundHandlers.onTouchEnd);
     }
     window.removeEventListener('mouseup', boundHandlers.onMouseUp);
+    if (runtimeResizeUnsubscribe) {
+        runtimeResizeUnsubscribe();
+        runtimeResizeUnsubscribe = null;
+    }
     window.removeEventListener('resize', boundHandlers.onResize);
     boundHandlers = {};
 }
