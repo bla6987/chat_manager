@@ -5,7 +5,7 @@
 import {
     buildIndex, getHydrationProgress, getIndex, getSearchableMessages, getSortedEntries,
     getFilteredSortedEntries, getIndexVersion,
-    isHydrationComplete, onHydrationUpdate, prioritizeInQueue, runDeferredBranchDetection,
+    isHydrationComplete, onHydrationUpdate, prioritizeInQueue, prioritizeHydrationFiles, runDeferredBranchDetection,
     getSiblingBranchContextForThread,
     ensureMessageEmbeddingMap, getMessageActiveSwipeIndex, getMessageEmbedding, setMessageEmbedding, makeMessageEmbeddingKey,
 } from './chat-reader.js';
@@ -74,6 +74,7 @@ let refreshTimelineFromHydrationTimer = null;
 let refreshSemanticMapFromHydrationTimer = null;
 let refreshGraphViewFromHydrationTimer = null;
 let refreshStatsFromHydrationTimer = null;
+let branchDetectionTimer = null;
 let embedBootstrapTimer = null;
 let embedIncrementalTimer = null;
 const EMBED_INCREMENTAL_DELAY_MS = 1200;
@@ -1002,16 +1003,42 @@ export function scheduleEmbeddingBootstrap() {
 
     embedBootstrapTimer = setTimeout(() => {
         embedBootstrapTimer = null;
-        void queueEmbeddingRun(() => runEmbeddingGeneration(null, {
+        const runBootstrap = () => queueEmbeddingRun(() => runEmbeddingGeneration(null, {
             ensureIndex: true,
             rerender: true,
             silent: true,
             // Startup optimization: load compatible vectors from cache only.
             cacheOnly: true,
-        })).catch((err) => {
-            console.warn(`[${MODULE_NAME}] Embedding bootstrap failed:`, err);
-        });
-    }, 900);
+        }));
+
+        const idleCallback = window.requestIdleCallback || ((callback) => setTimeout(callback, 250));
+        idleCallback(() => {
+            void runBootstrap().catch((err) => {
+                console.warn(`[${MODULE_NAME}] Embedding bootstrap failed:`, err);
+            });
+        }, { timeout: 4000 });
+    }, 1800);
+}
+
+function scheduleBranchDetection(delayMs = 1200) {
+    if (branchDetectionTimer) {
+        clearTimeout(branchDetectionTimer);
+    }
+
+    branchDetectionTimer = setTimeout(() => {
+        branchDetectionTimer = null;
+        if (!panelOpen || isAnyViewActive()) return;
+        if (!isHydrationComplete()) return;
+
+        const activeFile = getActiveFilename();
+        runDeferredBranchDetection(activeFile);
+        patchBranchIndicators();
+
+        if (branchContextActive) {
+            const result = updateBranchContextInjection(activeFile);
+            updateBranchContextStatusUI(result);
+        }
+    }, delayMs);
 }
 
 export function scheduleIncrementalEmbedding(fileName) {
@@ -1658,14 +1685,7 @@ function scheduleHydrationUIRefresh() {
         patchCardData();
 
         if (isHydrationComplete()) {
-            const activeFile = getActiveFilename();
-            runDeferredBranchDetection(activeFile);
-            patchBranchIndicators();
-
-            if (branchContextActive) {
-                const result = updateBranchContextInjection(activeFile);
-                updateBranchContextStatusUI(result);
-            }
+            scheduleBranchDetection(0);
         }
     }, 600);
 }
@@ -2023,11 +2043,7 @@ export async function refreshPanel() {
 
     const renderThreadListWithBranches = () => {
         renderThreadCards();
-        const activeFile = getActiveFilename();
-        setTimeout(() => {
-            runDeferredBranchDetection(activeFile);
-            patchBranchIndicators();
-        }, 0);
+        scheduleBranchDetection();
     };
 
     const renderFromLatestIndex = () => {
@@ -2058,6 +2074,9 @@ export async function refreshPanel() {
             searchState = null;
         }
         renderedFromMetadata = true;
+        const currentActiveFile = getActiveFilename();
+        const visibleFiles = getVisibleEntryFileNames().slice(0, 12);
+        prioritizeHydrationFiles([currentActiveFile, ...visibleFiles].filter(Boolean));
         if (!panelOpen || isAnyViewActive()) return;
         renderFromLatestIndex();
     });

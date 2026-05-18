@@ -4,9 +4,11 @@
  */
 
 import { getCachedChatsForCharacter, putCachedChat, removeCachedChat } from './cache-store.js';
+import { resolveActiveChatFilename } from './active-chat.js';
 
 const MODULE_NAME = 'chat_manager';
-const HYDRATION_BATCH_SIZE = 50;
+const HYDRATION_BATCH_SIZE = 6;
+const HYDRATION_YIELD_MS = 16;
 const FALLBACK_SORT_TIMESTAMP = 0;
 
 /** @type {Object<string, ChatIndexEntry>} filename -> index entry */
@@ -444,6 +446,24 @@ export function prioritizeInQueue(fileName) {
     }
 }
 
+/**
+ * Move multiple files to the front of the hydration queue, preserving the provided order.
+ * @param {string[]} fileNames
+ */
+export function prioritizeHydrationFiles(fileNames) {
+    if (!Array.isArray(fileNames) || fileNames.length === 0) return;
+
+    for (let i = fileNames.length - 1; i >= 0; i--) {
+        const fileName = fileNames[i];
+        if (!fileName) continue;
+        const idx = hydrationQueue.indexOf(fileName);
+        if (idx >= 0) {
+            hydrationQueue.splice(idx, 1);
+            hydrationQueue.unshift(fileName);
+        }
+    }
+}
+
 function bumpIndexVersion() {
     indexVersion++;
 }
@@ -493,6 +513,72 @@ function normalizeEntryShape(entry) {
             if (!msg.filename) msg.filename = entry.fileName;
         }
     }
+}
+
+function applyLoadedChatData(fileName, chatData, preserveEmbeddings = false) {
+    const current = chatIndex[fileName];
+    if (!current || !Array.isArray(chatData)) return false;
+
+    const messages = parseMessages(chatData, fileName);
+    const firstTs = messages.length > 0 ? messages[0].timestamp : null;
+    const lastTs = messages.length > 0 ? messages[messages.length - 1].timestamp : current.lastMessageTimestamp;
+    const parsedLastModified = lastTs ? new Date(lastTs).getTime() : NaN;
+    const hasValidLastModified = Number.isFinite(parsedLastModified);
+
+    chatIndex[fileName] = {
+        ...current,
+        messageCount: messages.length,
+        messages,
+        firstMessageTimestamp: firstTs,
+        lastMessageTimestamp: lastTs,
+        firstTimestampMs: normalizeTimestamp(firstTs),
+        lastTimestampMs: normalizeTimestamp(lastTs),
+        lastModified: hasValidLastModified ? parsedLastModified : current.lastModified,
+        sortTimestamp: hasValidLastModified ? parsedLastModified : current.sortTimestamp,
+        branchPoint: null,
+        isLoaded: true,
+        chatEmbedding: preserveEmbeddings ? current.chatEmbedding : null,
+        chatEmbeddingHash: preserveEmbeddings ? current.chatEmbeddingHash : null,
+        clusterLabel: preserveEmbeddings ? current.clusterLabel : null,
+        messageEmbeddings: preserveEmbeddings ? current.messageEmbeddings : null,
+    };
+
+    queuedFiles.delete(fileName);
+    hydrationQueue = hydrationQueue.filter(name => name !== fileName);
+
+    if (currentCharacterAvatar) {
+        putCachedChat(currentCharacterAvatar, fileName, chatIndex[fileName]);
+    }
+
+    return true;
+}
+
+function seedActiveChatFromMemory(context) {
+    const activeFile = resolveActiveChatFilename(context, chatIndex);
+    if (!activeFile || !Array.isArray(context?.chat) || context.chat.length === 0) return false;
+
+    const entry = chatIndex[activeFile];
+    if (!entry) return false;
+
+    normalizeEntryShape(entry);
+    if (entry.isLoaded && entry.messages.length === context.chat.length) {
+        const lastIndexed = entry.messages[entry.messages.length - 1];
+        const lastContext = context.chat[context.chat.length - 1];
+        const indexedSwipe = getMessageActiveSwipeIndex(lastIndexed);
+        const contextSwipe = Number.isFinite(Number(lastContext?.swipe_id))
+            ? Math.max(0, Math.floor(Number(lastContext.swipe_id)))
+            : 0;
+
+        if (
+            lastIndexed?.text === lastContext?.mes
+            && lastIndexed?.timestamp === (lastContext?.send_date || '')
+            && indexedSwipe === contextSwipe
+        ) {
+            return false;
+        }
+    }
+
+    return applyLoadedChatData(activeFile, context.chat, false);
 }
 
 /**
@@ -581,6 +667,10 @@ function startHydrationLoop() {
 
                 await Promise.all(batch.map(fileName => hydrateEntry(fileName, sessionId)));
                 emitHydrationUpdate();
+
+                if (sessionId === hydrationSessionId && hydrationQueue.length > 0) {
+                    await new Promise(resolve => setTimeout(resolve, HYDRATION_YIELD_MS));
+                }
             }
         } catch (err) {
             console.error('[chat_manager] Hydration loop error:', err);
@@ -807,6 +897,10 @@ export async function buildIndex(onProgress, onMetadataReady) {
             changed = true;
         }
 
+        if (seedActiveChatFromMemory(context)) {
+            changed = true;
+        }
+
         if (changed) {
             bumpIndexVersion();
             for (const entry of Object.values(chatIndex)) {
@@ -819,6 +913,13 @@ export async function buildIndex(onProgress, onMetadataReady) {
         emitHydrationUpdate();
 
         if (hydrationQueue.length > 0) {
+            const activeFile = resolveActiveChatFilename(context, chatIndex);
+            const recentFiles = getSortedEntries()
+                .filter(entry => !entry.isLoaded)
+                .slice(0, 12)
+                .map(entry => entry.fileName);
+            prioritizeHydrationFiles([activeFile, ...recentFiles].filter(Boolean));
+
             console.log(`[${MODULE_NAME}] Hydrating ${hydrationQueue.length} chats in background (${Object.keys(chatIndex).length} total)`);
             startHydrationLoop();
         }
@@ -873,39 +974,9 @@ export async function updateActiveChat(fileName, options = {}) {
             chatData = await fetchChatContent(fileName);
         }
 
-        const messages = parseMessages(chatData, fileName);
-        const cached = chatIndex[fileName];
-        const firstTimestamp = messages.length > 0 ? messages[0].timestamp : null;
-        const lastTimestamp = messages.length > 0 ? messages[messages.length - 1].timestamp : null;
-        const parsedLastModified = lastTimestamp ? new Date(lastTimestamp).getTime() : NaN;
-        const hasValidLastModified = Number.isFinite(parsedLastModified);
-        const effectiveLastTs = lastTimestamp || cached.lastMessageTimestamp;
-
-        chatIndex[fileName] = {
-            ...cached,
-            messageCount: messages.length,
-            messages,
-            firstMessageTimestamp: firstTimestamp,
-            lastMessageTimestamp: effectiveLastTs,
-            firstTimestampMs: normalizeTimestamp(firstTimestamp),
-            lastTimestampMs: normalizeTimestamp(effectiveLastTs),
-            lastModified: hasValidLastModified ? parsedLastModified : cached.lastModified,
-            sortTimestamp: hasValidLastModified ? parsedLastModified : cached.sortTimestamp,
-            branchPoint: null,
-            isLoaded: true,
-            chatEmbedding: resetEmbeddings ? null : cached.chatEmbedding,
-            chatEmbeddingHash: resetEmbeddings ? null : cached.chatEmbeddingHash,
-            clusterLabel: resetEmbeddings ? null : cached.clusterLabel,
-            messageEmbeddings: resetEmbeddings ? null : cached.messageEmbeddings,
-        };
+        const applied = applyLoadedChatData(fileName, chatData, !resetEmbeddings);
+        if (!applied) return false;
         bumpIndexVersion();
-
-        if (currentCharacterAvatar) {
-            putCachedChat(currentCharacterAvatar, fileName, chatIndex[fileName]);
-        }
-
-        queuedFiles.delete(fileName);
-        hydrationQueue = hydrationQueue.filter(name => name !== fileName);
         emitHydrationUpdate();
         return true;
     } catch (err) {
