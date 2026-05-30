@@ -39,7 +39,7 @@ import {
 } from './semantic-map-view.js';
 import {
     mountGraphView, unmountGraphView, updateGraphViewData,
-    isGraphViewMounted, setGraphViewCallbacks,
+    isGraphViewMounted, setGraphViewCallbacks, setGraphScope,
 } from './graph-view.js';
 import {
     mountStatsView, unmountStatsView, updateStatsView,
@@ -265,6 +265,31 @@ function getVisibleEntryFileNames() {
     const filterState = getFilterState();
     const sortState = getSortState();
     return getFilteredSortedEntries(filterState, sortState, getChatMeta).map(entry => entry.fileName);
+}
+
+/**
+ * Re-render whichever results view is currently active after a filter change.
+ * The graph view honors the same date/tag filters as the list; its scope
+ * provider (installed in toggleGraphView) re-reads the filter on each refresh,
+ * so here we only need to trigger the re-collect and refresh the toolbar state.
+ */
+function refreshAfterFilterChange() {
+    if (graphViewActive) {
+        if (isGraphViewMounted()) updateGraphViewData();
+        ensureFilterToolbar();
+        return;
+    }
+    renderThreadCards();
+}
+
+/**
+ * Live scope provider for the graph view: the set of fileNames matching the
+ * current filter, or null when no filter is active (so the unfiltered graph
+ * keeps showing every thread, including ones not present in the list).
+ * Evaluated fresh on every graph re-collect — never a stale snapshot.
+ */
+function currentGraphScope() {
+    return hasActiveFilter() ? new Set(getVisibleEntryFileNames()) : null;
 }
 
 function getScopeFilteredEntries(entries, settings) {
@@ -1241,20 +1266,27 @@ export function toggleGraphView() {
         if (statsActive) deactivateStats();
 
         const searchWrapper = _getSearchWrapper();
-        const toolbar = _getFilterToolbar();
         const content = _getContent();
         if (searchWrapper) searchWrapper.style.display = 'none';
-        if (toolbar) toolbar.style.display = 'none';
         dismissDropdown();
         if (content) {
             content.classList.add('timeline-active');
             content.innerHTML = '<div class="chat-manager-loading"><div class="chat-manager-spinner"></div> Preparing graph view…</div>';
         }
 
+        // Keep the filter toolbar available (collapsed to filter controls) so the
+        // active date/tag filter can be changed while the graph is open.
+        ensureFilterToolbar();
+
         setGraphViewCallbacks({
             onJump: handleTimelineJumpToMessage,
             getActive: getActiveFilename,
         });
+
+        // Restrict the graph to whatever the current filter matches. The provider
+        // is re-evaluated on every re-collect, so later hydration / embedding
+        // completions stay consistent with the active filter.
+        setGraphScope(currentGraphScope);
 
         requestAnimationFrame(() => {
             if (!graphViewActive) return;
@@ -1488,6 +1520,7 @@ function deactivateSemanticMap() {
 function deactivateGraphView() {
     if (!graphViewActive && !isGraphViewMounted()) return;
     graphViewActive = false;
+    setGraphScope(null);
     unmountGraphView();
 
     const btn = document.getElementById('chat-manager-graph-view-toggle');
@@ -2521,7 +2554,7 @@ function ensureFilterToolbar() {
         clearBtn.className = 'chat-manager-btn chat-manager-clear-filters-btn';
         clearBtn.title = 'Clear all filters';
         clearBtn.innerHTML = '<i class="fa-solid fa-filter-circle-xmark"></i>';
-        clearBtn.addEventListener('click', () => { clearFilterState(); renderThreadCards(); });
+        clearBtn.addEventListener('click', () => { clearFilterState(); refreshAfterFilterChange(); });
 
         const selectVisibleEmbBtn = document.createElement('button');
         selectVisibleEmbBtn.className = 'chat-manager-btn chat-manager-emb-scope-btn chat-manager-emb-select-visible-btn';
@@ -2582,9 +2615,14 @@ function ensureFilterToolbar() {
     if (clearBtn) clearBtn.style.display = hasActiveFilter() ? '' : 'none';
     updateEmbeddingSelectionControls(toolbar);
 
-    // Hide toolbar when search or alternate visualization modes are active
+    // Hide toolbar when search or other alternate visualization modes are active.
+    // The graph view is the exception: it keeps the toolbar but collapses it to
+    // the filter controls (via the 'graph-scope' class) since the date/tag
+    // filters apply there too, while sort and embed-scope buttons do not.
     const query = getCurrentSearchQuery();
-    toolbar.style.display = (query.length >= 2 || timelineActive || semanticMapActive || graphViewActive || statsActive) ? 'none' : '';
+    const hideForOtherView = timelineActive || semanticMapActive || statsActive;
+    toolbar.classList.toggle('graph-scope', graphViewActive);
+    toolbar.style.display = (query.length >= 2 || hideForOtherView) ? 'none' : '';
 }
 
 function updateSortDirIcon(btn, direction) {
@@ -2616,7 +2654,7 @@ function showTagFilterDropdown(anchorEl) {
                 if (idx !== -1) current.splice(idx, 1);
             }
             setFilterState({ tags: current });
-            renderThreadCards();
+            refreshAfterFilterChange();
         });
 
         const dot = document.createElement('span');
@@ -2640,7 +2678,20 @@ function showAdvancedFilterDropdown(anchorEl) {
     dropdown.className = 'chat-manager-dropdown chat-manager-adv-filter';
     const f = getFilterState();
 
+    const basis = f.dateBasis === 'created' ? 'created' : 'lastActivity';
     dropdown.innerHTML = `
+        <label>Date basis</label>
+        <div class="chat-manager-date-basis" role="group">
+            <button type="button" class="chat-manager-btn cm-af-basis ${basis === 'lastActivity' ? 'active' : ''}" data-basis="lastActivity">Last activity</button>
+            <button type="button" class="chat-manager-btn cm-af-basis ${basis === 'created' ? 'active' : ''}" data-basis="created">Created</button>
+        </div>
+        <label>Quick range</label>
+        <div class="chat-manager-date-presets">
+            <button type="button" class="chat-manager-btn cm-af-preset" data-days="7">7 days</button>
+            <button type="button" class="chat-manager-btn cm-af-preset" data-days="30">30 days</button>
+            <button type="button" class="chat-manager-btn cm-af-preset" data-days="90">90 days</button>
+            <button type="button" class="chat-manager-btn cm-af-preset" data-days="year">This year</button>
+        </div>
         <label>Date from</label>
         <input type="date" class="cm-af-date-from" value="${f.dateFrom || ''}">
         <label>Date to</label>
@@ -2655,6 +2706,32 @@ function showAdvancedFilterDropdown(anchorEl) {
         </div>
     `;
 
+    // Date-basis toggle — exclusive selection within the group.
+    let selectedBasis = basis;
+    dropdown.querySelectorAll('.cm-af-basis').forEach((btn) => {
+        btn.addEventListener('click', () => {
+            selectedBasis = btn.dataset.basis;
+            dropdown.querySelectorAll('.cm-af-basis').forEach(b => b.classList.toggle('active', b === btn));
+        });
+    });
+
+    // Quick presets fill the From field with a date relative to today.
+    const toISODate = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+    dropdown.querySelectorAll('.cm-af-preset').forEach((btn) => {
+        btn.addEventListener('click', () => {
+            const now = new Date();
+            let from;
+            if (btn.dataset.days === 'year') {
+                from = new Date(now.getFullYear(), 0, 1);
+            } else {
+                from = new Date(now);
+                from.setDate(from.getDate() - parseInt(btn.dataset.days, 10));
+            }
+            dropdown.querySelector('.cm-af-date-from').value = toISODate(from);
+            dropdown.querySelector('.cm-af-date-to').value = toISODate(now);
+        });
+    });
+
     dropdown.querySelector('.cm-af-apply').addEventListener('click', () => {
         const dateFrom = dropdown.querySelector('.cm-af-date-from').value || null;
         const dateTo = dropdown.querySelector('.cm-af-date-to').value || null;
@@ -2663,17 +2740,18 @@ function showAdvancedFilterDropdown(anchorEl) {
         setFilterState({
             dateFrom,
             dateTo,
+            dateBasis: selectedBasis,
             messageCountMin: parseMessageCountFilterInput(minVal),
             messageCountMax: parseMessageCountFilterInput(maxVal),
         });
         dismissDropdown();
-        renderThreadCards();
+        refreshAfterFilterChange();
     });
 
     dropdown.querySelector('.cm-af-clear').addEventListener('click', () => {
         setFilterState({ dateFrom: null, dateTo: null, messageCountMin: null, messageCountMax: null });
         dismissDropdown();
-        renderThreadCards();
+        refreshAfterFilterChange();
     });
 
     // Prevent dropdown from closing when clicking inside form elements

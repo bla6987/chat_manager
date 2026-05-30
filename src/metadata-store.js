@@ -12,7 +12,7 @@ const DEFAULT_TAG_DEFINITIONS = {
     tag_archived: { id: 'tag_archived', name: 'Archived', color: '#9E9E9E', textColor: '#FFFFFF' },
 };
 
-const DEFAULT_FILTER_STATE = { tags: [], dateFrom: null, dateTo: null, messageCountMin: null, messageCountMax: null };
+const DEFAULT_FILTER_STATE = { tags: [], dateFrom: null, dateTo: null, dateBasis: 'lastActivity', messageCountMin: null, messageCountMax: null };
 const DEFAULT_SORT_STATE = { field: 'recency', direction: 'desc' };
 const DEFAULT_EMBEDDING_LEVELS = {
     chat: false,
@@ -65,6 +65,7 @@ function normalizeFilterState(filterState) {
         tags: Array.isArray(filterState.tags) ? filterState.tags.filter(tag => typeof tag === 'string' && tag.length > 0) : [],
         dateFrom: typeof filterState.dateFrom === 'string' && filterState.dateFrom.length > 0 ? filterState.dateFrom : null,
         dateTo: typeof filterState.dateTo === 'string' && filterState.dateTo.length > 0 ? filterState.dateTo : null,
+        dateBasis: filterState.dateBasis === 'created' ? 'created' : 'lastActivity',
         messageCountMin: normalizeMessageCountFilterValue(filterState.messageCountMin),
         messageCountMax: normalizeMessageCountFilterValue(filterState.messageCountMax),
     };

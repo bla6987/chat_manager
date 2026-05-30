@@ -1953,6 +1953,38 @@
     text-align: center;
 }
 
+/* ── Date basis toggle & quick range presets ── */
+
+.chat-manager-date-basis,
+.chat-manager-date-presets {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px;
+}
+
+.chat-manager-date-basis .cm-af-basis {
+    flex: 1;
+    text-align: center;
+}
+
+.chat-manager-date-presets .cm-af-preset {
+    flex: 1 0 auto;
+    text-align: center;
+    font-size: 0.82em;
+}
+
+.chat-manager-date-basis .cm-af-basis.active {
+    background: var(--SmartThemeQuoteColor, rgba(255, 255, 255, 0.25));
+    border-color: var(--SmartThemeQuoteColor, rgba(255, 255, 255, 0.4));
+}
+
+/* In graph view the toolbar collapses to just the filter controls —
+   sort and embed-scope buttons don't apply to the force-graph layout. */
+.chat-manager-filter-toolbar.graph-scope .chat-manager-sort-controls,
+.chat-manager-filter-toolbar.graph-scope .chat-manager-emb-scope-btn {
+    display: none;
+}
+
 /* ── Tag Manager Dialog ── */
 
 .chat-manager-tag-manager {

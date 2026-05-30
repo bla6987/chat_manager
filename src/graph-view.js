@@ -77,6 +77,16 @@ let lastObservedHeight = 0;
 let onJumpToChat = null;
 let getActiveChatFile = null;
 
+// Provider that returns the Set of fileNames the graph is restricted to
+// (e.g. by an active date filter), or null for "no scope — include everything".
+// Stored as a function so every re-collect (filter change, hydration, embedding
+// completion) re-evaluates the current filter rather than a stale snapshot.
+let graphScopeProvider = null;
+// Whether the most recent collect ran with an active scope (a filter restricting
+// threads). Lets updateGraphViewData tell "empty because filtered" apart from
+// "empty because still hydrating".
+let lastCollectScopeActive = false;
+
 /* ── Embedding Data ── */
 
 let messageRefs = [];     // { fileName, displayName, msgIndex, swipeIndex, isActiveSwipe, role, timestamp, text }
@@ -165,6 +175,17 @@ export function isGraphViewMounted() {
     return mounted;
 }
 
+/**
+ * Restrict the graph to a set of thread fileNames (e.g. those passing the
+ * active date filter). Pass a provider function returning a Set (or null), so
+ * the scope is re-evaluated on every re-collect rather than captured once.
+ * Pass null to clear the restriction.
+ * @param {(() => (Set<string>|null))|null} provider
+ */
+export function setGraphScope(provider) {
+    graphScopeProvider = typeof provider === 'function' ? provider : null;
+}
+
 export async function mountGraphView(containerEl) {
     if (mounted) unmountGraphView();
 
@@ -251,8 +272,12 @@ export function updateGraphViewData() {
     const prevDims = messageDims;
     collectMessageVectors();
     if (messageRefs.length === 0) {
+        // An active filter that matches nothing is a legitimate empty result —
+        // don't fall back to the "keep existing graph during hydration" heuristic,
+        // or the graph would ignore the filter (chats are lazy-loaded, so
+        // hydration is almost always "in progress").
         const hydrationInProgress = Object.values(getIndex()).some(entry => entry && !entry.isLoaded);
-        if (prevRefs.length > 0 && hydrationInProgress) {
+        if (prevRefs.length > 0 && hydrationInProgress && !lastCollectScopeActive) {
             messageRefs = prevRefs;
             messageVectors = prevVectors;
             messageNorms = prevNorms;
@@ -263,8 +288,13 @@ export function updateGraphViewData() {
             return;
         }
         clearGraphDataState();
-        showEmpty('No message embeddings found. Generate message embeddings first.');
-        setInfo('No message embeddings available.');
+        if (lastCollectScopeActive) {
+            showEmpty('No threads with message embeddings match the current filter.');
+            setInfo('No matches for the current filter.');
+        } else {
+            showEmpty('No message embeddings found. Generate message embeddings first.');
+            setInfo('No message embeddings available.');
+        }
         return;
     }
     hideEmpty();
@@ -304,7 +334,11 @@ function collectMessageVectors() {
     const norms = [];
     let detectedDims = 0;
 
+    const scope = graphScopeProvider ? graphScopeProvider() : null;
+    lastCollectScopeActive = scope !== null;
+
     for (const [fileName, entry] of Object.entries(index)) {
+        if (scope && !scope.has(fileName)) continue;
         if (!entry?.isLoaded || !(entry.messageEmbeddings instanceof Map) || entry.messageEmbeddings.size === 0) {
             continue;
         }

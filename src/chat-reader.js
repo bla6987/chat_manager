@@ -1176,11 +1176,19 @@ export function getFilteredSortedEntries(filterState, sortState, getChatMetaFn) 
     }
 
     // ── Filter: date range (AND with above) ──
+    // dateBasis selects which timestamp a thread is judged by:
+    //   'created'      → first message time, 'lastActivity' (default) → last message time.
+    // Both bounds are applied to that single timestamp so the range reads intuitively.
+    const useCreated = filterState.dateBasis === 'created';
+    const entryDateMs = (entry) => {
+        const ts = useCreated ? entry.firstTimestampMs : entry.lastTimestampMs;
+        return Number.isFinite(ts) ? ts : entry.sortTimestamp;
+    };
     if (filterState.dateFrom) {
         const from = new Date(filterState.dateFrom).getTime();
         if (Number.isFinite(from)) {
             entries = entries.filter(entry => {
-                const ts = entry.lastTimestampMs ?? entry.sortTimestamp;
+                const ts = entryDateMs(entry);
                 return Number.isFinite(ts) && ts >= from;
             });
         }
@@ -1190,7 +1198,7 @@ export function getFilteredSortedEntries(filterState, sortState, getChatMetaFn) 
         const to = new Date(filterState.dateTo).getTime() + 86400000;
         if (Number.isFinite(to)) {
             entries = entries.filter(entry => {
-                const ts = entry.firstTimestampMs ?? entry.sortTimestamp;
+                const ts = entryDateMs(entry);
                 return Number.isFinite(ts) && ts <= to;
             });
         }
