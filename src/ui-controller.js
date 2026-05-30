@@ -3,8 +3,8 @@
  */
 
 import {
-    buildIndex, getHydrationProgress, getIndex, getSearchableMessages, getSortedEntries,
-    getFilteredSortedEntries, getIndexVersion,
+    buildIndex, getHydrationProgress, getIndex, getSearchableMessages,
+    getFilteredSortedEntries, getIndexVersion, bumpIndexVersion,
     isHydrationComplete, onHydrationUpdate, prioritizeInQueue, runDeferredBranchDetection,
     getSiblingBranchContextForThread,
     ensureMessageEmbeddingMap, getMessageActiveSwipeIndex, getMessageEmbedding, setMessageEmbedding, makeMessageEmbeddingKey,
@@ -654,6 +654,8 @@ async function recomputeEmbeddingClusters(options = {}) {
     for (const entry of entries) {
         entry.clusterLabel = null;
     }
+    // Cluster labels feed the 'cluster' sort; invalidate the filtered/sorted cache.
+    bumpIndexVersion();
 
     if (embeddedEntries.length === 0) {
         lastClusterK = null;
@@ -680,6 +682,7 @@ async function recomputeEmbeddingClusters(options = {}) {
     for (let i = 0; i < embeddedEntries.length; i++) {
         embeddedEntries[i].clusterLabel = labels[i] ?? 0;
     }
+    bumpIndexVersion();
 
     const clusterCount = new Set(labels).size;
     lastClusterK = k;
@@ -1010,6 +1013,7 @@ export function clearInMemoryEmbeddings(options = {}) {
         entry.clusterLabel = null;
         entry.messageEmbeddings = null;
     }
+    bumpIndexVersion();
 
     if (rerender) {
         refreshAfterEmbeddingUpdate();
@@ -1571,7 +1575,7 @@ function handleHeatmapDayClick(dateKey, chatFileNames) {
     const dateStr = moment(dateKey).format('ddd, MMM D, YYYY');
     if (status) status.textContent = `${entries.length} thread${entries.length !== 1 ? 's' : ''} active on ${dateStr}`;
 
-    renderThreadCardsFromEntries(entries, container, null, Object.keys(index).length);
+    renderThreadCardsFromEntries(entries, container, null, Object.keys(index).length, { virtual: false });
     // Prepend back button before cards
     container.prepend(backBtn);
 }
@@ -2120,11 +2124,12 @@ function patchBranchIndicators() {
     const index = getIndex();
     const activeFile = getActiveFilename();
     const activeEntry = activeFile ? index[activeFile] : null;
-    const entries = getSortedEntries();
 
-    for (const entry of entries) {
-        const card = document.querySelector(`.chat-manager-card[data-filename="${CSS.escape(entry.fileName)}"]`);
-        if (!card) continue;
+    // Only the cards currently in the DOM need updating.
+    const cards = document.querySelectorAll('.chat-manager-card[data-filename]');
+    for (const card of cards) {
+        const entry = index[card.dataset.filename];
+        if (!entry) continue;
 
         const meta = card.querySelector('.chat-manager-card-meta');
         if (!meta) continue;
@@ -2177,11 +2182,14 @@ function patchBranchIndicators() {
  */
 function patchCardData() {
     const { moment } = SillyTavern.libs;
-    const entries = getSortedEntries();
+    const index = getIndex();
 
-    for (const entry of entries) {
-        const card = document.querySelector(`.chat-manager-card[data-filename="${CSS.escape(entry.fileName)}"]`);
-        if (!card) continue;
+    // Iterate only the cards currently in the DOM (cheap; works with virtualization)
+    // instead of sorting every entry and doing one querySelector per thread.
+    const cards = document.querySelectorAll('.chat-manager-card[data-filename]');
+    for (const card of cards) {
+        const entry = index[card.dataset.filename];
+        if (!entry) continue;
 
         const meta = card.querySelector('.chat-manager-card-meta');
         if (!meta) continue;
@@ -2231,7 +2239,7 @@ function patchCardData() {
     // Update status bar
     const status = document.getElementById('chat-manager-status');
     if (status) {
-        status.textContent = withIndexingSuffix(`Showing ${entries.length} threads`);
+        status.textContent = withIndexingSuffix(`Showing ${Object.keys(index).length} threads`);
     }
 }
 
@@ -2257,6 +2265,10 @@ export function renderThreadCards() {
     const container = _getContent();
     const status = _getStatus();
     if (!container) return;
+
+    // Any path that doesn't re-mount the windowed list (empty/no-results states)
+    // must detach the previous one so its scroll listener stops firing.
+    teardownVirtualList();
 
     const index = getIndex();
     const totalCount = Object.keys(index).length;
@@ -2287,101 +2299,93 @@ export function renderThreadCards() {
 }
 
 /**
- * Render thread cards from a given set of entries into a container.
- * Extracted so heatmap day-click and other features can reuse it.
+ * Build the inner context shared by every card in a render pass.
  */
-export function renderThreadCardsFromEntries(entries, container, status, totalCount) {
-    if (!container) return;
-
-    const index = getIndex();
-    if (totalCount === undefined) totalCount = Object.keys(index).length;
-
+function buildCardRenderContext() {
     const { moment, DOMPurify } = SillyTavern.libs;
+    const index = getIndex();
     const activeChatFile = getActiveFilename();
-    const activeEntry = activeChatFile ? index[activeChatFile] : null;
-    const tagDefs = getTagDefinitions();
     const sortState = getSortState();
-    const embeddingSettings = getEmbeddingSettings();
-    const selectedScope = embeddingSettings.scopeMode === 'selected';
-    const isClusterSorted = sortState.field === 'cluster';
-    let previousClusterGroup = null;
-    let hasRenderedClusterGroup = false;
+    return {
+        moment,
+        DOMPurify,
+        index,
+        activeChatFile,
+        activeEntry: activeChatFile ? index[activeChatFile] : null,
+        tagDefs: getTagDefinitions(),
+        selectedScope: getEmbeddingSettings().scopeMode === 'selected',
+        isClusterSorted: sortState.field === 'cluster',
+    };
+}
 
-    let html = '';
-    for (const entry of entries) {
-        const currentClusterGroup = entry.clusterLabel ?? 999;
-        if (isClusterSorted && hasRenderedClusterGroup && currentClusterGroup !== previousClusterGroup) {
-            const dividerColor = entry.clusterLabel != null
-                ? clusterColor(entry.clusterLabel)
-                : 'rgba(180, 180, 180, 0.45)';
-            html += `<div class="chat-manager-cluster-divider" style="--chat-manager-cluster-color:${escapeAttr(dividerColor)}"></div>`;
-        }
-        if (isClusterSorted) {
-            previousClusterGroup = currentClusterGroup;
-            hasRenderedClusterGroup = true;
-        }
+/**
+ * Build the HTML for a single thread card. Extracted so the virtual list can
+ * render just the visible window instead of all N cards.
+ */
+function buildThreadCardHtml(entry, ctx) {
+    const { moment, activeChatFile, activeEntry, tagDefs, selectedScope } = ctx;
 
-        const displayName = getDisplayName(entry.fileName) || entry.fileName;
-        const summaryDisplay = getSummaryDisplay(entry);
-        const isActive = entry.fileName === activeChatFile;
-        const isSelectedForEmbedding = isEmbeddingChatSelected(entry.fileName);
-        const embeddingSelectControl = `
+    const displayName = getDisplayName(entry.fileName) || entry.fileName;
+    const summaryDisplay = getSummaryDisplay(entry);
+    const isActive = entry.fileName === activeChatFile;
+    const isSelectedForEmbedding = isEmbeddingChatSelected(entry.fileName);
+    const embeddingSelectControl = `
             <label class="chat-manager-emb-select${selectedScope ? ' scope-selected' : ''}" title="Include this chat when embedding scope is set to selected chats">
                 <input type="checkbox" class="chat-manager-emb-select-cb" data-filename="${escapeAttr(entry.fileName)}" ${isSelectedForEmbedding ? 'checked' : ''}>
                 <span>Emb</span>
             </label>`;
-        const clusterDot = entry.clusterLabel != null
-            ? `<span class="chat-manager-cluster-dot" style="background:${escapeAttr(clusterColor(entry.clusterLabel))}" title="Cluster ${entry.clusterLabel + 1}"></span>`
-            : '';
+    const clusterDot = entry.clusterLabel != null
+        ? `<span class="chat-manager-cluster-dot" style="background:${escapeAttr(clusterColor(entry.clusterLabel))}" title="Cluster ${entry.clusterLabel + 1}"></span>`
+        : '';
 
-        const firstDate = formatDateOrFallback(moment, entry.firstMessageTimestamp, '?');
-        const lastDate = formatDateOrFallback(moment, entry.lastMessageTimestamp, '?');
-        const lastActive = formatFromNowOrFallback(moment, entry.lastMessageTimestamp, 'unknown');
+    const firstDate = formatDateOrFallback(moment, entry.firstMessageTimestamp, '?');
+    const lastDate = formatDateOrFallback(moment, entry.lastMessageTimestamp, '?');
+    const lastActive = formatFromNowOrFallback(moment, entry.lastMessageTimestamp, 'unknown');
 
-        const branchDistance = (entry.isLoaded && entry.branchPoint !== null && activeEntry?.isLoaded)
-            ? activeEntry.messageCount - entry.branchPoint : null;
-        const branchInfo = (entry.isLoaded && entry.branchPoint !== null)
-            ? `<button type="button" class="chat-manager-branch chat-manager-branch-jump" data-filename="${escapeAttr(entry.fileName)}" data-msg-index="${entry.branchPoint}" title="Jump to this message in graph">${branchDistance !== null ? `Branched ${branchDistance} msgs ago` : `Branched at msg #${entry.branchPoint}`}</button>`
-            : '';
-        const driftSummary = getDriftSummary(entry);
-        const driftInfo = driftSummary
-            ? `<button type="button" class="chat-manager-drift-jump" data-filename="${escapeAttr(entry.fileName)}" data-msg-index="${driftSummary.firstMsgIndex}" title="Topic shifts near messages: ${escapeAttr(driftSummary.positions.join(', '))}">${driftSummary.count} topic shift${driftSummary.count !== 1 ? 's' : ''}</button>`
-            : '';
-        const indexingInfo = entry.isLoaded ? '' : '<span>Indexing...</span>';
-        const embStatus = getEmbeddingStatus(entry);
-        const embBadge = (embStatus === 'full' || embStatus === 'partial' || embStatus === 'none')
-            ? `<span class="chat-manager-emb-status chat-manager-emb-status-${embStatus}" title="${escapeAttr(embStatusTitle(embStatus))}"><i class="fa-solid fa-vector-square"></i></span>`
-            : '';
-        const embedCardBtn = (embStatus !== 'disabled' && embStatus !== 'full' && embStatus !== 'unknown' && entry.isLoaded)
-            ? `<i class="chat-manager-icon-btn chat-manager-embed-card-btn fa-fw fa-solid fa-bolt" data-filename="${escapeAttr(entry.fileName)}" title="Generate embeddings for this thread" tabindex="0"></i>`
-            : '';
-        const aiSummaryTitleClasses = `chat-manager-icon-btn chat-manager-ai-summarize-title-btn fa-fw fa-solid fa-wand-magic-sparkles${entry.isLoaded ? '' : ' disabled'}`;
-        const aiTitleClasses = `chat-manager-icon-btn chat-manager-ai-title-btn fa-fw fa-solid fa-robot${entry.isLoaded ? '' : ' disabled'}`;
-        const regenSummaryClasses = `chat-manager-icon-btn chat-manager-regen-summary-btn fa-fw fa-solid fa-rotate${entry.isLoaded ? '' : ' disabled'}`;
-        const aiSummaryTitle = entry.isLoaded
-            ? 'Generate summary and set AI title'
-            : 'AI summary/title will be available once indexing finishes';
-        const aiTitle = entry.isLoaded
-            ? 'Generate AI title'
-            : 'AI title will be available once indexing finishes';
-        const summaryTitle = entry.isLoaded
-            ? 'Generate/regenerate summary'
-            : 'AI summary will be available once indexing finishes';
+    const branchDistance = (entry.isLoaded && entry.branchPoint !== null && activeEntry?.isLoaded)
+        ? activeEntry.messageCount - entry.branchPoint : null;
+    const branchInfo = (entry.isLoaded && entry.branchPoint !== null)
+        ? `<button type="button" class="chat-manager-branch chat-manager-branch-jump" data-filename="${escapeAttr(entry.fileName)}" data-msg-index="${entry.branchPoint}" title="Jump to this message in graph">${branchDistance !== null ? `Branched ${branchDistance} msgs ago` : `Branched at msg #${entry.branchPoint}`}</button>`
+        : '';
+    const driftSummary = getDriftSummary(entry);
+    const driftInfo = driftSummary
+        ? `<button type="button" class="chat-manager-drift-jump" data-filename="${escapeAttr(entry.fileName)}" data-msg-index="${driftSummary.firstMsgIndex}" title="Topic shifts near messages: ${escapeAttr(driftSummary.positions.join(', '))}">${driftSummary.count} topic shift${driftSummary.count !== 1 ? 's' : ''}</button>`
+        : '';
+    const indexingInfo = entry.isLoaded ? '' : '<span>Indexing...</span>';
+    const embStatus = getEmbeddingStatus(entry);
+    const embBadge = (embStatus === 'full' || embStatus === 'partial' || embStatus === 'none')
+        ? `<span class="chat-manager-emb-status chat-manager-emb-status-${embStatus}" title="${escapeAttr(embStatusTitle(embStatus))}"><i class="fa-solid fa-vector-square"></i></span>`
+        : '';
+    const embedCardBtn = (embStatus !== 'disabled' && embStatus !== 'full' && embStatus !== 'unknown' && entry.isLoaded)
+        ? `<i class="chat-manager-icon-btn chat-manager-embed-card-btn fa-fw fa-solid fa-bolt" data-filename="${escapeAttr(entry.fileName)}" title="Generate embeddings for this thread" tabindex="0"></i>`
+        : '';
+    const aiSummaryTitleClasses = `chat-manager-icon-btn chat-manager-ai-summarize-title-btn fa-fw fa-solid fa-wand-magic-sparkles${entry.isLoaded ? '' : ' disabled'}`;
+    const aiTitleClasses = `chat-manager-icon-btn chat-manager-ai-title-btn fa-fw fa-solid fa-robot${entry.isLoaded ? '' : ' disabled'}`;
+    const regenSummaryClasses = `chat-manager-icon-btn chat-manager-regen-summary-btn fa-fw fa-solid fa-rotate${entry.isLoaded ? '' : ' disabled'}`;
+    const aiSummaryTitle = entry.isLoaded
+        ? 'Generate summary and set AI title'
+        : 'AI summary/title will be available once indexing finishes';
+    const aiTitle = entry.isLoaded
+        ? 'Generate AI title'
+        : 'AI title will be available once indexing finishes';
+    const summaryTitle = entry.isLoaded
+        ? 'Generate/regenerate summary'
+        : 'AI summary will be available once indexing finishes';
 
-        // Tag chips
-        const chatTags = getChatTags(entry.fileName);
-        let tagChipsHtml = '';
-        if (chatTags.length > 0) {
-            tagChipsHtml = '<div class="chat-manager-card-tags">';
-            for (const tagId of chatTags) {
-                const def = tagDefs[tagId];
-                if (!def) continue;
-                tagChipsHtml += `<span class="chat-manager-tag-chip" style="background:${escapeAttr(def.color)};color:${escapeAttr(def.textColor)}">${escapeHtml(def.name)}</span>`;
-            }
-            tagChipsHtml += '</div>';
+    // Tag chips
+    const chatTags = getChatTags(entry.fileName);
+    let tagChipsHtml = '';
+    if (chatTags.length > 0) {
+        tagChipsHtml = '<div class="chat-manager-card-tags">';
+        for (const tagId of chatTags) {
+            const def = tagDefs[tagId];
+            if (!def) continue;
+            tagChipsHtml += `<span class="chat-manager-tag-chip" style="background:${escapeAttr(def.color)};color:${escapeAttr(def.textColor)}">${escapeHtml(def.name)}</span>`;
         }
+        tagChipsHtml += '</div>';
+    }
 
-        html += `
+    return `
         <div class="chat-manager-card${isActive ? ' active' : ''}" data-filename="${escapeAttr(entry.fileName)}">
             <div class="chat-manager-card-header">
                 <div class="chat-manager-card-title-row">
@@ -2417,17 +2421,256 @@ export function renderThreadCardsFromEntries(entries, container, status, totalCo
             </div>
             <div class="chat-manager-card-filename">${escapeHtml(entry.fileName)}</div>
         </div>`;
-    }
+}
 
-    container.innerHTML = DOMPurify.sanitize(html);
+function clusterDividerHtml(entry) {
+    const dividerColor = entry.clusterLabel != null
+        ? clusterColor(entry.clusterLabel)
+        : 'rgba(180, 180, 180, 0.45)';
+    return `<div class="chat-manager-cluster-divider" style="--chat-manager-cluster-color:${escapeAttr(dividerColor)}"></div>`;
+}
+
+/**
+ * Render thread cards from a given set of entries into a container.
+ * Extracted so heatmap day-click and other features can reuse it.
+ *
+ * Uses a windowed (virtual) renderer: only the cards near the viewport are kept
+ * in the DOM, so the cost no longer scales with the total thread count. This is
+ * the primary fix for characters with hundreds/thousands of branches.
+ */
+export function renderThreadCardsFromEntries(entries, container, status, totalCount, options = {}) {
+    if (!container) return;
+
+    const index = getIndex();
+    if (totalCount === undefined) totalCount = Object.keys(index).length;
+
+    const ctx = buildCardRenderContext();
+
+    if (options.virtual === false) {
+        // Direct (non-windowed) render — used by callers that inject sibling
+        // elements (e.g. the heatmap day-view "Back" button) into the container.
+        teardownVirtualList();
+        let html = '';
+        for (let i = 0; i < entries.length; i++) {
+            const entry = entries[i];
+            if (ctx.isClusterSorted && i > 0) {
+                const prev = entries[i - 1];
+                if ((entry.clusterLabel ?? 999) !== (prev.clusterLabel ?? 999)) {
+                    html += clusterDividerHtml(entry);
+                }
+            }
+            html += buildThreadCardHtml(entry, ctx);
+        }
+        container.innerHTML = ctx.DOMPurify.sanitize(html);
+        bindCardEvents(container);
+    } else {
+        mountVirtualList(container, entries, ctx);
+    }
 
     const filtered = hasActiveFilter();
     const statusText = filtered
         ? `Showing ${entries.length} of ${totalCount} threads`
         : `Showing ${entries.length} threads`;
     if (status) status.textContent = withIndexingSuffix(statusText);
+}
 
+// ──────────────────────────────────────────────
+//  Virtual (windowed) thread list
+// ──────────────────────────────────────────────
+
+const VLIST_ESTIMATE_PX = 150;   // initial per-card height guess
+const VLIST_OVERSCAN_MIN = 300;  // minimum buffer above/below the viewport
+
+/**
+ * @type {null | {
+ *   container: HTMLElement,
+ *   entries: Array,
+ *   ctx: Object,
+ *   heights: Map<string, number>,
+ *   estimate: number,
+ *   range: { start: number, end: number } | null,
+ *   rafPending: boolean,
+ *   scrollHandler: (() => void) | null,
+ *   resizeObserver: ResizeObserver | null,
+ * }}
+ */
+let vState = null;
+
+function teardownVirtualList() {
+    if (!vState) return;
+    const st = vState;
+    if (st.scrollHandler) st.container.removeEventListener('scroll', st.scrollHandler);
+    if (st.resizeObserver) st.resizeObserver.disconnect();
+    vState = null;
+}
+
+function mountVirtualList(container, entries, ctx) {
+    teardownVirtualList();
+
+    vState = {
+        container,
+        entries,
+        ctx,
+        heights: new Map(),
+        estimate: VLIST_ESTIMATE_PX,
+        range: null,
+        rafPending: false,
+        scrollHandler: null,
+        resizeObserver: null,
+    };
+
+    vRenderWindow(true);
+
+    const handler = () => vOnScroll();
+    vState.scrollHandler = handler;
+    container.addEventListener('scroll', handler, { passive: true });
+
+    if (typeof ResizeObserver !== 'undefined') {
+        const ro = new ResizeObserver(() => {
+            if (!vState) return;
+            // If another view has replaced our content, stop driving the container.
+            if (!vState.container.querySelector('.cm-vspacer-top')) {
+                teardownVirtualList();
+                return;
+            }
+            if (vState.container.querySelector('.chat-manager-inline-edit')) return;
+            vRenderWindow(true);
+        });
+        ro.observe(container);
+        vState.resizeObserver = ro;
+    }
+
+    // Delegated handlers; addEventListener with the same named fn is idempotent.
     bindCardEvents(container);
+}
+
+function vHeightOf(entry) {
+    const h = vState.heights.get(entry.fileName);
+    return (typeof h === 'number' && h > 0) ? h : vState.estimate;
+}
+
+function vSumHeights(entries, start, end) {
+    let total = 0;
+    for (let i = start; i < end; i++) {
+        total += vHeightOf(entries[i]);
+    }
+    return total;
+}
+
+function vOnScroll() {
+    const st = vState;
+    if (!st) return;
+    if (st.rafPending) return;
+    st.rafPending = true;
+    requestAnimationFrame(() => {
+        st.rafPending = false;
+        if (vState !== st) return;
+        // Another view replaced the container contents — stop driving it.
+        if (!st.container.querySelector('.cm-vspacer-top')) {
+            teardownVirtualList();
+            return;
+        }
+        // Don't disrupt an in-progress inline edit (e.g. renaming a thread).
+        if (st.container.querySelector('.chat-manager-inline-edit')) return;
+        vRenderWindow(false);
+    });
+}
+
+/**
+ * Render the slice of cards near the viewport, padding above/below with spacer
+ * divs so the scrollbar reflects the full list height.
+ * @param {boolean} force - re-render even if the visible range is unchanged
+ */
+function vRenderWindow(force) {
+    const st = vState;
+    if (!st) return;
+    const { container, entries, ctx } = st;
+    const n = entries.length;
+
+    const scrollTop = container.scrollTop;
+    const viewport = container.clientHeight || 600;
+    const overscan = Math.max(viewport, VLIST_OVERSCAN_MIN);
+
+    // Find first visible index (accumulating estimated/measured heights).
+    let y = 0;
+    let start = 0;
+    while (start < n) {
+        const h = vHeightOf(entries[start]);
+        if (y + h > scrollTop - overscan) break;
+        y += h;
+        start++;
+    }
+    // Find one-past-last visible index.
+    let end = start;
+    let yEnd = y;
+    const limit = scrollTop + viewport + overscan;
+    while (end < n && yEnd < limit) {
+        yEnd += vHeightOf(entries[end]);
+        end++;
+    }
+
+    if (!force && st.range && st.range.start === start && st.range.end === end) {
+        return;
+    }
+
+    const desiredScrollTop = scrollTop;
+    const topPadding = vSumHeights(entries, 0, start);
+    const bottomPadding = vSumHeights(entries, end, entries.length);
+
+    let html = `<div class="cm-vspacer-top" style="height:${topPadding}px"></div>`;
+    for (let i = start; i < end; i++) {
+        const entry = entries[i];
+        if (ctx.isClusterSorted && i > 0) {
+            const prev = entries[i - 1];
+            if ((entry.clusterLabel ?? 999) !== (prev.clusterLabel ?? 999)) {
+                html += clusterDividerHtml(entry);
+            }
+        }
+        html += buildThreadCardHtml(entry, ctx);
+    }
+    html += `<div class="cm-vspacer-bottom" style="height:${bottomPadding}px"></div>`;
+
+    container.innerHTML = ctx.DOMPurify.sanitize(html);
+    st.range = { start, end };
+
+    vMeasureAndPad();
+    if (container.scrollTop !== desiredScrollTop) {
+        container.scrollTop = desiredScrollTop;
+    }
+}
+
+/**
+ * Measure the just-rendered cards to refine height estimates, then size the
+ * top/bottom spacers to the true cumulative heights of the off-screen entries.
+ */
+function vMeasureAndPad() {
+    const st = vState;
+    if (!st || !st.range) return;
+
+    const cards = st.container.querySelectorAll('.chat-manager-card[data-filename]');
+    let measuredTotal = 0;
+    let measuredCount = 0;
+    for (const card of cards) {
+        let h = card.offsetHeight + 10; // card height + margin-bottom
+        const prev = card.previousElementSibling;
+        if (prev && prev.classList.contains('chat-manager-cluster-divider')) {
+            h += prev.offsetHeight;
+        }
+        st.heights.set(card.dataset.filename, h);
+        measuredTotal += card.offsetHeight + 10;
+        measuredCount++;
+    }
+    if (measuredCount > 0) {
+        st.estimate = measuredTotal / measuredCount;
+    }
+
+    const top = vSumHeights(st.entries, 0, st.range.start);
+    const bottom = vSumHeights(st.entries, st.range.end, st.entries.length);
+
+    const topEl = st.container.querySelector('.cm-vspacer-top');
+    const botEl = st.container.querySelector('.cm-vspacer-bottom');
+    if (topEl) topEl.style.height = `${top}px`;
+    if (botEl) botEl.style.height = `${bottom}px`;
 }
 
 // ──────────────────────────────────────────────

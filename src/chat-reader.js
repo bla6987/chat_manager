@@ -4,6 +4,7 @@
  */
 
 import { getCachedChatsForCharacter, putCachedChat, removeCachedChat } from './cache-store.js';
+import { getMetaVersion } from './metadata-store.js';
 
 const MODULE_NAME = 'chat_manager';
 const HYDRATION_BATCH_SIZE = 50;
@@ -23,10 +24,29 @@ const entryHydrationPromises = new Map();
 const hydrationListeners = new Set();
 let progressCallback = null;
 
-/** Searchable messages cache — invalidated on every index mutation */
+/**
+ * Version counters used to invalidate derived caches.
+ *  - indexVersion bumps whenever anything affecting list ordering/display changes
+ *    (message content, clustering, etc.). Used by the filtered/sorted cache.
+ *  - messagesVersion bumps only when message *content* changes (hydration, deletion).
+ *    Used by the searchable-messages cache so that clustering and metadata edits do
+ *    not force an O(total messages) rebuild.
+ */
 let indexVersion = 0;
+let messagesVersion = 0;
 let cachedSearchableMessages = null;
 let cachedSearchableVersion = -1;
+
+/** Memoized filtered/sorted entries — keyed by data + metadata + filter/sort state. */
+let cachedFilteredEntries = null;
+let cachedFilteredKey = '';
+
+/** Guards against redundant active-chat branch detection rescans. */
+let lastBranchDetectionKey = null;
+
+/** Single-slot memo for per-thread sibling branch context (prompt-injection hot path). */
+let cachedSiblingContext = null;
+let cachedSiblingKey = '';
 
 /**
  * @typedef {Object} IndexMessage
@@ -444,8 +464,21 @@ export function prioritizeInQueue(fileName) {
     }
 }
 
-function bumpIndexVersion() {
+/**
+ * Bump the ordering/display version only. Use when entry-level derived fields change
+ * (e.g. cluster labels) without any message content changing.
+ */
+export function bumpIndexVersion() {
     indexVersion++;
+}
+
+/**
+ * Bump both versions. Use when message content changes (hydration, deletion) — this
+ * also invalidates the searchable-messages cache.
+ */
+function bumpDataVersion() {
+    indexVersion++;
+    messagesVersion++;
 }
 
 function normalizeEntryShape(entry) {
@@ -547,7 +580,7 @@ async function hydrateEntry(fileName, sessionId) {
                 isLoaded: true,
                 messageEmbeddings: null,
             };
-            bumpIndexVersion();
+            bumpDataVersion();
 
             if (currentCharacterAvatar) {
                 putCachedChat(currentCharacterAvatar, fileName, chatIndex[fileName]);
@@ -808,7 +841,7 @@ export async function buildIndex(onProgress, onMetadataReady) {
         }
 
         if (changed) {
-            bumpIndexVersion();
+            bumpDataVersion();
             for (const entry of Object.values(chatIndex)) {
                 entry.branchPoint = null;
             }
@@ -898,7 +931,7 @@ export async function updateActiveChat(fileName, options = {}) {
             clusterLabel: resetEmbeddings ? null : cached.clusterLabel,
             messageEmbeddings: resetEmbeddings ? null : cached.messageEmbeddings,
         };
-        bumpIndexVersion();
+        bumpDataVersion();
 
         if (currentCharacterAvatar) {
             putCachedChat(currentCharacterAvatar, fileName, chatIndex[fileName]);
@@ -928,6 +961,12 @@ export function runDeferredBranchDetection(activeFilename) {
  * @param {string} activeFilename - The currently active chat filename
  */
 function detectBranches(index, activeFilename) {
+    // Branch points only depend on the active chat and message content. Skip the
+    // O(n·m) rescan when neither has changed since the last detection.
+    const key = `${activeFilename || ''}|${messagesVersion}`;
+    if (key === lastBranchDetectionKey) return;
+    lastBranchDetectionKey = key;
+
     // Reset all branch points (detection is relative to the active chat)
     for (const entry of Object.values(index)) {
         entry.branchPoint = null;
@@ -1028,8 +1067,19 @@ export function getSiblingBranchContext(activeFilename, maxBranches = 3) {
 export function getSiblingBranchContextForThread(baseFilename, maxBranches = 3) {
     if (!baseFilename) return [];
 
+    // Prompt injection re-requests this for the same thread repeatedly; memoize on
+    // (base thread, message content version, cap) so we don't rescan all threads each time.
+    const cacheKey = `${baseFilename}|${messagesVersion}|${maxBranches}`;
+    if (cachedSiblingContext && cachedSiblingKey === cacheKey) {
+        return cachedSiblingContext;
+    }
+
     const baseEntry = chatIndex[baseFilename];
-    if (!baseEntry || !baseEntry.isLoaded || baseEntry.messages.length < 2) return [];
+    if (!baseEntry || !baseEntry.isLoaded || baseEntry.messages.length < 2) {
+        cachedSiblingContext = [];
+        cachedSiblingKey = cacheKey;
+        return cachedSiblingContext;
+    }
 
     const siblings = [];
 
@@ -1051,7 +1101,9 @@ export function getSiblingBranchContextForThread(baseFilename, maxBranches = 3) 
     }
 
     sortSiblingContextByRecency(siblings);
-    return siblings.slice(0, maxBranches);
+    cachedSiblingContext = siblings.slice(0, maxBranches);
+    cachedSiblingKey = cacheKey;
+    return cachedSiblingContext;
 }
 
 /**
@@ -1088,7 +1140,7 @@ export function clearIndex() {
     currentCharacterAvatar = null;
     nextInitialOrder = 0;
     progressCallback = null;
-    bumpIndexVersion();
+    bumpDataVersion();
     resetHydrationQueue();
     emitHydrationUpdate();
 }
@@ -1163,6 +1215,14 @@ export function getIndexVersion() {
  * @returns {ChatIndexEntry[]}
  */
 export function getFilteredSortedEntries(filterState, sortState, getChatMetaFn) {
+    // Memoize: the result only changes when the underlying data (indexVersion),
+    // per-chat metadata (metaVersion), or the filter/sort request changes. This is
+    // on the hot render path and is called repeatedly during background hydration.
+    const cacheKey = `${indexVersion}|${getMetaVersion()}|${JSON.stringify(filterState)}|${JSON.stringify(sortState)}`;
+    if (cachedFilteredEntries && cachedFilteredKey === cacheKey) {
+        return cachedFilteredEntries;
+    }
+
     let entries = Object.values(chatIndex);
 
     // ── Filter: tags (OR logic) ──
@@ -1271,6 +1331,8 @@ export function getFilteredSortedEntries(filterState, sortState, getChatMetaFn) 
         return a.fileName.localeCompare(b.fileName);
     });
 
+    cachedFilteredEntries = entries;
+    cachedFilteredKey = cacheKey;
     return entries;
 }
 
@@ -1280,7 +1342,7 @@ export function getFilteredSortedEntries(filterState, sortState, getChatMetaFn) 
  * @returns {Array}
  */
 export function getSearchableMessages() {
-    if (cachedSearchableMessages && cachedSearchableVersion === indexVersion) {
+    if (cachedSearchableMessages && cachedSearchableVersion === messagesVersion) {
         return cachedSearchableMessages;
     }
 
@@ -1302,6 +1364,6 @@ export function getSearchableMessages() {
     });
 
     cachedSearchableMessages = messages;
-    cachedSearchableVersion = indexVersion;
+    cachedSearchableVersion = messagesVersion;
     return messages;
 }

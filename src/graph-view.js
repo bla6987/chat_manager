@@ -26,6 +26,11 @@ const MAX_PINS = 8;
 
 const SPRING_K = 0.06;
 const REPULSION_STRENGTH = 800;
+// Repulsion falls off as 1/dist² so it is negligible beyond a few hundred px.
+// Above REPULSION_GRID_THRESHOLD nodes we bucket into a uniform grid and only
+// evaluate near pairs (cell size = cutoff), turning the O(n²) pass into ~O(n).
+const REPULSION_CUTOFF = 300;
+const REPULSION_GRID_THRESHOLD = 200;
 const DAMPING = 0.88;
 const PIN_CIRCLE_RADIUS = 180;
 const SETTLE_ENERGY_THRESHOLD = 0.05;
@@ -711,6 +716,72 @@ function tick() {
     });
 }
 
+/** Accumulate the pairwise repulsion force between simNodes[i] and simNodes[j]. */
+function accumulateRepulsion(i, j, fx, fy) {
+    const dx = simNodes[j].x - simNodes[i].x;
+    const dy = simNodes[j].y - simNodes[i].y;
+    const distSq = dx * dx + dy * dy + 1;
+    const force = REPULSION_STRENGTH / distSq;
+    const dist = Math.sqrt(distSq);
+
+    const forceX = (dx / dist) * force;
+    const forceY = (dy / dist) * force;
+
+    if (!simNodes[i].isPin) { fx[i] -= forceX; fy[i] -= forceY; }
+    if (!simNodes[j].isPin) { fx[j] += forceX; fy[j] += forceY; }
+}
+
+/**
+ * Apply repulsion across all nodes. Uses an exact O(n²) sweep for small graphs
+ * (preserving prior behaviour) and a uniform spatial grid for large ones, where
+ * only pairs in neighbouring cells are evaluated.
+ */
+function applyRepulsion(fx, fy, n) {
+    if (n <= REPULSION_GRID_THRESHOLD) {
+        for (let i = 0; i < n; i++) {
+            for (let j = i + 1; j < n; j++) {
+                accumulateRepulsion(i, j, fx, fy);
+            }
+        }
+        return;
+    }
+
+    // Bucket nodes into cells of size REPULSION_CUTOFF so a 3×3 cell scan covers
+    // every pair within the cutoff radius.
+    const cell = REPULSION_CUTOFF;
+    const buckets = new Map();
+    const keyOf = (cx, cy) => `${cx},${cy}`;
+    const cellX = new Int32Array(n);
+    const cellY = new Int32Array(n);
+
+    for (let i = 0; i < n; i++) {
+        const cx = Math.floor(simNodes[i].x / cell);
+        const cy = Math.floor(simNodes[i].y / cell);
+        cellX[i] = cx;
+        cellY[i] = cy;
+        const k = keyOf(cx, cy);
+        let arr = buckets.get(k);
+        if (!arr) { arr = []; buckets.set(k, arr); }
+        arr.push(i);
+    }
+
+    for (let i = 0; i < n; i++) {
+        const cx = cellX[i];
+        const cy = cellY[i];
+        for (let ox = -1; ox <= 1; ox++) {
+            for (let oy = -1; oy <= 1; oy++) {
+                const arr = buckets.get(keyOf(cx + ox, cy + oy));
+                if (!arr) continue;
+                for (let a = 0; a < arr.length; a++) {
+                    const j = arr[a];
+                    if (j <= i) continue; // evaluate each unordered pair once
+                    accumulateRepulsion(i, j, fx, fy);
+                }
+            }
+        }
+    }
+}
+
 function stepSimulation() {
     const n = simNodes.length;
     if (n === 0) return 0;
@@ -741,22 +812,8 @@ function stepSimulation() {
         fy[i] += (dy / dist) * force;
     }
 
-    // 2. Repulsion between all nodes (O(n^2) — fine for n < 500)
-    for (let i = 0; i < n; i++) {
-        for (let j = i + 1; j < n; j++) {
-            const dx = simNodes[j].x - simNodes[i].x;
-            const dy = simNodes[j].y - simNodes[i].y;
-            const distSq = dx * dx + dy * dy + 1;
-            const force = REPULSION_STRENGTH / distSq;
-            const dist = Math.sqrt(distSq);
-
-            const forceX = (dx / dist) * force;
-            const forceY = (dy / dist) * force;
-
-            if (!simNodes[i].isPin) { fx[i] -= forceX; fy[i] -= forceY; }
-            if (!simNodes[j].isPin) { fx[j] += forceX; fy[j] += forceY; }
-        }
-    }
+    // 2. Repulsion between nodes (exact for small graphs, spatial-grid for large).
+    applyRepulsion(fx, fy, n);
 
     // 3. Gentle centering for pins (keep them from drifting during interactions)
     for (let i = 0; i < n; i++) {

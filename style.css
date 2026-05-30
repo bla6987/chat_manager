@@ -185,6 +185,14 @@
     padding: 8px 12px;
 }
 
+/* Virtual-list spacers: reserve scroll height for off-screen cards. */
+.cm-vspacer-top,
+.cm-vspacer-bottom {
+    flex: none;
+    width: 100%;
+    pointer-events: none;
+}
+
 /* ── Thread Cards ── */
 
 .chat-manager-card {

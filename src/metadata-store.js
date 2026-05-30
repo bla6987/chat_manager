@@ -5,6 +5,22 @@
 
 const MODULE_NAME = 'chat_manager';
 
+/**
+ * Bumped whenever per-chat metadata that affects list ordering/filtering/display
+ * changes (display names, tags, summaries, key migrations). Lets derived caches
+ * (e.g. the filtered/sorted entry list) detect metadata changes cheaply.
+ */
+let metaVersion = 0;
+
+/** @returns {number} current metadata version */
+export function getMetaVersion() {
+    return metaVersion;
+}
+
+function bumpMetaVersion() {
+    metaVersion++;
+}
+
 const DEFAULT_TAG_DEFINITIONS = {
     tag_canon: { id: 'tag_canon', name: 'Canon', color: '#4CAF50', textColor: '#FFFFFF' },
     tag_experimental: { id: 'tag_experimental', name: 'Experimental', color: '#FF9800', textColor: '#FFFFFF' },
@@ -236,6 +252,7 @@ export function setChatMeta(fileName, data, charKey) {
     }
 
     Object.assign(extensionSettings[MODULE_NAME].metadata[key][fileName], data);
+    bumpMetaVersion();
     saveSettingsDebounced();
 }
 
@@ -317,6 +334,7 @@ export function migrateFileKey(oldFileName, newFileName) {
     if (charMeta[oldFileName]) {
         charMeta[newFileName] = { ...charMeta[oldFileName] };
         delete charMeta[oldFileName];
+        bumpMetaVersion();
         saveSettingsDebounced();
     } else if (updatedSelection) {
         saveSettingsDebounced();
