@@ -92,6 +92,20 @@ const queryEmbeddingCache = new Map();
 const driftSummaryCache = new Map();
 
 /**
+ * Run a callback during browser idle time, falling back to setTimeout where
+ * requestIdleCallback is unavailable. Used to keep heavy, non-visual work
+ * (e.g. branch detection) out of the thread-switch render path.
+ * @param {() => void} fn
+ */
+function scheduleIdle(fn) {
+    if (typeof requestIdleCallback === 'function') {
+        requestIdleCallback(fn, { timeout: 500 });
+    } else {
+        setTimeout(fn, 0);
+    }
+}
+
+/**
  * Streaming search state — allows early termination and "load more" resumption.
  * @type {{ query: string, lowerQuery: string, searchable: Array, position: number, results: Array, totalMatches: number, exhausted?: boolean, mode?: 'keyword'|'semantic' } | null}
  */
@@ -2061,10 +2075,12 @@ export async function refreshPanel() {
     const renderThreadListWithBranches = () => {
         renderThreadCards();
         const activeFile = getActiveFilename();
-        setTimeout(() => {
+        // Branch detection is O(chats × messages). Defer it to idle time so it never blocks
+        // the thread-switch render; cards paint immediately and branch badges patch in after.
+        scheduleIdle(() => {
             runDeferredBranchDetection(activeFile);
             patchBranchIndicators();
-        }, 0);
+        });
     };
 
     const renderFromLatestIndex = () => {
@@ -3679,11 +3695,16 @@ async function handleSwitchThread(e) {
     if (filename === activeChatFile) return;
 
     const context = SillyTavern.getContext();
-    await context.openCharacterChat(filename.replace(/\.jsonl$/i, ''));
 
+    // In popup mode the panel closes on switch anyway. Close it *before* awaiting so
+    // CHAT_CHANGED sees the panel closed and skips the expensive refreshPanel() rebuild
+    // (thread-card re-render + index refetch + branch detection) that would otherwise run
+    // in the critical path for a panel that's about to disappear.
     if (getDisplayMode() === 'popup') {
         closePanel();
     }
+
+    await context.openCharacterChat(filename.replace(/\.jsonl$/i, ''));
 }
 
 function handleEditDisplayName(e) {
