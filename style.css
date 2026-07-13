@@ -894,6 +894,22 @@
     border-top: 1px solid rgba(255, 255, 255, 0.08);
 }
 
+.chat-manager-alert-setting {
+    padding: 9px 10px;
+    border: 1px solid rgba(255, 174, 94, 0.22);
+    border-radius: 7px;
+    background: rgba(255, 148, 72, 0.055);
+}
+
+.chat-manager-alert-setting .chat-manager-settings-inline-check {
+    margin-bottom: 5px;
+}
+
+.chat-manager-alert-setting .fa-bell {
+    margin-right: 3px;
+    color: rgba(255, 184, 112, 0.92);
+}
+
 .chat-manager-emb-model-tools {
     display: flex;
     gap: 8px;

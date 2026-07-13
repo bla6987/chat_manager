@@ -31,6 +31,18 @@
             </small>
 
             <div class="chat-manager-settings-separator"></div>
+            <label class="chat-manager-settings-label">Alerts</label>
+            <div class="chat-manager-alert-setting">
+                <label class="chat-manager-settings-inline-check" for="chat-manager-failure-alert-enabled">
+                    <input id="chat-manager-failure-alert-enabled" type="checkbox" />
+                    <span><i class="fa-solid fa-bell" aria-hidden="true"></i> Failed generation sound</span>
+                </label>
+                <small class="chat-manager-settings-desc" style="padding-left: 0;">
+                    Plays a descending alert when a response fails or returns an API error. Manual stops are ignored.
+                </small>
+            </div>
+
+            <div class="chat-manager-settings-separator"></div>
             <label class="chat-manager-settings-label">Embeddings</label>
             <label class="chat-manager-settings-inline-check">
                 <input id="chat-manager-emb-enabled" type="checkbox" />

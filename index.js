@@ -11,13 +11,14 @@ import {
 } from './src/ui-controller.js';
 import {
     getDisplayMode, setDisplayMode, getBranchContextEnabled, getAIConnectionProfile, setAIConnectionProfile,
-    getEmbeddingSettings, setEmbeddingSettings,
+    getEmbeddingSettings, setEmbeddingSettings, getFailureAlertEnabled, setFailureAlertEnabled,
 } from './src/metadata-store.js';
 import { updateBranchContextInjection, clearBranchContextInjection } from './src/branch-context.js';
 import { attachMomentumScroll } from './src/momentum-scroll.js';
 import { acknowledgeEmbeddingModelChange, clearEmbeddingCache, getCacheStats } from './src/embedding-service.js';
 import { updateGraphViewData, isGraphViewMounted } from './src/graph-view.js';
 import { resolveActiveChatFilename } from './src/active-chat.js';
+import { initGenerationFailureAlert, primeFailureAlertAudio } from './src/generation-failure-alert.js';
 
 const MODULE_NAME = 'chat_manager';
 const EXTENSION_PATH = '/scripts/extensions/third-party/chat_manager';
@@ -115,6 +116,13 @@ const onMessageUpdate = (() => {
 
     // Listen for SillyTavern events
     if (eventSource && eventTypes) {
+        initGenerationFailureAlert({
+            eventSource,
+            eventTypes,
+            getContext: () => SillyTavern.getContext(),
+            isEnabled: getFailureAlertEnabled,
+        });
+
         eventSource.on(eventTypes.CHAT_CHANGED, onChatChanged);
         eventSource.on(eventTypes.MESSAGE_SENT, onMessageUpdate);
         eventSource.on(eventTypes.MESSAGE_RECEIVED, onMessageUpdate);
@@ -443,6 +451,25 @@ function formatCacheStatsLine(stats) {
     const count = Number.isFinite(stats?.count) ? stats.count : 0;
     const sizeKB = Number.isFinite(stats?.estimatedSizeKB) ? stats.estimatedSizeKB : 0;
     return `${count} vectors, ~${sizeKB.toFixed(1)} KB`;
+}
+
+/**
+ * Bind the failed generation sound toggle.
+ * @param {HTMLElement} container
+ */
+function bindFailureAlertSettingsUI(container) {
+    const toggle = container.querySelector('#chat-manager-failure-alert-enabled');
+    if (!toggle) return;
+
+    toggle.checked = getFailureAlertEnabled();
+    toggle.addEventListener('change', () => {
+        setFailureAlertEnabled(toggle.checked);
+        if (toggle.checked) {
+            // The change event is a user gesture, making it the reliable moment
+            // to unlock Web Audio for later background failures.
+            void primeFailureAlertAudio();
+        }
+    });
 }
 
 /**
@@ -1066,6 +1093,7 @@ async function injectSettingsPanel() {
         const aiProfileSelect = container.querySelector('#chat-manager-ai-profile');
         bindAIProfileDropdown(aiProfileSelect);
 
+        bindFailureAlertSettingsUI(container);
         bindEmbeddingSettingsUI(container);
     })().finally(() => {
         pendingSettingsInjection = null;

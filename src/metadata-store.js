@@ -99,6 +99,9 @@ function ensureSettings() {
     if (extensionSettings[MODULE_NAME].aiConnectionProfile === undefined) {
         extensionSettings[MODULE_NAME].aiConnectionProfile = '';
     }
+    if (extensionSettings[MODULE_NAME].failureAlertEnabled === undefined) {
+        extensionSettings[MODULE_NAME].failureAlertEnabled = false;
+    }
     if (!extensionSettings[MODULE_NAME].embeddings || typeof extensionSettings[MODULE_NAME].embeddings !== 'object') {
         extensionSettings[MODULE_NAME].embeddings = createDefaultEmbeddingSettings();
     }
@@ -396,6 +399,27 @@ export function setAIConnectionProfile(profileId) {
     ensureSettings();
     const { extensionSettings, saveSettingsDebounced } = SillyTavern.getContext();
     extensionSettings[MODULE_NAME].aiConnectionProfile = profileId || '';
+    saveSettingsDebounced();
+}
+
+/**
+ * Get the failed response generation sound preference (defaults to false).
+ * @returns {boolean}
+ */
+export function getFailureAlertEnabled() {
+    ensureSettings();
+    const { extensionSettings } = SillyTavern.getContext();
+    return extensionSettings[MODULE_NAME].failureAlertEnabled === true;
+}
+
+/**
+ * Set the failed response generation sound preference.
+ * @param {boolean} enabled
+ */
+export function setFailureAlertEnabled(enabled) {
+    ensureSettings();
+    const { extensionSettings, saveSettingsDebounced } = SillyTavern.getContext();
+    extensionSettings[MODULE_NAME].failureAlertEnabled = enabled === true;
     saveSettingsDebounced();
 }
 
