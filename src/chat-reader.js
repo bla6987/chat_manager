@@ -656,10 +656,26 @@ export async function buildIndex(onProgress, onMetadataReady) {
             serverChats.set(metaObj.file_name, metaObj);
         }
 
-        // Bulk-read IndexedDB cache for this character
+        // Loaded, unchanged entries already live in memory. Avoid cloning their
+        // full message histories out of IndexedDB on every panel open.
+        const cacheFiles = [];
+        for (const [fileName, metaObj] of serverChats) {
+            const entry = chatIndex[fileName];
+            if (!entry?.isLoaded || entry.lastModified !== getMetaTimestamp(metaObj)) {
+                cacheFiles.push(fileName);
+            }
+        }
         let idbCache = new Map();
         try {
-            idbCache = await getCachedChatsForCharacter(character.avatar);
+            if (cacheFiles.length > 0) {
+                idbCache = await getCachedChatsForCharacter(character.avatar, cacheFiles);
+                for (const [fileName, entry] of idbCache) {
+                    if (!Array.isArray(entry.messages)) continue;
+                    for (const msg of entry.messages) {
+                        if (!msg.filename) msg.filename = fileName;
+                    }
+                }
+            }
         } catch {
             // IndexedDB unavailable — proceed without cache
         }
@@ -787,13 +803,6 @@ export async function buildIndex(onProgress, onMetadataReady) {
                         cached.messageCount = metaMessageCount;
                     }
                     markEntryForHydration(fileName);
-                }
-            }
-
-            if (cached.isLoaded) {
-                // Ensure older cached messages can be searched lazily.
-                for (const msg of cached.messages) {
-                    if (!msg.filename) msg.filename = fileName;
                 }
             }
         }

@@ -1817,29 +1817,32 @@ export function closePanel() {
 
 // ── Side Panel ──
 
-let isToggling = false;
+let panelOpenRequestId = 0;
+
+async function refreshAfterPanelPaint(root, requestId) {
+    // Promise continuations (including refreshPanel's initial cached render) run
+    // before paint. Leave a frame for the visible shell before doing that work.
+    await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+    if (!panelOpen || requestId !== panelOpenRequestId || !root.isConnected) return;
+    await refreshPanel();
+}
 
 async function toggleSidePanel() {
-    if (isToggling) return;
-    isToggling = true;
-    try {
-        const panel = document.getElementById('chat-manager-panel');
-        if (!panel) return;
-
-        panelOpen = !panelOpen;
-
-        if (panelOpen) {
-            panel.classList.add('open');
-            await refreshPanel();
-        } else {
-            panel.classList.remove('open');
-        }
-    } finally {
-        isToggling = false;
+    const panel = document.getElementById('chat-manager-panel');
+    if (!panel) return;
+    if (panelOpen) {
+        closeSidePanel();
+        return;
     }
+
+    panelOpen = true;
+    const requestId = ++panelOpenRequestId;
+    panel.classList.add('open');
+    await refreshAfterPanelPaint(panel, requestId);
 }
 
 function closeSidePanel() {
+    panelOpenRequestId++;
     const panel = document.getElementById('chat-manager-panel');
     if (panel) panel.classList.remove('open');
     panelOpen = false;
@@ -1853,29 +1856,24 @@ function closeSidePanel() {
 // ── Popup ──
 
 async function togglePopup() {
-    if (isToggling) return;
-    isToggling = true;
-    try {
-        const overlay = document.getElementById('chat-manager-shadow-overlay');
-        if (!overlay) return;
-
-        panelOpen = !panelOpen;
-
-        if (panelOpen) {
-            overlay.style.display = 'block';
-            // Force reflow so the transition triggers
-            void overlay.offsetHeight;
-            overlay.classList.add('visible');
-            await refreshPanel();
-        } else {
-            closePopup();
-        }
-    } finally {
-        isToggling = false;
+    const overlay = document.getElementById('chat-manager-shadow-overlay');
+    if (!overlay) return;
+    if (panelOpen) {
+        closePopup();
+        return;
     }
+
+    panelOpen = true;
+    const requestId = ++panelOpenRequestId;
+    overlay.style.display = 'block';
+    // Force reflow so the transition triggers
+    void overlay.offsetHeight;
+    overlay.classList.add('visible');
+    await refreshAfterPanelPaint(overlay, requestId);
 }
 
 function closePopup() {
+    panelOpenRequestId++;
     const overlay = document.getElementById('chat-manager-shadow-overlay');
     if (!overlay) return;
     overlay.classList.remove('visible');
@@ -2092,7 +2090,9 @@ export async function refreshPanel() {
         }
         renderedFromMetadata = true;
         if (!panelOpen || isAnyViewActive()) return;
-        renderFromLatestIndex();
+        if (!hasCache || buildState?.changed) {
+            renderFromLatestIndex();
+        }
     });
 
     // Invalidate search state since the index may have changed

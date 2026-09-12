@@ -57,27 +57,27 @@ function makeKey(avatar, fileName) {
 }
 
 /**
- * Bulk-read all cached chat entries for a character.
+ * Read only the cached chat entries missing or stale in the in-memory index.
  * @param {string} avatar
+ * @param {string[]} fileNames
  * @returns {Promise<Map<string, object>>} Map of fileName -> cached entry
  */
-export async function getCachedChatsForCharacter(avatar) {
+export async function getCachedChatsForCharacter(avatar, fileNames) {
     const result = new Map();
+    if (fileNames.length === 0) return result;
     try {
         const database = await openDB();
         return new Promise((resolve) => {
             const tx = database.transaction(STORE_NAME, 'readonly');
             const store = tx.objectStore(STORE_NAME);
-            const index = store.index('avatar');
-            const request = index.openCursor(IDBKeyRange.only(avatar));
-
-            request.onsuccess = (event) => {
-                const cursor = event.target.result;
-                if (cursor) {
-                    result.set(cursor.value.fileName, cursor.value);
-                    cursor.continue();
-                }
-            };
+            for (const fileName of fileNames) {
+                const request = store.get(makeKey(avatar, fileName));
+                request.onsuccess = () => {
+                    const entry = request.result;
+                    if (!entry) return;
+                    result.set(fileName, entry);
+                };
+            }
 
             tx.oncomplete = () => resolve(result);
             tx.onerror = () => resolve(result);
