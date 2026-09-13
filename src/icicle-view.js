@@ -40,6 +40,10 @@ let ctx = null;
 let container = null;
 let currentMode = null;       // 'mini' | 'full'
 let mounted = false;
+let lifecycleGeneration = 0;
+let dataUpdateInFlight = false;
+let dataUpdatePending = false;
+let dataUpdateToken = null;
 let threadFocusActive = true;
 
 // Data
@@ -203,7 +207,8 @@ export function focusMessageInIcicle(filename, msgIndex, options = {}) {
 }
 
 export async function mountIcicle(containerEl, mode) {
-    if (mounted) unmountIcicle();
+    if (mounted || container) unmountIcicle();
+    const generation = ++lifecycleGeneration;
 
     container = containerEl;
     currentMode = mode;
@@ -219,6 +224,7 @@ export async function mountIcicle(containerEl, mode) {
     const activeChatFile = getActiveChatFile ? getActiveChatFile() : null;
     const chatIndex = getIndex();
     const data = await buildIcicleData(chatIndex, activeChatFile, { threadFocus: threadFocusActive });
+    if (generation !== lifecycleGeneration || container !== containerEl) return;
     refreshActiveTopicDrift(activeChatFile, chatIndex);
 
     icicleRoot = data.root;
@@ -341,6 +347,10 @@ export async function mountIcicle(containerEl, mode) {
 }
 
 export function unmountIcicle() {
+    lifecycleGeneration++;
+    dataUpdatePending = false;
+    dataUpdateInFlight = false;
+    dataUpdateToken = null;
     cancelViewportAnim();
     cancelInertia();
     clearTimeout(rebuildTimer);
@@ -403,10 +413,38 @@ export function unmountIcicle() {
 
 export async function updateIcicleData() {
     if (!mounted || !canvas) return;
+    if (dataUpdateInFlight) {
+        dataUpdatePending = true;
+        return;
+    }
+    dataUpdateInFlight = true;
+    const updateToken = {};
+    dataUpdateToken = updateToken;
+    const generation = lifecycleGeneration;
+    const mountedCanvas = canvas;
 
     const activeChatFile = getActiveChatFile ? getActiveChatFile() : null;
     const chatIndex = getIndex();
-    const data = await buildIcicleData(chatIndex, activeChatFile, { threadFocus: threadFocusActive });
+    let data;
+    try {
+        data = await buildIcicleData(chatIndex, activeChatFile, { threadFocus: threadFocusActive });
+    } catch (err) {
+        if (dataUpdateToken === updateToken) {
+            dataUpdateInFlight = false;
+            dataUpdateToken = null;
+        }
+        console.warn('[chat_manager] Failed to refresh icicle data:', err);
+        queuePendingIcicleUpdate();
+        return;
+    }
+    if (dataUpdateToken === updateToken) {
+        dataUpdateInFlight = false;
+        dataUpdateToken = null;
+    }
+    if (generation !== lifecycleGeneration || canvas !== mountedCanvas || !mounted) {
+        queuePendingIcicleUpdate();
+        return;
+    }
     refreshActiveTopicDrift(activeChatFile, chatIndex);
 
     icicleRoot = data.root;
@@ -427,7 +465,10 @@ export async function updateIcicleData() {
     wasDragging = false;
     cancelViewportAnim();
 
-    if (!icicleRoot || flatNodes.length === 0) return;
+    if (!icicleRoot || flatNodes.length === 0) {
+        queuePendingIcicleUpdate();
+        return;
+    }
 
     // Re-run search against new data if query is active
     if (searchQuery.length >= 2) {
@@ -441,6 +482,13 @@ export async function updateIcicleData() {
     updateBreadcrumbs();
     updateResetButton();
     tryApplyPendingFocus();
+    queuePendingIcicleUpdate();
+}
+
+function queuePendingIcicleUpdate() {
+    if (!dataUpdatePending || !mounted) return;
+    dataUpdatePending = false;
+    void updateIcicleData().catch(err => console.warn('[chat_manager] Failed to run pending icicle refresh:', err));
 }
 
 export async function expandToFullScreen() {

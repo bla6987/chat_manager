@@ -95,6 +95,12 @@ let backgroundSwipeEmbedActive = false;
 const pendingBackgroundSwipeCandidates = new Map();
 let latestSearchRequestId = 0;
 const queryEmbeddingCache = new Map();
+const queryEmbeddingInFlight = new Map();
+let clusterResultCache = null;
+const clusterComputationsInFlight = new Map();
+const clusterVectorIds = new WeakMap();
+let nextClusterInputId = 1;
+let queryEmbeddingEpoch = 0;
 let driftSummaryCache = new WeakMap();
 
 /**
@@ -660,42 +666,95 @@ function embStatusTitle(status) {
     }
 }
 
-async function recomputeEmbeddingClusters(options = {}) {
+function getClusterInputs() {
     const index = getIndex();
     const entries = Object.values(index);
     const embeddedEntries = entries.filter(entry => Array.isArray(entry.chatEmbedding) && entry.chatEmbedding.length > 0);
+    const signature = embeddedEntries.map(entry => {
+        const vector = entry.chatEmbedding;
+        if (!clusterVectorIds.has(vector)) clusterVectorIds.set(vector, nextClusterInputId++);
+        let vectorHashA = 0x811c9dc5;
+        let vectorHashB = 0x9e3779b1;
+        const bits = new DataView(new ArrayBuffer(8));
+        for (let i = 0; i < vector.length; i++) {
+            bits.setFloat64(0, Number(vector[i]), true);
+            const low = bits.getUint32(0, true);
+            const high = bits.getUint32(4, true);
+            vectorHashA = Math.imul(vectorHashA ^ low, 0x01000193);
+            vectorHashA = Math.imul(vectorHashA ^ high, 0x01000193);
+            vectorHashB = Math.imul(vectorHashB ^ high, 0x85ebca6b);
+            vectorHashB = Math.imul(vectorHashB ^ low, 0xc2b2ae35);
+        }
+        return `${hashEmbeddingText(entry.fileName || '')}:${clusterVectorIds.get(vector)}:${vector.length}:${vectorHashA >>> 0}:${vectorHashB >>> 0}`;
+    }).join('\u0001');
+    return { entries, embeddedEntries, signature };
+}
 
-    for (const entry of entries) {
-        entry.clusterLabel = null;
+async function computeClusterLabels(vectors, fixedK) {
+    let k = Number.isFinite(fixedK) && fixedK > 0
+        ? Math.floor(fixedK)
+        : await findOptimalKAsync(vectors, 8);
+    if (!Number.isFinite(k) || k < 1) {
+        k = Math.min(5, Math.ceil(vectors.length / 3));
+    }
+    k = Math.max(1, Math.min(Math.floor(k), vectors.length));
+    const { labels } = await kMeansAsync(vectors, k, 50);
+    return { labels, k };
+}
+
+export async function recomputeEmbeddingClusters(options = {}) {
+    const { entries, embeddedEntries, signature } = getClusterInputs();
+    const fixedK = Number.isFinite(options.fixedK) && options.fixedK > 0 ? Math.floor(options.fixedK) : null;
+    const cacheKey = `${signature}\u0002${fixedK ?? 'auto'}`;
+
+    if (clusterResultCache?.key === cacheKey) {
+        for (const entry of entries) entry.clusterLabel = null;
+        for (let i = 0; i < embeddedEntries.length; i++) {
+            embeddedEntries[i].clusterLabel = clusterResultCache.labels[i] ?? 0;
+        }
+        lastClusterK = clusterResultCache.k;
+        lastClusterChatCount = embeddedEntries.length;
+        return { clusterCount: clusterResultCache.clusterCount, k: clusterResultCache.k, embeddedCount: embeddedEntries.length, cached: true };
     }
 
     if (embeddedEntries.length === 0) {
+        for (const entry of entries) entry.clusterLabel = null;
+        clusterResultCache = { key: cacheKey, labels: [], clusterCount: 0, k: null };
         lastClusterK = null;
         lastClusterChatCount = 0;
         return { clusterCount: 0, k: null, embeddedCount: 0 };
     }
     if (embeddedEntries.length === 1) {
+        for (const entry of entries) entry.clusterLabel = null;
         embeddedEntries[0].clusterLabel = 0;
+        clusterResultCache = { key: cacheKey, labels: [0], clusterCount: 1, k: 1 };
         lastClusterK = 1;
         lastClusterChatCount = 1;
         return { clusterCount: 1, k: 1, embeddedCount: 1 };
     }
 
-    const vectors = embeddedEntries.map(entry => entry.chatEmbedding);
-    let k = Number.isFinite(options.fixedK) && options.fixedK > 0
-        ? Math.floor(options.fixedK)
-        : await findOptimalKAsync(vectors, 8);
-    if (!Number.isFinite(k) || k < 1) {
-        k = Math.min(5, Math.ceil(embeddedEntries.length / 3));
+    const computationKey = cacheKey;
+    let computation = clusterComputationsInFlight.get(computationKey);
+    if (!computation) {
+        computation = computeClusterLabels(embeddedEntries.map(entry => entry.chatEmbedding), fixedK);
+        clusterComputationsInFlight.set(computationKey, computation);
+        computation.finally(() => {
+            if (clusterComputationsInFlight.get(computationKey) === computation) clusterComputationsInFlight.delete(computationKey);
+        }).catch(() => {});
     }
-    k = Math.max(1, Math.min(Math.floor(k), embeddedEntries.length));
+    const { labels, k } = await computation;
+    const currentInputs = getClusterInputs();
+    if (currentInputs.signature !== signature) {
+        return recomputeEmbeddingClusters(options);
+    }
 
-    const { labels } = await kMeansAsync(vectors, k, 50);
-    for (let i = 0; i < embeddedEntries.length; i++) {
-        embeddedEntries[i].clusterLabel = labels[i] ?? 0;
+    for (const entry of currentInputs.entries) entry.clusterLabel = null;
+    for (let i = 0; i < currentInputs.embeddedEntries.length; i++) {
+        currentInputs.embeddedEntries[i].clusterLabel = labels[i] ?? 0;
     }
 
     const clusterCount = new Set(labels).size;
+    clusterResultCache = { key: cacheKey, labels: [...labels], clusterCount, k };
     lastClusterK = k;
     lastClusterChatCount = embeddedEntries.length;
     return { clusterCount, k, embeddedCount: embeddedEntries.length };
@@ -767,11 +826,7 @@ async function flushBackgroundSwipeEmbeddings(settings, rerender = false) {
 
     try {
         while (pendingBackgroundSwipeCandidates.size > 0) {
-            const batch = Array.from(pendingBackgroundSwipeCandidates.values()).slice(0, batchSize);
-            for (const candidate of batch) {
-                const dedupKey = `${candidate.entry.fileName}:${candidate.key}`;
-                pendingBackgroundSwipeCandidates.delete(dedupKey);
-            }
+            const batch = takeMapBatch(pendingBackgroundSwipeCandidates, batchSize);
             if (batch.length === 0) break;
 
             const cached = await getCachedEmbeddingsForTexts(batch.map(item => item.text));
@@ -802,6 +857,19 @@ async function flushBackgroundSwipeEmbeddings(settings, rerender = false) {
             refreshAfterEmbeddingUpdate();
         }
     }
+}
+
+export function takeMapBatch(map, batchSize) {
+    const batch = [];
+    const iterator = map.entries();
+    while (batch.length < batchSize) {
+        const next = iterator.next();
+        if (next.done) break;
+        const [key, value] = next.value;
+        map.delete(key);
+        batch.push(value);
+    }
+    return batch;
 }
 
 async function runEmbeddingGeneration(targetFileNames = null, options = {}) {
@@ -972,6 +1040,8 @@ async function runEmbeddingGeneration(targetFileNames = null, options = {}) {
     }
 
     queryEmbeddingCache.clear();
+    queryEmbeddingInFlight.clear();
+    queryEmbeddingEpoch++;
 
     let clusters = getCurrentClusterCount();
     let reclusterTriggered = false;
@@ -1023,6 +1093,9 @@ export function clearInMemoryEmbeddings(options = {}) {
     lastClusterChatCount = 0;
     lastClusterResult = 0;
     queryEmbeddingCache.clear();
+    queryEmbeddingInFlight.clear();
+    queryEmbeddingEpoch++;
+    clusterResultCache = null;
     driftSummaryCache = new WeakMap();
 
     const index = getIndex();
@@ -3110,6 +3183,78 @@ function renderSearchState(container, status, queryText) {
     renderSearchPage(container, 0);
 }
 
+function getQueryEmbeddingKey(query, settings) {
+    const credentialIdentity = hashEmbeddingText(String(settings.apiKey || ''));
+    return [
+        settings.provider || '',
+        settings.model || '',
+        settings.provider === 'ollama' ? (settings.ollamaUrl || '') : credentialIdentity,
+        query,
+    ].join('\u0000');
+}
+
+export async function getSemanticQueryEmbedding(query) {
+    const settings = getEmbeddingSettings();
+    const key = getQueryEmbeddingKey(query, settings);
+    const epoch = queryEmbeddingEpoch;
+    const cached = queryEmbeddingCache.get(key);
+    if (cached) return cached;
+
+    let inFlight = queryEmbeddingInFlight.get(key);
+    if (!inFlight) {
+        inFlight = embedText(query, { level: 'query' });
+        queryEmbeddingInFlight.set(key, inFlight);
+    }
+
+    try {
+        const vector = await inFlight;
+        if (queryEmbeddingEpoch === epoch && getQueryEmbeddingKey(query, getEmbeddingSettings()) === key) {
+            queryEmbeddingCache.set(key, vector);
+            if (queryEmbeddingCache.size > 32) {
+                const firstKey = queryEmbeddingCache.keys().next().value;
+                queryEmbeddingCache.delete(firstKey);
+            }
+        }
+        return vector;
+    } finally {
+        if (queryEmbeddingInFlight.get(key) === inFlight) queryEmbeddingInFlight.delete(key);
+    }
+}
+
+export function aggregateSemanticResult(aggregated, dedupKey, result) {
+    const existing = aggregated.get(dedupKey);
+    if (!existing) {
+        result._fileRanks = new Map([[result.item.filename, { score: result.combinedScore, order: result._semanticOrder }]]);
+        aggregated.set(dedupKey, result);
+        return;
+    }
+
+    const ranks = existing._fileRanks || new Map();
+    const priorRank = ranks.get(result.item.filename);
+    if (!priorRank || result.combinedScore > priorRank.score) {
+        ranks.set(result.item.filename, { score: result.combinedScore, order: result._semanticOrder });
+    }
+    if (result.combinedScore > existing.combinedScore) {
+        result._fileRanks = ranks;
+        aggregated.set(dedupKey, result);
+    }
+}
+
+export function finalizeSemanticResults(aggregated, limit = HYBRID_SEARCH_LIMIT) {
+    return [...aggregated.values()]
+        .sort((a, b) => (b.combinedScore - a.combinedScore) || (a._semanticOrder - b._semanticOrder))
+        .slice(0, Math.max(0, Math.min(HYBRID_SEARCH_LIMIT, Math.floor(limit))))
+        .map(result => {
+            result.otherFiles = [...(result._fileRanks || new Map()).entries()]
+                .filter(([filename]) => filename !== result.item.filename)
+                .sort((a, b) => (b[1].score - a[1].score) || (a[1].order - b[1].order))
+                .map(([filename]) => filename);
+            delete result._fileRanks;
+            delete result._semanticOrder;
+            return result;
+        });
+}
+
 async function performSemanticSearch(trimmed, requestId) {
     const container = document.getElementById('chat-manager-content');
     const status = document.getElementById('chat-manager-status');
@@ -3117,22 +3262,15 @@ async function performSemanticSearch(trimmed, requestId) {
 
     const lowerQuery = trimmed.toLowerCase();
     const searchable = getSearchableMessages();
-    let queryVector = queryEmbeddingCache.get(trimmed);
-    if (!queryVector) {
-        queryVector = await embedText(trimmed, { level: 'query' });
-        queryEmbeddingCache.set(trimmed, queryVector);
-        if (queryEmbeddingCache.size > 32) {
-            const firstKey = queryEmbeddingCache.keys().next().value;
-            queryEmbeddingCache.delete(firstKey);
-        }
-    }
+    const queryVector = await getSemanticQueryEmbedding(trimmed);
 
     if (requestId !== latestSearchRequestId) return;
 
     const index = getIndex();
     const embeddingSettings = getEmbeddingSettings();
     const showAlternateMatches = embeddingSettings.showAlternateSwipesInResults === true;
-    const scored = [];
+    const aggregated = new Map();
+    let semanticResultOrder = 0;
     for (const msg of searchable) {
         const entry = index[msg.filename];
         if (!entry || !(entry.messageEmbeddings instanceof Map)) continue;
@@ -3157,7 +3295,7 @@ async function performSemanticSearch(trimmed, requestId) {
             }
 
             const combinedScore = (0.7 * semanticScore) + (0.3 * keywordScore);
-            scored.push({
+            const result = {
                 item: msg,
                 matchIndex: variantTextLower.indexOf(lowerQuery),
                 combinedScore,
@@ -3165,33 +3303,17 @@ async function performSemanticSearch(trimmed, requestId) {
                 matchedSwipeIndex: variant.swipeIndex,
                 activeSwipeIndex,
                 isActiveSwipeMatch: variant.swipeIndex === activeSwipeIndex,
-            });
+                otherFiles: [],
+                _semanticOrder: semanticResultOrder++,
+            };
+            const textLower = msg.textLower || (msg.textLower = msg.text.toLowerCase());
+            const dedupKey = `${msg.index}:${textLower}`;
+            aggregateSemanticResult(aggregated, dedupKey, result);
         }
     }
 
-    scored.sort((a, b) => b.combinedScore - a.combinedScore);
-
-    // Deduplicate: group by messageIndex:textLower, keep highest-scoring entry
-    const dedupMap = new Map();
-    const deduped = [];
-    for (const result of scored) {
-        const msg = result.item;
-        const textLower = msg.textLower || (msg.textLower = msg.text.toLowerCase());
-        const dedupKey = `${msg.index}:${textLower}`;
-        const existingIdx = dedupMap.get(dedupKey);
-        if (existingIdx != null) {
-            const existing = deduped[existingIdx];
-            if (!existing.otherFiles) existing.otherFiles = [];
-            if (existing.item.filename !== msg.filename && !existing.otherFiles.includes(msg.filename)) {
-                existing.otherFiles.push(msg.filename);
-            }
-        } else {
-            dedupMap.set(dedupKey, deduped.length);
-            deduped.push({ ...result, otherFiles: [] });
-        }
-    }
-
-    const limited = deduped.slice(0, HYBRID_SEARCH_LIMIT);
+    const totalMatches = aggregated.size;
+    const limited = finalizeSemanticResults(aggregated);
 
     searchState = {
         query: trimmed,
@@ -3199,7 +3321,7 @@ async function performSemanticSearch(trimmed, requestId) {
         searchable,
         position: searchable.length,
         results: limited,
-        totalMatches: deduped.length,
+        totalMatches,
         exhausted: true,
         mode: 'semantic',
         showAlternateMatches,

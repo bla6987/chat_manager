@@ -6,6 +6,7 @@
 import { getIndex, getIndexVersion, getHydrationProgress, isHydrationComplete } from './chat-reader.js';
 import { getDisplayName } from './metadata-store.js';
 import { computeStats, computeHeatmapData } from './stats-engine.js';
+import { getGridCellAtPoint } from './view-efficiency-utils.js';
 
 // ── Constants ──
 
@@ -36,6 +37,7 @@ let callbacks = { onDayClick: null, getActive: null };
 
 /** Cached layout data for hit-testing */
 let cellLayout = []; // { x, y, w, h, dateKey, count, chatCount }
+let cellGrid = null;
 
 /**
  * Set callbacks for stats view interactions.
@@ -152,6 +154,7 @@ export function unmountStatsView() {
     }
 
     cellLayout = [];
+    cellGrid = null;
 }
 
 /**
@@ -226,6 +229,7 @@ function renderHeatmap(heatmap) {
     if (!canvasEl || !ctx) return;
 
     cellLayout = [];
+    cellGrid = null;
 
     if (!heatmap.minDate || !heatmap.maxDate) {
         // No data — show minimal canvas
@@ -259,6 +263,7 @@ function renderHeatmap(heatmap) {
     const step = CELL_SIZE + CELL_GAP;
     const canvasW = DAY_LABEL_WIDTH + totalWeeks * step;
     const canvasH = MONTH_LABEL_HEIGHT + ROWS * step;
+    cellGrid = { originX: DAY_LABEL_WIDTH, originY: MONTH_LABEL_HEIGHT, step, cellSize: CELL_SIZE, rows: ROWS, columns: totalWeeks };
 
     const dpr = window.devicePixelRatio || 1;
     canvasEl.width = canvasW * dpr;
@@ -360,13 +365,7 @@ function formatDateKey(date) {
 // ── Canvas Interactions ──
 
 function getCellAtPoint(canvasX, canvasY) {
-    for (const cell of cellLayout) {
-        if (canvasX >= cell.x && canvasX <= cell.x + cell.w &&
-            canvasY >= cell.y && canvasY <= cell.y + cell.h) {
-            return cell;
-        }
-    }
-    return null;
+    return getGridCellAtPoint(cellLayout, cellGrid, canvasX, canvasY);
 }
 
 function getCanvasCoords(e) {

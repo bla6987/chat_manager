@@ -1,0 +1,44 @@
+<!doctype html>
+<html lang="en"><meta charset="utf-8"><title>Chat Manager view efficiency checks</title>
+<style>body{background:#18212b;color:#e4e9ee;font:15px system-ui;margin:24px}.fixture{width:800px;height:480px;position:relative}pre{white-space:pre-wrap}</style>
+<h1>View efficiency regression checks</h1><button id="run">Run checks</button><pre id="results">Ready. Uses synthetic messages only.</pre><div id="fixture" class="fixture"></div>
+<script type="module">
+import { getIndex, clearIndex, setMessageEmbedding } from '../src/chat-reader.js';
+import { mountSemanticMap, updateSemanticMapData, unmountSemanticMap, focusMessageInSemanticMap } from '../src/semantic-map-view.js';
+import { mountIcicle, unmountIcicle, isIcicleMounted } from '../src/icicle-view.js';
+const context={characterId:0,characters:[{avatar:'fixture.png'}],extensionSettings:{chat_manager:{embeddings:{}}},saveSettingsDebounced(){}};
+window.SillyTavern={getContext:()=>context,libs:{DOMPurify:{sanitize:x=>x},moment:()=>({isValid:()=>true,format:()=>'',fromNow:()=>''})}};
+const fixture=document.getElementById('fixture'),results=document.getElementById('results');
+function assert(value,label){if(!value)throw Error(label);results.textContent+=`PASS ${label}\n`;}
+function seed(count=80,fileName='fixture.jsonl'){clearIndex();const messages=[];const entry={isLoaded:true,messages,messageEmbeddings:new Map(),chatEmbedding:[1,0],clusterLabel:1};for(let i=0;i<count;i++){messages.push({index:i,text:`message ${i}`,role:i%2?'assistant':'user',timestamp:null,swipes:[`message ${i}`],swipeId:0});setMessageEmbedding(entry,i,0,[Math.sin(i),Math.cos(i),i/count]);}getIndex()[fileName]=entry;}
+document.getElementById('run').onclick=async()=>{results.textContent='';const NativeWorker=window.Worker;try{
+ seed();let posts=0,pendingBuild=null;
+ class DeferredWorker{constructor(){DeferredWorker.last=this;}postMessage(msg){if(msg.type==='buildMapData'){posts++;pendingBuild=msg;}}terminate(){}set onmessage(fn){this._onmessage=fn;}get onmessage(){return this._onmessage;}}
+ const finishBuild=()=>{const job=pendingBuild,count=job.vectorsFlatBuffer.byteLength/(job.dims*4),points=new Float32Array(count*2),labels=new Uint16Array(count),centroids=new Float32Array(2),sizes=new Uint32Array([count]);DeferredWorker.last.onmessage({data:{type:'mapDataReady',jobId:job.jobId,points2dBuffer:points.buffer,labelsBuffer:labels.buffer,centroids2dBuffer:centroids.buffer,clusterSizesBuffer:sizes.buffer,bounds:{minX:-1,maxX:1,minY:-1,maxY:1}}});};
+ window.Worker=DeferredWorker;await mountSemanticMap(fixture,'mini');assert(posts===1,'initial map submits one build');
+ await Promise.all([updateSemanticMapData(),updateSemanticMapData(),updateSemanticMapData()]);assert(posts===1,'refresh burst stays coalesced while build is active');
+ finishBuild();
+ await new Promise(resolve=>setTimeout(resolve,0));assert(posts===2,'settled build collects and submits exactly one latest refresh');
+ finishBuild();await new Promise(resolve=>setTimeout(resolve,0));
+ assert(focusMessageInSemanticMap('fixture.jsonl',0,{openPopup:false,persistIfMissing:false}),'completed map exposes its matching message snapshot');
+ seed(80,'replacement.jsonl');await updateSemanticMapData();assert(posts===3,'replacement submits one build');
+ assert(focusMessageInSemanticMap('fixture.jsonl',0,{openPopup:false,persistIfMissing:false}),'old mapping remains active while replacement builds');
+ assert(!focusMessageInSemanticMap('replacement.jsonl',0,{openPopup:false,persistIfMissing:false}),'replacement mapping is hidden until matching points arrive');
+ finishBuild();await new Promise(resolve=>setTimeout(resolve,0));
+ assert(!focusMessageInSemanticMap('fixture.jsonl',0,{openPopup:false,persistIfMissing:false})&&focusMessageInSemanticMap('replacement.jsonl',0,{openPopup:false,persistIfMissing:false}),'message mapping switches atomically with replacement points');
+ seed(80,'failed.jsonl');await updateSemanticMapData();assert(posts===4,'failed replacement submits a build');
+ seed(80,'recovered.jsonl');await updateSemanticMapData();assert(posts===4,'latest recovery waits behind the failing build');
+ DeferredWorker.last.onmessage({data:{type:'error',jobId:pendingBuild.jobId,message:'synthetic failure'}});await new Promise(resolve=>setTimeout(resolve,0));
+ assert(focusMessageInSemanticMap('replacement.jsonl',0,{openPopup:false,persistIfMissing:false})&&!focusMessageInSemanticMap('failed.jsonl',0,{openPopup:false,persistIfMissing:false}),'worker error retains the last completed mapping');
+ assert(posts===5,'queued latest refresh starts after worker build error');finishBuild();await new Promise(resolve=>setTimeout(resolve,0));
+ assert(!focusMessageInSemanticMap('replacement.jsonl',0,{openPopup:false,persistIfMissing:false})&&focusMessageInSemanticMap('recovered.jsonl',0,{openPopup:false,persistIfMissing:false}),'recovery publishes only its matching mapping');
+ await Promise.all([updateSemanticMapData(),updateSemanticMapData()]);assert(posts===6,'second refresh burst waits behind its active build');
+ unmountSemanticMap();assert(posts===6,'unmount discards queued refresh without another vector snapshot');
+ window.Worker=NativeWorker;
+ seed(1200);const mountPromise=mountIcicle(fixture,'mini');unmountIcicle();await mountPromise;assert(!isIcicleMounted()&&!fixture.querySelector('canvas'),'async icicle mount cannot remount after unmount');
+ // Exercise the production worker module through a real browser Worker.
+ const realWorker=new NativeWorker('../src/semantic-map-worker.js',{type:'module'});const ready=new Promise((resolve,reject)=>{realWorker.onmessage=e=>e.data.type==='mapDataReady'?resolve(e.data):e.data.type==='error'&&reject(Error(e.data.message));realWorker.onerror=reject;});
+ const vectors=new Float32Array([1,0,0,1,1,1]);realWorker.postMessage({type:'buildMapData',jobId:1,dims:2,vectorsFlatBuffer:vectors.buffer,fixedK:2,maxK:2},[vectors.buffer]);const built=await ready;assert(new Float32Array(built.points2dBuffer).length===6,'real semantic worker builds projected points');realWorker.terminate();
+ results.textContent+='ALL BROWSER CHECKS PASSED';
+ }catch(error){results.textContent+=`FAIL ${error.stack}`;}finally{window.Worker=NativeWorker;unmountSemanticMap();unmountIcicle();}};
+</script></html>

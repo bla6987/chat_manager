@@ -115,8 +115,9 @@ export async function buildIcicleData(chatIndex, activeChatFile, options = {}) {
         }
     }
 
+    compactSharedMembership(root, null);
     const semanticContext = await buildSemanticContext(entries);
-    annotateSemanticFields(root, chatIndex, semanticContext);
+    annotateSemanticFields(root, chatIndex, semanticContext, new WeakMap());
 
     // ── Phase 2: Layout computation ──
     computeLayout(root, 0, 1, activeChatFile);
@@ -147,6 +148,13 @@ function makeNode(normalizedText, role, depth) {
         y0: 0,
         y1: 1,
     };
+}
+
+function compactSharedMembership(node, parentChatFiles) {
+    if (parentChatFiles && node.chatFiles.length === parentChatFiles.length) {
+        node.chatFiles = parentChatFiles;
+    }
+    for (const child of node.children.values()) compactSharedMembership(child, node.chatFiles);
 }
 
 /**
@@ -186,7 +194,6 @@ function majorityCluster(chatFiles, chatIndex) {
         const key = Math.floor(label);
         counts.set(key, (counts.get(key) || 0) + 1);
     }
-
     if (counts.size === 0) return null;
 
     let bestLabel = null;
@@ -206,31 +213,18 @@ function majorityCluster(chatFiles, chatIndex) {
  * @returns {number[]|null}
  */
 function meanPoolEmbeddings(chatFiles, chatIndex) {
-    let dims = 0;
-    let count = 0;
     let sum = null;
-
+    let count = 0;
     for (const file of chatFiles) {
         const vector = chatIndex[file]?.chatEmbedding;
         if (!Array.isArray(vector) || vector.length === 0) continue;
-
-        if (!sum) {
-            dims = vector.length;
-            sum = new Array(dims).fill(0);
-        }
-        if (vector.length !== dims) continue;
-
-        for (let i = 0; i < dims; i++) {
-            sum[i] += vector[i];
-        }
+        if (!sum) sum = new Array(vector.length).fill(0);
+        if (vector.length !== sum.length) continue;
+        for (let i = 0; i < vector.length; i++) sum[i] += vector[i];
         count++;
     }
-
     if (!sum || count === 0) return null;
-
-    for (let i = 0; i < sum.length; i++) {
-        sum[i] /= count;
-    }
+    for (let i = 0; i < sum.length; i++) sum[i] /= count;
     return sum;
 }
 
@@ -273,18 +267,25 @@ function projectToPca3(vector, mean, components) {
  * @param {Object} chatIndex
  * @param {{ mean: number[]|null, components: number[][]|null }} semanticContext
  */
-function annotateSemanticFields(node, chatIndex, semanticContext) {
-    node.clusterLabel = majorityCluster(node.chatFiles, chatIndex);
-    node.chatEmbedding = meanPoolEmbeddings(node.chatFiles, chatIndex);
-
-    if (node.chatEmbedding && semanticContext.mean && semanticContext.components) {
-        node.pca3d = projectToPca3(node.chatEmbedding, semanticContext.mean, semanticContext.components);
-    } else {
-        node.pca3d = null;
+function annotateSemanticFields(node, chatIndex, semanticContext, aggregateCache) {
+    let aggregate = aggregateCache.get(node.chatFiles);
+    if (!aggregate) {
+        aggregate = {
+            clusterLabel: majorityCluster(node.chatFiles, chatIndex),
+            chatEmbedding: meanPoolEmbeddings(node.chatFiles, chatIndex),
+            pca3d: null,
+        };
+        if (aggregate.chatEmbedding && semanticContext.mean && semanticContext.components) {
+            aggregate.pca3d = projectToPca3(aggregate.chatEmbedding, semanticContext.mean, semanticContext.components);
+        }
+        aggregateCache.set(node.chatFiles, aggregate);
     }
+    node.clusterLabel = aggregate.clusterLabel;
+    node.chatEmbedding = aggregate.chatEmbedding;
+    node.pca3d = aggregate.pca3d;
 
     for (const child of node.children.values()) {
-        annotateSemanticFields(child, chatIndex, semanticContext);
+        annotateSemanticFields(child, chatIndex, semanticContext, aggregateCache);
     }
 }
 

@@ -14,6 +14,7 @@ import { getIndex, getMessageEmbedding, getMessageActiveSwipeIndex } from './cha
 import { embedText, isEmbeddingConfigured } from './embedding-service.js';
 import { clusterColor, cosineSimilarity } from './semantic-engine.js';
 import { getDisplayName, getEmbeddingSettings } from './metadata-store.js';
+import { selectTopStable } from './view-efficiency-utils.js';
 
 /* ── Constants ── */
 
@@ -455,6 +456,7 @@ async function addSearchTermPin(query) {
         kind: 'term',
         label: query.trim(),
         vector,
+        vectorNorm: vectorNorm(vector),
         colorIndex: nextColorIndex++ % PALETTE.length,
         x: Math.cos(angle) * radius,
         y: Math.sin(angle) * radius,
@@ -489,6 +491,7 @@ function addMessagePin(msgRefIndex) {
         kind: 'message',
         label: truncate(ref.text, LABEL_MAX_CHARS),
         vector,
+        vectorNorm: messageNorms[msgRefIndex],
         colorIndex: nextColorIndex++ % PALETTE.length,
         x: Math.cos(angle) * radius,
         y: Math.sin(angle) * radius,
@@ -603,7 +606,7 @@ function rebuildSimulation() {
         let bestSim = -Infinity;
 
         for (const p of compatiblePinIndices) {
-            const sim = fastCosineSim(pins[p].vector, messageVectors[i], messageNorms[i]);
+            const sim = fastCosineSim(pins[p].vector, messageVectors[i], messageNorms[i], pins[p].vectorNorm);
             if (sim > bestSim) {
                 bestSim = sim;
                 bestPin = p;
@@ -621,13 +624,9 @@ function rebuildSimulation() {
         perPinBuckets[s.pinIndex].push(s);
     }
 
-    for (const bucket of perPinBuckets) {
-        bucket.sort((a, b) => b.similarity - a.similarity);
-    }
-
     const neighborLimit = neighborsPerPin;
     for (let p = 0; p < pins.length; p++) {
-        const bucket = perPinBuckets[p];
+        const bucket = selectTopStable(perPinBuckets[p], neighborLimit);
         const pin = pins[p];
         const take = Math.min(bucket.length, neighborLimit);
 
@@ -659,15 +658,19 @@ function rebuildSimulation() {
     settleCounter = 0;
 }
 
-function fastCosineSim(vecA, vecB, normB) {
+function vectorNorm(vector) {
+    if (!Array.isArray(vector)) return 0;
+    let sum = 0;
+    for (let i = 0; i < vector.length; i++) sum += vector[i] * vector[i];
+    return Math.sqrt(sum);
+}
+
+function fastCosineSim(vecA, vecB, normB, normA = vectorNorm(vecA)) {
     if (!vecA || !vecB || vecA.length !== vecB.length) return Number.NEGATIVE_INFINITY;
     let dot = 0;
-    let normASq = 0;
     for (let d = 0; d < vecA.length; d++) {
         dot += vecA[d] * vecB[d];
-        normASq += vecA[d] * vecA[d];
     }
-    const normA = Math.sqrt(normASq);
     if (normA < 1e-12 || normB < 1e-12) return 0;
     const sim = dot / (normA * normB);
     return Math.max(-1, Math.min(1, sim));

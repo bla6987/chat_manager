@@ -6,6 +6,7 @@
 const DB_NAME = 'chat_manager_cache';
 const DB_VERSION = 1;
 const STORE_NAME = 'chats';
+const READ_BATCH_SIZE = 50;
 
 /** @type {IDBDatabase|null} */
 let db = null;
@@ -67,21 +68,23 @@ export async function getCachedChatsForCharacter(avatar, fileNames) {
     if (fileNames.length === 0) return result;
     try {
         const database = await openDB();
-        return new Promise((resolve) => {
-            const tx = database.transaction(STORE_NAME, 'readonly');
-            const store = tx.objectStore(STORE_NAME);
-            for (const fileName of fileNames) {
-                const request = store.get(makeKey(avatar, fileName));
-                request.onsuccess = () => {
-                    const entry = request.result;
-                    if (!entry) return;
-                    result.set(fileName, entry);
-                };
-            }
-
-            tx.oncomplete = () => resolve(result);
-            tx.onerror = () => resolve(result);
-        });
+        for (let offset = 0; offset < fileNames.length; offset += READ_BATCH_SIZE) {
+            const batch = fileNames.slice(offset, offset + READ_BATCH_SIZE);
+            await new Promise((resolve) => {
+                const tx = database.transaction(STORE_NAME, 'readonly');
+                const store = tx.objectStore(STORE_NAME);
+                for (const fileName of batch) {
+                    const request = store.get(makeKey(avatar, fileName));
+                    request.onsuccess = () => {
+                        const entry = request.result;
+                        if (entry) result.set(fileName, entry);
+                    };
+                }
+                tx.oncomplete = resolve;
+                tx.onerror = resolve;
+            });
+        }
+        return result;
     } catch {
         return result;
     }
@@ -94,20 +97,33 @@ export async function getCachedChatsForCharacter(avatar, fileNames) {
  * @param {object} entry - The ChatIndexEntry to cache
  */
 export function putCachedChat(avatar, fileName, entry) {
+    putCachedChats(avatar, [{ fileName, entry }]);
+}
+
+/**
+ * Write several hydrated entries using one transaction.
+ * @param {string} avatar
+ * @param {Array<{fileName: string, entry: object}>} chats
+ */
+export function putCachedChats(avatar, chats) {
+    if (!Array.isArray(chats) || chats.length === 0) return;
     openDB().then((database) => {
         const tx = database.transaction(STORE_NAME, 'readwrite');
         const store = tx.objectStore(STORE_NAME);
-        store.put({
-            key: makeKey(avatar, fileName),
-            avatar,
-            fileName,
-            lastModified: entry.lastModified,
-            messageCount: entry.messageCount,
-            messages: entry.messages,
-            firstMessageTimestamp: entry.firstMessageTimestamp,
-            lastMessageTimestamp: entry.lastMessageTimestamp,
-            sortTimestamp: entry.sortTimestamp,
-        });
+        for (const { fileName, entry } of chats) {
+            if (!fileName || !entry) continue;
+            store.put({
+                key: makeKey(avatar, fileName),
+                avatar,
+                fileName,
+                lastModified: entry.lastModified,
+                messageCount: entry.messageCount,
+                messages: entry.messages,
+                firstMessageTimestamp: entry.firstMessageTimestamp,
+                lastMessageTimestamp: entry.lastMessageTimestamp,
+                sortTimestamp: entry.sortTimestamp,
+            });
+        }
     }).catch(() => {
         // Silently ignore cache write failures
     });

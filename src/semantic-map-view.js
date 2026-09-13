@@ -47,6 +47,9 @@ let canvasHeight = 0;
 let worker = null;
 let workerBuildJobId = 0;
 let workerScoreJobId = 0;
+let workerBuildInFlight = false;
+let workerBuildPending = false;
+let pendingBuildSnapshot = null;
 
 let messageRefs = [];
 let messageLookup = new Map();
@@ -187,6 +190,9 @@ export function unmountSemanticMap() {
         worker.terminate();
         worker = null;
     }
+    workerBuildInFlight = false;
+    workerBuildPending = false;
+    pendingBuildSnapshot = null;
 
     destroyGLResources();
 
@@ -239,6 +245,19 @@ export function unmountSemanticMap() {
 
 export async function updateSemanticMapData() {
     if (!mounted || !container) return;
+
+    if (!worker && !ensureWorker()) {
+        hideLoading();
+        showEmpty('Semantic map unavailable: worker initialization failed.');
+        return;
+    }
+
+    if (workerBuildInFlight) {
+        workerBuildPending = true;
+        showLoading('Refreshing semantic map…');
+        setInfo('Refresh queued…');
+        return;
+    }
 
     const prevRefs = messageRefs;
     const prevLookup = messageLookup;
@@ -295,7 +314,11 @@ function ensureWorker() {
         const msg = event.data || {};
         if (msg.type === 'mapDataReady') {
             if (msg.jobId !== workerBuildJobId) return;
-            handleMapDataReady(msg);
+            try {
+                handleMapDataReady(msg);
+            } finally {
+                finishWorkerBuild();
+            }
             return;
         }
 
@@ -311,6 +334,8 @@ function ensureWorker() {
                 hideLoading();
                 showEmpty('Failed to build semantic map. Check console for details.');
                 setInfo('Failed to build semantic map.');
+                pendingBuildSnapshot = null;
+                finishWorkerBuild();
             }
             if (msg.jobId === workerScoreJobId) {
                 scoreValues = null;
@@ -326,6 +351,16 @@ function ensureWorker() {
     worker.onerror = (err) => {
         console.warn(`[${MODULE_NAME}] Semantic worker crashed:`, err);
         setInfo('Semantic map worker crashed.');
+        worker?.terminate();
+        worker = null;
+        workerBuildInFlight = false;
+        pendingBuildSnapshot = null;
+        hideLoading();
+        showEmpty('Semantic map worker crashed. Refresh to retry.');
+        if (workerBuildPending && mounted) {
+            workerBuildPending = false;
+            if (ensureWorker()) void updateSemanticMapData();
+        }
     };
 
     return true;
@@ -396,10 +431,7 @@ function collectMessageVectors() {
 
     const count = vectors.length;
     if (!detectedDims || count === 0) {
-        messageRefs = [];
-        messageLookup = new Map();
-        dims = 0;
-        return { count: 0, dims: 0, vectorsFlat: new Float32Array(0) };
+        return { count: 0, dims: 0, vectorsFlat: new Float32Array(0), refs: [], lookup: new Map() };
     }
 
     const vectorsFlat = new Float32Array(count * detectedDims);
@@ -411,23 +443,24 @@ function collectMessageVectors() {
         }
     }
 
-    messageRefs = refs;
-    dims = detectedDims;
-    messageLookup = new Map();
+    const lookup = new Map();
     for (let i = 0; i < refs.length; i++) {
         // Jump/focus should resolve to active swipe for a message.
-        if (refs[i].isActiveSwipe === true || !messageLookup.has(makePointKey(refs[i].fileName, refs[i].msgIndex))) {
-            messageLookup.set(makePointKey(refs[i].fileName, refs[i].msgIndex), i);
+        if (refs[i].isActiveSwipe === true || !lookup.has(makePointKey(refs[i].fileName, refs[i].msgIndex))) {
+            lookup.set(makePointKey(refs[i].fileName, refs[i].msgIndex), i);
         }
     }
 
-    return { count, dims: detectedDims, vectorsFlat };
+    return { count, dims: detectedDims, vectorsFlat, refs, lookup };
 }
 
-function queueBuild({ count, dims: vectorDims, vectorsFlat }) {
+function queueBuild({ count, dims: vectorDims, vectorsFlat, refs, lookup }) {
     if (!worker) return;
 
+    workerBuildInFlight = true;
+
     workerBuildJobId += 1;
+    pendingBuildSnapshot = { jobId: workerBuildJobId, refs, lookup, dims: vectorDims };
     workerScoreJobId += 1; // invalidate in-flight score jobs after rebuild
     scoreValues = null;
     scoreMin = 0;
@@ -451,12 +484,30 @@ function queueBuild({ count, dims: vectorDims, vectorsFlat }) {
     setInfo(`Projecting ${count.toLocaleString()} vectors…`);
 }
 
+function finishWorkerBuild() {
+    workerBuildInFlight = false;
+    if (!workerBuildPending || !mounted) return;
+    workerBuildPending = false;
+    // Collect only now, so any number of obsolete refreshes cost one snapshot.
+    void updateSemanticMapData();
+}
+
 function handleMapDataReady(msg) {
-    points2d = new Float32Array(msg.points2dBuffer || new ArrayBuffer(0));
-    labels = new Uint16Array(msg.labelsBuffer || new ArrayBuffer(0));
-    centroids2d = new Float32Array(msg.centroids2dBuffer || new ArrayBuffer(0));
-    clusterSizes = new Uint32Array(msg.clusterSizesBuffer || new ArrayBuffer(0));
-    bounds = msg.bounds || { minX: -1, maxX: 1, minY: -1, maxY: 1 };
+    if (pendingBuildSnapshot?.jobId !== msg.jobId) return;
+    const nextPoints2d = new Float32Array(msg.points2dBuffer || new ArrayBuffer(0));
+    const nextLabels = new Uint16Array(msg.labelsBuffer || new ArrayBuffer(0));
+    const nextCentroids2d = new Float32Array(msg.centroids2dBuffer || new ArrayBuffer(0));
+    const nextClusterSizes = new Uint32Array(msg.clusterSizesBuffer || new ArrayBuffer(0));
+    const nextBounds = msg.bounds || { minX: -1, maxX: 1, minY: -1, maxY: 1 };
+    messageRefs = pendingBuildSnapshot.refs;
+    messageLookup = pendingBuildSnapshot.lookup;
+    dims = pendingBuildSnapshot.dims;
+    pendingBuildSnapshot = null;
+    points2d = nextPoints2d;
+    labels = nextLabels;
+    centroids2d = nextCentroids2d;
+    clusterSizes = nextClusterSizes;
+    bounds = nextBounds;
 
     hideLoading();
     initializeCamera(bounds);
@@ -487,6 +538,9 @@ function handleQueryScoresReady(msg) {
 }
 
 function clearMapDataState() {
+    messageRefs = [];
+    messageLookup = new Map();
+    dims = 0;
     points2d = new Float32Array(0);
     labels = new Uint16Array(0);
     centroids2d = new Float32Array(0);

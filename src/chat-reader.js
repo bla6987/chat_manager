@@ -3,7 +3,7 @@
  * Never modifies any chat files.
  */
 
-import { getCachedChatsForCharacter, putCachedChat, removeCachedChat } from './cache-store.js';
+import { getCachedChatsForCharacter, putCachedChat, putCachedChats, removeCachedChat } from './cache-store.js';
 import { getRepresentativeEmbeddingText } from './embedding-text.js';
 
 const MODULE_NAME = 'chat_manager';
@@ -14,6 +14,8 @@ const FALLBACK_SORT_TIMESTAMP = 0;
 let chatIndex = {};
 let currentCharacterAvatar = null;
 let indexBuildInProgress = false;
+let nextBuildToken = 0;
+let activeBuildToken = null;
 let nextInitialOrder = 0;
 
 let hydrationQueue = [];
@@ -23,6 +25,12 @@ let hydrationSessionId = 0;
 const entryHydrationPromises = new Map();
 const hydrationListeners = new Set();
 const compositeEmbeddingMaps = new WeakSet();
+// Entries are normalized once because every message/body mutation in this
+// module replaces the entry object (or installs already-normalized cache data).
+const normalizedEntries = new WeakSet();
+// Branch inputs follow the same replacement rule: edits and swipe changes
+// install new message arrays, so array identity is the cache invalidation key.
+const branchPointCache = new WeakMap();
 let progressCallback = null;
 
 /** Searchable messages cache — invalidated on every index mutation */
@@ -483,6 +491,7 @@ function bumpIndexVersion() {
 
 function normalizeEntryShape(entry) {
     if (!entry || typeof entry !== 'object') return;
+    if (normalizedEntries.has(entry)) return;
 
     if (!Array.isArray(entry.messages)) entry.messages = [];
     if (!Number.isFinite(entry.messageCount)) entry.messageCount = 0;
@@ -526,6 +535,29 @@ function normalizeEntryShape(entry) {
             if (!msg.filename) msg.filename = entry.fileName;
         }
     }
+    normalizedEntries.add(entry);
+}
+
+function messagesEqual(a, b) {
+    if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) return false;
+    for (let i = 0; i < a.length; i++) {
+        const left = a[i];
+        const right = b[i];
+        if (left?.filename !== right?.filename
+            || left?.index !== right?.index
+            || left?.role !== right?.role
+            || left?.text !== right?.text
+            || left?.timestamp !== right?.timestamp
+            || getMessageActiveSwipeIndex(left) !== getMessageActiveSwipeIndex(right)) return false;
+        const leftSwipes = left?.swipes;
+        const rightSwipes = right?.swipes;
+        if (leftSwipes === rightSwipes) continue;
+        if (!Array.isArray(leftSwipes) || !Array.isArray(rightSwipes) || leftSwipes.length !== rightSwipes.length) return false;
+        for (let swipe = 0; swipe < leftSwipes.length; swipe++) {
+            if (leftSwipes[swipe] !== rightSwipes[swipe]) return false;
+        }
+    }
+    return true;
 }
 
 /**
@@ -534,7 +566,7 @@ function normalizeEntryShape(entry) {
  * @param {number} sessionId
  * @returns {Promise<boolean>}
  */
-async function hydrateEntry(fileName, sessionId) {
+async function hydrateEntry(fileName, sessionId, persist = true) {
     if (entryHydrationPromises.has(fileName)) {
         return entryHydrationPromises.get(fileName);
     }
@@ -558,6 +590,9 @@ async function hydrateEntry(fileName, sessionId) {
 
             const current = chatIndex[fileName];
             if (!current) return false;
+            // An active-chat event may have populated the entry while the
+            // network request was in flight. Its newer in-memory state wins.
+            if (current.isLoaded) return true;
 
             // Metadata changed while this request was in flight.
             if (current.lastModified !== expectedTimestamp) {
@@ -582,7 +617,7 @@ async function hydrateEntry(fileName, sessionId) {
             };
             bumpIndexVersion();
 
-            if (currentCharacterAvatar) {
+            if (persist && currentCharacterAvatar) {
                 putCachedChat(currentCharacterAvatar, fileName, chatIndex[fileName]);
             }
 
@@ -591,7 +626,11 @@ async function hydrateEntry(fileName, sessionId) {
 
         return false;
     })().finally(() => {
-        entryHydrationPromises.delete(fileName);
+        // A reset can start a new same-filename hydration before this older
+        // promise settles. Do not delete the newer session's promise.
+        if (entryHydrationPromises.get(fileName) === promise) {
+            entryHydrationPromises.delete(fileName);
+        }
     });
 
     entryHydrationPromises.set(fileName, promise);
@@ -612,16 +651,25 @@ function startHydrationLoop() {
                     queuedFiles.delete(fileName);
                 }
 
-                await Promise.all(batch.map(fileName => hydrateEntry(fileName, sessionId)));
-                emitHydrationUpdate();
+                const results = await Promise.all(batch.map(fileName => hydrateEntry(fileName, sessionId, false)));
+                if (sessionId === hydrationSessionId && currentCharacterAvatar) {
+                    const hydrated = [];
+                    for (let i = 0; i < batch.length; i++) {
+                        const entry = chatIndex[batch[i]];
+                        if (results[i] && entry?.isLoaded) hydrated.push({ fileName: batch[i], entry });
+                    }
+                    putCachedChats(currentCharacterAvatar, hydrated);
+                }
+                if (sessionId === hydrationSessionId) emitHydrationUpdate();
             }
         } catch (err) {
             console.error('[chat_manager] Hydration loop error:', err);
         } finally {
+            if (sessionId !== hydrationSessionId) return;
             hydrationInProgress = false;
 
             // New items may have been queued while this loop was running.
-            if (sessionId === hydrationSessionId && hydrationQueue.length > 0) {
+            if (hydrationQueue.length > 0) {
                 startHydrationLoop();
             } else {
                 emitHydrationUpdate();
@@ -649,6 +697,8 @@ export async function buildIndex(onProgress, onMetadataReady) {
     }
 
     indexBuildInProgress = true;
+    const buildToken = ++nextBuildToken;
+    activeBuildToken = buildToken;
     const context = SillyTavern.getContext();
 
     if (context.characterId === undefined) {
@@ -666,13 +716,23 @@ export async function buildIndex(onProgress, onMetadataReady) {
 
     if (currentCharacterAvatar && currentCharacterAvatar !== character.avatar) {
         clearIndex();
+        // clearIndex releases any older build. This invocation now owns the
+        // freshly reset session and must retain the build lock across awaits.
+        indexBuildInProgress = true;
+        activeBuildToken = buildToken;
     }
 
     currentCharacterAvatar = character.avatar;
+    const buildAvatar = character.avatar;
+    const buildSessionId = hydrationSessionId;
     let changed = false;
+    let metadataNotified = false;
 
     try {
         const chatList = await fetchChatList();
+        if (buildSessionId !== hydrationSessionId || currentCharacterAvatar !== buildAvatar) {
+            return getBuildStateResponse(false);
+        }
         if (!chatList || !chatList.length) {
             changed = Object.keys(chatIndex).length > 0;
             chatIndex = {};
@@ -689,6 +749,44 @@ export async function buildIndex(onProgress, onMetadataReady) {
             serverChats.set(metaObj.file_name, metaObj);
         }
 
+        // Publish a metadata-only index before potentially large IndexedDB bodies
+        // are read. Cached bodies and server hydration fill these entries afterward.
+        for (const [fileName, metaObj] of serverChats) {
+            if (chatIndex[fileName]) continue;
+            const serverTimestamp = getMetaTimestamp(metaObj);
+            const metaLastTimestamp = getMetaTimestampString(metaObj);
+            chatIndex[fileName] = {
+                fileName,
+                lastModified: serverTimestamp,
+                messageCount: getMetaMessageCount(metaObj) ?? 0,
+                messages: [],
+                firstMessageTimestamp: null,
+                lastMessageTimestamp: metaLastTimestamp,
+                firstTimestampMs: FALLBACK_SORT_TIMESTAMP,
+                lastTimestampMs: normalizeTimestamp(metaLastTimestamp),
+                sortTimestamp: serverTimestamp,
+                initialOrder: allocateInitialOrder(),
+                branchPoint: null,
+                isLoaded: false,
+                chatEmbedding: null,
+                chatEmbeddingHash: null,
+                clusterLabel: null,
+                messageEmbeddings: null,
+            };
+            markEntryForHydration(fileName);
+            changed = true;
+        }
+        if (changed) {
+            bumpIndexVersion();
+            notifyMetadataReady(onMetadataReady, true);
+            metadataNotified = true;
+        }
+
+        // Identity snapshots prevent this build from overwriting an entry
+        // replaced by an active-chat event while IndexedDB is being read.
+        const entriesBeforeCacheRead = new Map(Object.entries(chatIndex));
+        const indexKeysBeforeCacheRead = new Set(Object.keys(chatIndex));
+
         // Loaded, unchanged entries already live in memory. Avoid cloning their
         // full message histories out of IndexedDB on every panel open.
         const cacheFiles = [];
@@ -702,6 +800,9 @@ export async function buildIndex(onProgress, onMetadataReady) {
         try {
             if (cacheFiles.length > 0) {
                 idbCache = await getCachedChatsForCharacter(character.avatar, cacheFiles);
+                if (buildSessionId !== hydrationSessionId || currentCharacterAvatar !== buildAvatar) {
+                    return getBuildStateResponse(false);
+                }
                 for (const [fileName, entry] of idbCache) {
                     if (!Array.isArray(entry.messages)) continue;
                     for (const msg of entry.messages) {
@@ -713,10 +814,15 @@ export async function buildIndex(onProgress, onMetadataReady) {
             // IndexedDB unavailable — proceed without cache
         }
 
-        const existingKeys = new Set(Object.keys(chatIndex));
+        const existingKeys = indexKeysBeforeCacheRead;
 
         for (const [fileName, metaObj] of serverChats) {
             existingKeys.delete(fileName);
+
+            if (chatIndex[fileName] !== entriesBeforeCacheRead.get(fileName)) {
+                changed = true;
+                continue;
+            }
 
             const serverTimestamp = getMetaTimestamp(metaObj);
             const metaLastTimestamp = getMetaTimestampString(metaObj);
@@ -830,6 +936,8 @@ export async function buildIndex(onProgress, onMetadataReady) {
                     cached.lastTimestampMs = normalizeTimestamp(cached.lastMessageTimestamp);
                     cached.branchPoint = null;
                     cached.messageEmbeddings = null;
+                    queuedFiles.delete(fileName);
+                    hydrationQueue = hydrationQueue.filter(name => name !== fileName);
                     changed = true;
                 } else {
                     if (metaMessageCount !== null) {
@@ -842,6 +950,7 @@ export async function buildIndex(onProgress, onMetadataReady) {
 
         // existingKeys now contains deleted chats
         for (const deletedKey of existingKeys) {
+            if (chatIndex[deletedKey] !== entriesBeforeCacheRead.get(deletedKey)) continue;
             delete chatIndex[deletedKey];
             queuedFiles.delete(deletedKey);
             hydrationQueue = hydrationQueue.filter(name => name !== deletedKey);
@@ -856,7 +965,7 @@ export async function buildIndex(onProgress, onMetadataReady) {
             }
         }
 
-        notifyMetadataReady(onMetadataReady, changed);
+        if (!metadataNotified) notifyMetadataReady(onMetadataReady, changed);
 
         emitHydrationUpdate();
 
@@ -867,7 +976,10 @@ export async function buildIndex(onProgress, onMetadataReady) {
     } catch (err) {
         console.error(`[${MODULE_NAME}] Error building index:`, err);
     } finally {
-        indexBuildInProgress = false;
+        if (activeBuildToken === buildToken) {
+            indexBuildInProgress = false;
+            activeBuildToken = null;
+        }
     }
 
     return getBuildStateResponse(changed);
@@ -920,6 +1032,12 @@ export async function updateActiveChat(fileName) {
         const parsedLastModified = lastTimestamp ? new Date(lastTimestamp).getTime() : NaN;
         const hasValidLastModified = Number.isFinite(parsedLastModified);
         const effectiveLastTs = lastTimestamp || cached.lastMessageTimestamp;
+
+        if (cached.isLoaded && messagesEqual(cached.messages, messages)) {
+            queuedFiles.delete(fileName);
+            hydrationQueue = hydrationQueue.filter(name => name !== fileName);
+            return false;
+        }
 
         const updated = {
             ...cached,
@@ -1002,7 +1120,18 @@ export function computeBranchPoint(baseMessages, candidateMessages) {
     if (!Array.isArray(baseMessages) || !Array.isArray(candidateMessages)) return null;
     if (baseMessages.length < 2 || candidateMessages.length < 2) return null;
 
-    if (candidateMessages[0]?.text !== baseMessages[0]?.text) return null;
+    let candidateCache = branchPointCache.get(baseMessages);
+    if (!candidateCache) {
+        candidateCache = new WeakMap();
+        branchPointCache.set(baseMessages, candidateCache);
+    } else if (candidateCache.has(candidateMessages)) {
+        return candidateCache.get(candidateMessages);
+    }
+
+    if (candidateMessages[0]?.text !== baseMessages[0]?.text) {
+        candidateCache.set(candidateMessages, null);
+        return null;
+    }
 
     const maxCompare = Math.min(candidateMessages.length, baseMessages.length);
     let divergeAt = maxCompare;
@@ -1014,7 +1143,9 @@ export function computeBranchPoint(baseMessages, candidateMessages) {
         }
     }
 
-    return divergeAt > 0 ? divergeAt : null;
+    const result = divergeAt > 0 ? divergeAt : null;
+    candidateCache.set(candidateMessages, result);
+    return result;
 }
 
 function sortSiblingContextByRecency(siblings) {
@@ -1131,6 +1262,8 @@ export function clearIndex() {
     currentCharacterAvatar = null;
     nextInitialOrder = 0;
     progressCallback = null;
+    indexBuildInProgress = false;
+    activeBuildToken = null;
     bumpIndexVersion();
     resetHydrationQueue();
     emitHydrationUpdate();

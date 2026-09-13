@@ -349,7 +349,6 @@ function kMeans2D(points2d, n, k, opts = {}) {
         const sumsX = new Float64Array(clusterCount);
         const sumsY = new Float64Array(clusterCount);
         const counts = new Uint32Array(clusterCount);
-        const dist = new Float64Array(n);
         inertia = 0;
 
         for (let i = 0; i < n; i++) {
@@ -369,7 +368,6 @@ function kMeans2D(points2d, n, k, opts = {}) {
             }
 
             labels[i] = bestLabel;
-            dist[i] = bestDist;
             inertia += bestDist;
             counts[bestLabel] += 1;
             sumsX[bestLabel] += px;
