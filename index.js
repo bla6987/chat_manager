@@ -5,9 +5,9 @@
 
 import { clearIndex, getIndex, getIndexCharacterAvatar, updateActiveChat } from './src/chat-reader.js';
 import {
-    togglePanel, closePanel, refreshPanel, renderThreadCards, onSearchInput, isPanelOpen, resetSearchState,
+    togglePanel, closePanel, refreshPanel, renderThreadCards, refreshThreadCardsAfterMessage, onSearchInput, isPanelOpen, resetSearchState,
     toggleTimeline, isTimelineActive, toggleSemanticMap, isSemanticMapActive, toggleGraphView, isGraphViewActive, toggleStats, isStatsActive, toggleBranchContext, isBranchContextActive,
-    clearInMemoryEmbeddings, generateEmbeddingsForCurrentIndex, scheduleEmbeddingBootstrap, scheduleIncrementalEmbedding, performSearch,
+    clearInMemoryEmbeddings, generateEmbeddingsForCurrentIndex, scheduleEmbeddingBootstrap, scheduleIncrementalEmbedding, setEmbeddingGenerationActive, onEmbeddingGenerationStarted, performSearch,
 } from './src/ui-controller.js';
 import {
     getDisplayMode, setDisplayMode, getBranchContextEnabled, getAIConnectionProfile, setAIConnectionProfile,
@@ -63,23 +63,17 @@ const onMessageUpdate = (() => {
 
             let updated = false;
             if (activeChatFile && (isPanelOpen() || embeddingGenerationEnabled)) {
-                updated = await updateActiveChat(activeChatFile, {
-                    // Keep vectors only when embeddings are disabled so semantic views do not
-                    // unexpectedly "drop out" while the user is not auto-regenerating vectors.
-                    resetEmbeddings: embeddingGenerationEnabled,
-                });
+                updated = await updateActiveChat(activeChatFile);
             }
 
             if (isPanelOpen() && activeChatFile) {
                 if (updated && !isTimelineActive() && !isStatsActive() && !isSemanticMapActive() && !isGraphViewActive()) {
-                    renderThreadCards();
+                    refreshThreadCardsAfterMessage(activeChatFile);
                 }
             }
 
             if (embeddingGenerationEnabled && activeChatFile && updated) {
                 scheduleIncrementalEmbedding(activeChatFile);
-            } else if (embeddingGenerationEnabled && activeChatFile && !updated) {
-                scheduleEmbeddingBootstrap();
             }
 
             // Branch context injection works even when panel is closed
@@ -126,6 +120,13 @@ const onMessageUpdate = (() => {
         eventSource.on(eventTypes.CHAT_CHANGED, onChatChanged);
         eventSource.on(eventTypes.MESSAGE_SENT, onMessageUpdate);
         eventSource.on(eventTypes.MESSAGE_RECEIVED, onMessageUpdate);
+        for (const name of ['MESSAGE_EDITED', 'MESSAGE_DELETED', 'MESSAGE_SWIPED']) {
+            if (eventTypes[name]) eventSource.on(eventTypes[name], onMessageUpdate);
+        }
+        if (eventTypes.GENERATION_STARTED) eventSource.on(eventTypes.GENERATION_STARTED, (_type, _params, isDryRun) => onEmbeddingGenerationStarted(isDryRun));
+        for (const name of ['GENERATION_ENDED', 'GENERATION_STOPPED']) {
+            if (eventTypes[name]) eventSource.on(eventTypes[name], () => setEmbeddingGenerationActive(false));
+        }
 
         // Ensure the top bar toggle button exists once all extensions are ready
         if (eventTypes.APP_READY) {
@@ -150,7 +151,7 @@ const onMessageUpdate = (() => {
     // If embeddings are enabled, attempt to restore vectors/clusters from cache.
     if (isEmbeddingGenerationEnabled()) {
         setTimeout(() => {
-            scheduleEmbeddingBootstrap();
+            scheduleEmbeddingBootstrap(getActiveChatFile());
         }, 1200);
     }
 
@@ -175,7 +176,7 @@ function onAppReady() {
     mountTopBarToggleButton();
     void injectSettingsPanel();
     if (isEmbeddingGenerationEnabled()) {
-        scheduleEmbeddingBootstrap();
+        scheduleEmbeddingBootstrap(getActiveChatFile());
     }
 }
 
@@ -848,19 +849,19 @@ function bindEmbeddingSettingsUI(container) {
     enabledEl.addEventListener('change', () => {
         persistForm();
         if (enabledEl.checked) {
-            scheduleEmbeddingBootstrap();
+            scheduleEmbeddingBootstrap(getActiveChatFile());
         }
     });
     levelChatEl.addEventListener('change', () => {
         persistForm();
         if (enabledEl.checked && (levelChatEl.checked || levelMessageEl.checked)) {
-            scheduleEmbeddingBootstrap();
+            scheduleEmbeddingBootstrap(getActiveChatFile());
         }
     });
     levelMessageEl.addEventListener('change', () => {
         persistForm();
         if (enabledEl.checked && (levelChatEl.checked || levelMessageEl.checked)) {
-            scheduleEmbeddingBootstrap();
+            scheduleEmbeddingBootstrap(getActiveChatFile());
         }
     });
     levelQueryEl.addEventListener('change', persistForm);
@@ -1356,7 +1357,7 @@ async function onChatChanged() {
     if (isEmbeddingGenerationEnabled()) {
         const activeFile = getActiveChatFile(context);
         if (!sameCharacter) {
-            scheduleEmbeddingBootstrap();
+            scheduleEmbeddingBootstrap(activeFile);
         } else if (activeFile) {
             scheduleIncrementalEmbedding(activeFile);
         } else {

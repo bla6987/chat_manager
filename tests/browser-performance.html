@@ -1,0 +1,64 @@
+<!doctype html>
+<html lang="en"><meta charset="utf-8"><title>Chat Manager performance regression checks</title>
+<style>body{background:#18212b;color:#e4e9ee;font:15px system-ui;margin:24px}button{padding:8px;margin:4px}#chat-manager-content{height:480px;overflow:auto}.chat-manager-card{border:1px solid #789;padding:12px;margin:8px}.chat-manager-card-actions,.chat-manager-summary-actions{display:none}.chat-manager-cluster-divider{border-top:3px solid red}pre{white-space:pre-wrap}</style>
+<h1>Chat Manager synthetic browser checks</h1>
+<button id="run">Run checks</button><pre id="results">Ready. Uses synthetic messages only.</pre>
+<div class="chat-manager-search-wrapper"><div class="chat-manager-search-row"><input id="chat-manager-search"></div></div>
+<div id="chat-manager-status"></div><div id="chat-manager-content"></div>
+<script type="module">
+import { getIndex, clearIndex } from '../src/chat-reader.js';
+import { renderThreadCards, refreshThreadCardsAfterMessage, performSearch } from '../src/ui-controller.js';
+import { setFilterState, clearFilterState, setSortState, isEmbeddingChatSelected } from '../src/metadata-store.js';
+const context = {characterId:0, characters:[{avatar:'fixture.png'}], chatMetadata:{chat_file_name:'chat0.jsonl'}, extensionSettings:{}, saveSettingsDebounced(){}};
+// All generated HTML values are controlled synthetic strings. This fixture
+// exercises DOM behavior; sanitization itself remains DOMPurify's responsibility.
+window.SillyTavern = {getContext:()=>context, libs:{DOMPurify:{sanitize:html=>html},moment:()=>({isValid:()=>true,format:()=> 'Jan 1',fromNow:()=> 'just now'})}};
+const content=document.getElementById('chat-manager-content');
+const results=document.getElementById('results');
+function assert(condition,label){if(!condition) throw Error(label);results.textContent+='PASS '+label+'\n';}
+function cards(){return [...content.querySelectorAll('.chat-manager-card')];}
+function find(name){return cards().find(card=>card.dataset.filename===name);}
+document.getElementById('run').onclick=async()=>{
+ results.textContent='';
+ try {
+  clearIndex();context.extensionSettings={};document.getElementById('chat-manager-search').value='';
+  for(let i=0;i<125;i++){
+   const fileName=`chat${i}.jsonl`;
+   getIndex()[fileName]={fileName,isLoaded:true,messageCount:i+1,messages:[{filename:fileName,index:0,text:`synthetic match ${i}`,role:'assistant'}],sortTimestamp:1000-i,firstTimestampMs:1,lastTimestampMs:1,initialOrder:i,firstMessageTimestamp:'2026-01-01',lastMessageTimestamp:'2026-01-01',branchPoint:null,clusterLabel:Math.floor(i/25)};
+  }
+  renderThreadCards();
+  assert(cards().length===50,'first render is bounded to 50 of 125 threads');
+  const first=cards()[0];
+  content.querySelector('.chat-manager-threads-more').click();
+  assert(cards().length===100 && cards()[0]===first,'next page appends 50 cards without replacing existing cards');
+  const unchanged=find('chat10.jsonl');
+  getIndex()['chat70.jsonl']={...getIndex()['chat70.jsonl'],messageCount:5000,sortTimestamp:2000};
+  refreshThreadCardsAfterMessage('chat70.jsonl');
+  assert(cards().length===100 && cards()[0].dataset.filename==='chat70.jsonl','message update preserves page count and reorders by recency');
+  assert(find('chat10.jsonl')===unchanged,'message update preserves unrelated card DOM');
+  assert(cards()[0].textContent.includes('5000 messages'),'changed card shows new message count');
+  content.querySelector('.chat-manager-threads-more').click();
+  assert(cards().length===125 && !content.querySelector('.chat-manager-threads-more'),'last page shows remainder and removes load-more control');
+  const checkbox=find('chat124.jsonl').querySelector('input[type=checkbox]');
+  checkbox.checked=true;checkbox.dispatchEvent(new Event('change',{bubbles:true}));
+  assert(isEmbeddingChatSelected('chat124.jsonl'),'delegated checkbox action works on appended cards');
+  setFilterState({messageCountMin:80,messageCountMax:100});renderThreadCards();
+  assert(cards().length===21,'message-count filters apply before pagination');
+  getIndex()['chat90.jsonl']={...getIndex()['chat90.jsonl'],messageCount:101};
+  refreshThreadCardsAfterMessage('chat90.jsonl');
+  assert(cards().length===20 && !find('chat90.jsonl'),'an updated card leaves the list when it no longer matches');
+  clearFilterState();setSortState({field:'cluster',direction:'asc',secondaryField:'recency'});renderThreadCards();
+  content.querySelector('.chat-manager-threads-more').click();
+  content.querySelector('.chat-manager-threads-more').click();
+  assert(cards().length===125 && content.querySelectorAll('.chat-manager-cluster-divider').length===4,'cluster dividers remain correct across page boundaries');
+  setSortState({field:'recency',direction:'desc'});renderThreadCards();
+  assert(!find('chat124.jsonl'),'search target starts outside the rendered page');
+  document.getElementById('chat-manager-search').value='synthetic match 124';
+  await performSearch('synthetic match 124');
+  assert(content.querySelectorAll('.chat-manager-card').length===0 && content.textContent.includes('chat124.jsonl'),'keyword search searches beyond the rendered thread page');
+  refreshThreadCardsAfterMessage('chat0.jsonl');
+  assert(!content.querySelector('.chat-manager-card'),'message update preserves search view');
+  results.textContent+='ALL BROWSER CHECKS PASSED';
+ } catch(error){results.textContent+='FAIL '+error.stack;}
+};
+</script></html>

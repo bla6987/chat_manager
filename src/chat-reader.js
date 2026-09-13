@@ -4,6 +4,7 @@
  */
 
 import { getCachedChatsForCharacter, putCachedChat, removeCachedChat } from './cache-store.js';
+import { getRepresentativeEmbeddingText } from './embedding-text.js';
 
 const MODULE_NAME = 'chat_manager';
 const HYDRATION_BATCH_SIZE = 50;
@@ -21,6 +22,7 @@ let hydrationInProgress = false;
 let hydrationSessionId = 0;
 const entryHydrationPromises = new Map();
 const hydrationListeners = new Set();
+const compositeEmbeddingMaps = new WeakSet();
 let progressCallback = null;
 
 /** Searchable messages cache — invalidated on every index mutation */
@@ -89,8 +91,11 @@ export function getMessageActiveSwipeIndex(msg) {
 export function ensureMessageEmbeddingMap(entry) {
     if (!(entry?.messageEmbeddings instanceof Map)) {
         entry.messageEmbeddings = new Map();
+        compositeEmbeddingMaps.add(entry.messageEmbeddings);
         return entry.messageEmbeddings;
     }
+
+    if (compositeEmbeddingMaps.has(entry.messageEmbeddings)) return entry.messageEmbeddings;
 
     if (entry.messageEmbeddings.size === 0 || !Array.isArray(entry.messages) || entry.messages.length === 0) {
         return entry.messageEmbeddings;
@@ -105,6 +110,7 @@ export function ensureMessageEmbeddingMap(entry) {
     }
 
     if (!needsMigration) {
+        compositeEmbeddingMaps.add(entry.messageEmbeddings);
         return entry.messageEmbeddings;
     }
 
@@ -125,6 +131,7 @@ export function ensureMessageEmbeddingMap(entry) {
     }
 
     entry.messageEmbeddings = migrated;
+    compositeEmbeddingMaps.add(migrated);
     return entry.messageEmbeddings;
 }
 
@@ -146,19 +153,41 @@ export function getMessageEmbedding(entry, msg, swipeIndex = null) {
         return fromComposite;
     }
 
-    const fromLegacy = entry.messageEmbeddings.get(msg.index);
+    // A legacy numeric key describes the active variant only. Another swipe
+    // must never borrow this vector just because its own embedding is missing.
+    const fromLegacy = resolvedSwipe === getMessageActiveSwipeIndex(msg)
+        ? entry.messageEmbeddings.get(msg.index) : null;
     if (Array.isArray(fromLegacy) && fromLegacy.length > 0) {
         return fromLegacy;
     }
 
-    if (resolvedSwipe !== 0) {
-        const fallbackPrimary = entry.messageEmbeddings.get(makeMessageEmbeddingKey(msg.index, 0));
-        if (Array.isArray(fallbackPrimary) && fallbackPrimary.length > 0) {
-            return fallbackPrimary;
+    return null;
+}
+
+function messageVariantText(msg, swipeIndex) {
+    if (!msg) return '';
+    const text = swipeIndex === getMessageActiveSwipeIndex(msg) ? msg.text : msg.swipes?.[swipeIndex];
+    return typeof text === 'string' ? text.trim() : '';
+}
+
+function retainMessageEmbeddings(entry, messages) {
+    if (!(entry.messageEmbeddings instanceof Map)) return null;
+    const previousMap = ensureMessageEmbeddingMap(entry);
+    const retained = new Map();
+    for (let i = 0; i < messages.length; i++) {
+        const msg = messages[i];
+        const previous = entry.messages[i];
+        if (!previous) continue;
+        const swipeCount = Math.max(msg.swipes?.length || 0, getMessageActiveSwipeIndex(msg) + 1);
+        for (let swipe = 0; swipe < swipeCount; swipe++) {
+            const text = messageVariantText(msg, swipe);
+            if (!text || text !== messageVariantText(previous, swipe)) continue;
+            const vector = previousMap.get(makeMessageEmbeddingKey(previous.index, swipe));
+            if (vector) retained.set(makeMessageEmbeddingKey(msg.index, swipe), vector);
         }
     }
-
-    return null;
+    compositeEmbeddingMaps.add(retained);
+    return retained;
 }
 
 /**
@@ -171,7 +200,11 @@ export function getMessageEmbedding(entry, msg, swipeIndex = null) {
 export function setMessageEmbedding(entry, messageIndex, swipeIndex, vector) {
     if (!entry || !Array.isArray(vector) || vector.length === 0) return;
     const map = ensureMessageEmbeddingMap(entry);
-    map.set(makeMessageEmbeddingKey(messageIndex, swipeIndex), vector);
+    const key = makeMessageEmbeddingKey(messageIndex, swipeIndex);
+    if (map.get(key) !== vector) {
+        map.set(key, vector);
+        entry.messageEmbeddingVersion = (entry.messageEmbeddingVersion || 0) + 1;
+    }
 }
 
 /**
@@ -865,18 +898,16 @@ export async function loadEntryNow(fileName) {
  * Update only the active chat's entry in the index (lightweight, no full rebuild).
  * Reads from SillyTavern's in-memory chat array when possible, avoiding an HTTP request.
  * @param {string} fileName - The chat file to update
- * @param {{ resetEmbeddings?: boolean }} [options]
  * @returns {Promise<boolean>} Whether the entry was actually updated
  */
-export async function updateActiveChat(fileName, options = {}) {
+export async function updateActiveChat(fileName) {
     if (!fileName || !chatIndex[fileName]) return false;
-    const resetEmbeddings = options.resetEmbeddings !== false;
 
     try {
         // Prefer in-memory chat data over HTTP fetch
         const context = SillyTavern.getContext();
         let chatData;
-        if (Array.isArray(context.chat) && context.chat.length > 0) {
+        if (Array.isArray(context.chat)) {
             chatData = context.chat;
         } else {
             chatData = await fetchChatContent(fileName);
@@ -890,7 +921,7 @@ export async function updateActiveChat(fileName, options = {}) {
         const hasValidLastModified = Number.isFinite(parsedLastModified);
         const effectiveLastTs = lastTimestamp || cached.lastMessageTimestamp;
 
-        chatIndex[fileName] = {
+        const updated = {
             ...cached,
             messageCount: messages.length,
             messages,
@@ -902,11 +933,14 @@ export async function updateActiveChat(fileName, options = {}) {
             sortTimestamp: hasValidLastModified ? parsedLastModified : cached.sortTimestamp,
             branchPoint: null,
             isLoaded: true,
-            chatEmbedding: resetEmbeddings ? null : cached.chatEmbedding,
-            chatEmbeddingHash: resetEmbeddings ? null : cached.chatEmbeddingHash,
-            clusterLabel: resetEmbeddings ? null : cached.clusterLabel,
-            messageEmbeddings: resetEmbeddings ? null : cached.messageEmbeddings,
+            messageEmbeddings: retainMessageEmbeddings(cached, messages),
         };
+        if (getRepresentativeEmbeddingText(cached) !== getRepresentativeEmbeddingText(updated)) {
+            updated.chatEmbedding = null;
+            updated.chatEmbeddingHash = null;
+            updated.clusterLabel = null;
+        }
+        chatIndex[fileName] = updated;
         bumpIndexVersion();
 
         if (currentCharacterAvatar) {

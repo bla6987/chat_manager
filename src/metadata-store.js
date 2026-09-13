@@ -4,6 +4,9 @@
  */
 
 const MODULE_NAME = 'chat_manager';
+const normalizedEmbeddingSettings = new WeakSet();
+const normalizedFilters = new WeakSet();
+const selectedChatSets = new WeakMap();
 
 const DEFAULT_TAG_DEFINITIONS = {
     tag_canon: { id: 'tag_canon', name: 'Canon', color: '#4CAF50', textColor: '#FFFFFF' },
@@ -61,7 +64,7 @@ function normalizeFilterState(filterState) {
         return { ...DEFAULT_FILTER_STATE };
     }
 
-    return {
+    const normalized = {
         tags: Array.isArray(filterState.tags) ? filterState.tags.filter(tag => typeof tag === 'string' && tag.length > 0) : [],
         dateFrom: typeof filterState.dateFrom === 'string' && filterState.dateFrom.length > 0 ? filterState.dateFrom : null,
         dateTo: typeof filterState.dateTo === 'string' && filterState.dateTo.length > 0 ? filterState.dateTo : null,
@@ -69,6 +72,8 @@ function normalizeFilterState(filterState) {
         messageCountMin: normalizeMessageCountFilterValue(filterState.messageCountMin),
         messageCountMax: normalizeMessageCountFilterValue(filterState.messageCountMax),
     };
+    normalizedFilters.add(normalized);
+    return normalized;
 }
 
 /**
@@ -90,7 +95,7 @@ function ensureSettings() {
     }
     if (!extensionSettings[MODULE_NAME].filterState) {
         extensionSettings[MODULE_NAME].filterState = { ...DEFAULT_FILTER_STATE };
-    } else {
+    } else if (!normalizedFilters.has(extensionSettings[MODULE_NAME].filterState)) {
         extensionSettings[MODULE_NAME].filterState = normalizeFilterState(extensionSettings[MODULE_NAME].filterState);
     }
     if (!extensionSettings[MODULE_NAME].sortState) {
@@ -105,7 +110,9 @@ function ensureSettings() {
     if (!extensionSettings[MODULE_NAME].embeddings || typeof extensionSettings[MODULE_NAME].embeddings !== 'object') {
         extensionSettings[MODULE_NAME].embeddings = createDefaultEmbeddingSettings();
     }
-    normalizeEmbeddingSettings(extensionSettings[MODULE_NAME].embeddings);
+    if (!normalizedEmbeddingSettings.has(extensionSettings[MODULE_NAME].embeddings)) {
+        normalizeEmbeddingSettings(extensionSettings[MODULE_NAME].embeddings);
+    }
 }
 
 /**
@@ -114,6 +121,12 @@ function ensureSettings() {
  */
 function normalizeEmbeddingSettings(embeddings) {
     if (!embeddings || typeof embeddings !== 'object') return;
+
+    for (const [key, value] of Object.entries(DEFAULT_EMBEDDING_SETTINGS)) {
+        if (embeddings[key] === undefined) {
+            embeddings[key] = (value && typeof value === 'object') ? { ...value } : value;
+        }
+    }
 
     const providers = new Set(['openrouter', 'openai', 'ollama']);
     const colorModes = new Set(['structural', 'cluster', 'gradient']);
@@ -186,6 +199,7 @@ function normalizeEmbeddingSettings(embeddings) {
     embeddings.swipeBackgroundDelayMs = Number.isFinite(swipeBackgroundDelayMs)
         ? Math.max(100, Math.min(5000, Math.floor(swipeBackgroundDelayMs)))
         : DEFAULT_EMBEDDING_SETTINGS.swipeBackgroundDelayMs;
+    normalizedEmbeddingSettings.add(embeddings);
 }
 
 /**
@@ -629,21 +643,7 @@ export function setSortState(partial) {
  * @returns {{ enabled: boolean, provider: string, apiKey: string, ollamaUrl: string, model: string, dimensions: number|null, colorMode: string, mapEnabled: boolean, mapLodMode: string, mapPointSize: number, mapSimilarityChannel: string, embeddingLevels: { chat: boolean, message: boolean, query: boolean }, scopeMode: string, selectedChatsByAvatar: Record<string, string[]>, includeAlternateSwipes: boolean, showAlternateSwipesInResults: boolean, maxSwipesPerMessage: number, swipeBackgroundBatchSize: number, swipeBackgroundDelayMs: number }}
  */
 export function getEmbeddingSettings() {
-    const settings = getSettings();
-    if (!settings.embeddings || typeof settings.embeddings !== 'object') {
-        settings.embeddings = createDefaultEmbeddingSettings();
-        save();
-    } else {
-        for (const [key, value] of Object.entries(DEFAULT_EMBEDDING_SETTINGS)) {
-            if (settings.embeddings[key] === undefined) {
-                settings.embeddings[key] = (value && typeof value === 'object' && !Array.isArray(value))
-                    ? { ...value }
-                    : value;
-            }
-        }
-        normalizeEmbeddingSettings(settings.embeddings);
-    }
-    return settings.embeddings;
+    return getSettings().embeddings;
 }
 
 /**
@@ -701,8 +701,15 @@ export function setSelectedEmbeddingChats(fileNames, charKey) {
  */
 export function isEmbeddingChatSelected(fileName, charKey) {
     if (!fileName) return false;
-    const selected = getSelectedEmbeddingChats(charKey);
-    return selected.includes(fileName);
+    const settings = getEmbeddingSettings();
+    const selected = settings.selectedChatsByAvatar[charKey || getCharacterKey()];
+    if (!Array.isArray(selected)) return false;
+    let set = selectedChatSets.get(selected);
+    if (!set) {
+        set = new Set(selected);
+        selectedChatSets.set(selected, set);
+    }
+    return set.has(fileName);
 }
 
 /**

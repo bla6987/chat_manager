@@ -499,15 +499,16 @@ export async function getCachedEmbeddingForText(text) {
  * @param {import('localforage')} cache
  * @param {{hash:string, text:string}[]} items
  * @param {number} [concurrency]
- * @returns {Promise<(object|null)[]>}
+ * @param {(value:object|null, item:{hash:string,text:string}, index:number)=>any} [project]
+ * @returns {Promise<any[]>}
  */
-async function batchCacheGet(cache, items, concurrency = 50) {
+async function batchCacheGet(cache, items, concurrency = 50, project = value => value) {
     const results = new Array(items.length);
     for (let i = 0; i < items.length; i += concurrency) {
         const chunk = items.slice(i, i + concurrency);
         const values = await Promise.all(chunk.map(item => cache.getItem(item.hash)));
         for (let j = 0; j < chunk.length; j++) {
-            results[i + j] = values[j];
+            results[i + j] = project(values[j], chunk[j], i + j);
         }
     }
     return results;
@@ -529,9 +530,8 @@ export async function getCachedEmbeddingsForTexts(texts) {
         const normalized = String(t ?? '');
         return { hash: makeTextCacheKey(normalized), text: normalized };
     });
-    const cached = await batchCacheGet(cache, items);
-    return cached.map((value, i) =>
-        isUsableCacheEntry(value, settings, expectedDims, items[i].text) ? value.vector : null,
+    return batchCacheGet(cache, items, 50, (value, item) =>
+        isUsableCacheEntry(value, settings, expectedDims, item.text) ? value.vector : null,
     );
 }
 
