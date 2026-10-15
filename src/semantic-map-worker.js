@@ -226,7 +226,35 @@ function projectPca2D(vectorsFlat, n, dims) {
 
 function powerIterComponent(vectorsFlat, sample, dims, mean, orthogonalTo = null) {
     const v = new Float64Array(dims);
-    v[0] = 1;
+    // Seed from a direction that actually has residual variance. A fixed e0
+    // seed can lie in the covariance nullspace, including after deflation.
+    const residualVariance = new Float64Array(dims);
+    for (const idx of sample) {
+        const offset = idx * dims;
+        let projection = 0;
+        if (orthogonalTo) {
+            for (let d = 0; d < dims; d++) projection += (vectorsFlat[offset + d] - mean[d]) * orthogonalTo[d];
+        }
+        for (let d = 0; d < dims; d++) {
+            const residual = vectorsFlat[offset + d] - mean[d] - projection * (orthogonalTo?.[d] || 0);
+            residualVariance[d] += residual * residual;
+        }
+    }
+    let seed = 0;
+    for (let d = 1; d < dims; d++) {
+        if (residualVariance[d] > residualVariance[seed]) seed = d;
+    }
+    if (residualVariance[seed] <= EPSILON) return v;
+    v[seed] = 1;
+    if (orthogonalTo) {
+        const projection = orthogonalTo[seed];
+        for (let d = 0; d < dims; d++) v[d] -= projection * orthogonalTo[d];
+        let length = 0;
+        for (let d = 0; d < dims; d++) length += v[d] * v[d];
+        length = Math.sqrt(length);
+        if (length <= EPSILON) return new Float64Array(dims);
+        for (let d = 0; d < dims; d++) v[d] /= length;
+    }
 
     const w = new Float64Array(dims);
     const sampleLen = Math.max(1, sample.length - 1);
@@ -268,7 +296,7 @@ function powerIterComponent(vectorsFlat, sample, dims, mean, orthogonalTo = null
         }
         norm = Math.sqrt(norm);
         if (!Number.isFinite(norm) || norm <= EPSILON) {
-            break;
+            return new Float64Array(dims);
         }
 
         for (let d = 0; d < dims; d++) {

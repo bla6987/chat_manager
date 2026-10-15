@@ -44,6 +44,106 @@ const OPENAI_COMPAT_ENDPOINTS = Object.freeze({
 
 /** @type {import('localforage')|null} */
 let embeddingCache = null;
+let embeddingOperationEpoch = 0;
+let activeConfigurationKey = null;
+let cacheMutationTail = Promise.resolve();
+const dimensionsInvalidatedListeners = new Set();
+
+/** Subscribe to confirmed dimension drift, after cache/settings reset. */
+export function onEmbeddingDimensionsInvalidated(callback) {
+    if (typeof callback !== 'function') throw new TypeError('Dimension invalidation listener must be a function.');
+    dimensionsInvalidatedListeners.add(callback);
+    return () => dimensionsInvalidatedListeners.delete(callback);
+}
+
+function notifyEmbeddingDimensionsInvalidated() {
+    for (const callback of dimensionsInvalidatedListeners) {
+        try {
+            callback();
+        } catch (error) {
+            console.warn('[chat_manager] Embedding dimension invalidation listener failed:', error);
+        }
+    }
+}
+
+class StaleEmbeddingOperationError extends Error {
+    constructor(reason = 'superseded') {
+        super('Embedding operation was superseded by a settings change or cache clear.');
+        this.name = 'StaleEmbeddingOperationError';
+        this.reason = reason;
+    }
+}
+
+export function isStaleEmbeddingOperationError(error) {
+    return error instanceof StaleEmbeddingOperationError;
+}
+
+/** Dimensions are learned from responses and must not change recipe identity. */
+export function getEmbeddingRecipeKey(settings) {
+    const provider = settings.provider;
+    const endpoint = provider === 'ollama'
+        ? String(settings.ollamaUrl || DEFAULT_EMBEDDING_SETTINGS.ollamaUrl).trim().replace(/\/+$/, '')
+        : OPENAI_COMPAT_ENDPOINTS[provider] || '';
+    return JSON.stringify([provider, String(settings.model || '').trim(), endpoint]);
+}
+
+function synchronizeEmbeddingConfiguration(settings) {
+    const configurationKey = JSON.stringify([
+        getEmbeddingRecipeKey(settings),
+        settings.provider === 'ollama' ? '' : hashEmbeddingText(settings.apiKey || ''),
+        settings.enabled === true,
+        ...EMBEDDING_LEVELS.map(level => settings.embeddingLevels?.[level] === true),
+    ]);
+    if (activeConfigurationKey !== configurationKey) {
+        activeConfigurationKey = configurationKey;
+        embeddingOperationEpoch += 1;
+    }
+    return configurationKey;
+}
+
+export function invalidateEmbeddingOperations() {
+    embeddingOperationEpoch += 1;
+}
+
+/** Capture before awaiting work; callers must guard transient vector attachments. */
+export function captureEmbeddingOperation() {
+    const current = ensureEmbeddingSettings();
+    const configurationKey = synchronizeEmbeddingConfiguration(current);
+    const settings = Object.freeze({
+        ...current,
+        model: current.model.trim(),
+        ollamaUrl: current.ollamaUrl.trim().replace(/\/+$/, ''),
+        embeddingLevels: Object.freeze({ ...current.embeddingLevels }),
+    });
+    return Object.freeze({
+        epoch: embeddingOperationEpoch,
+        recipeKey: getEmbeddingRecipeKey(settings),
+        configurationKey,
+        settings,
+    });
+}
+
+export function isEmbeddingOperationCurrent(operation) {
+    const configurationKey = synchronizeEmbeddingConfiguration(ensureEmbeddingSettings());
+    return Boolean(operation && operation.epoch === embeddingOperationEpoch
+        && operation.configurationKey === configurationKey);
+}
+
+function assertEmbeddingOperationCurrent(operation) {
+    if (!isEmbeddingOperationCurrent(operation)) throw new StaleEmbeddingOperationError();
+}
+
+// A clear waits for writes already issued to IndexedDB. Epoch checks alone cannot
+// stop an outstanding setItem from finishing after a concurrent clear.
+function mutateEmbeddingCache(mutation) {
+    const result = cacheMutationTail.catch(() => {}).then(mutation);
+    cacheMutationTail = result.catch(() => {});
+    return result;
+}
+
+function makeRecipeCacheKey(settings, text) {
+    return `${hashEmbeddingText(getEmbeddingRecipeKey(settings))}:${makeTextCacheKey(text)}`;
+}
 
 class EmbeddingDimensionMismatchError extends Error {
     /**
@@ -306,8 +406,10 @@ async function postJson(url, body, extraHeaders = {}) {
     }
 
     if (!response.ok) {
-        const detail = extractErrorMessage(payload);
-        throw new Error(detail || `Embedding request failed (${response.status} ${response.statusText})`);
+        const detail = extractErrorMessage(payload) || raw.trim().slice(0, 200);
+        const error = new Error(detail || `Embedding request failed (${response.status} ${response.statusText})`);
+        error.status = response.status;
+        throw error;
     }
 
     return payload;
@@ -362,8 +464,18 @@ async function embedOllamaSingle(settings, text) {
     return validateVector(payload?.embedding);
 }
 
-/** Flag: does the connected Ollama support /api/embed (batch)? */
-let ollamaBatchSupported = true;
+/** Only explicit unsupported-route responses disable batching for an endpoint. */
+const unsupportedOllamaBatchEndpoints = new Set();
+
+function isUnsupportedOllamaBatchError(error) {
+    if (error?.status === 405 || error?.status === 501) return true;
+    // A missing model can also produce a 404; it does not identify an old server.
+    return error?.status === 404 && /(?:404 page not found|unknown (?:route|endpoint)|(?:route|endpoint) (?:not found|not supported))/i.test(error.message);
+}
+
+function isTransientEmbeddingRequestError(error) {
+    return error instanceof TypeError || error?.status === 408 || error?.status === 429 || error?.status >= 500;
+}
 
 /**
  * @param {typeof DEFAULT_EMBEDDING_SETTINGS} settings
@@ -380,46 +492,6 @@ async function embedOllamaBatch(settings, texts) {
         throw new Error(`Ollama /api/embed returned ${payload?.embeddings?.length ?? 0} vectors for ${texts.length} texts.`);
     }
     return payload.embeddings.map(v => validateVector(v));
-}
-
-/**
- * @param {string} currentProvider
- * @param {string} currentModel
- * @returns {Promise<void>}
- */
-async function maybeHandleModelChange(currentProvider, currentModel) {
-    const cache = getEmbeddingCache();
-    const meta = await cache.getItem(CACHE_META_KEY);
-    if (!meta || typeof meta !== 'object') return;
-
-    if (meta.provider === currentProvider && meta.model === currentModel) {
-        return;
-    }
-
-    const previous = `${meta.provider || 'unknown'} / ${meta.model || 'unknown'}`;
-    const next = `${currentProvider} / ${currentModel}`;
-    const shouldClear = window.confirm(
-        `Model changed. Clear embedding cache?\n\nPrevious: ${previous}\nCurrent: ${next}`,
-    );
-
-    if (shouldClear) {
-        await clearEmbeddingCache();
-        const settings = ensureEmbeddingSettings();
-        if (settings.dimensions !== null) {
-            settings.dimensions = null;
-            saveEmbeddingSettings();
-        }
-    } else {
-        if (typeof toastr !== 'undefined') {
-            toastr.warning('Provider/model changed without clearing cache. Existing embeddings may be inconsistent.');
-        }
-        // Avoid prompting repeatedly in the same configuration.
-        await cache.setItem(CACHE_META_KEY, {
-            provider: currentProvider,
-            model: currentModel,
-            dimensions: null,
-        });
-    }
 }
 
 /**
@@ -463,7 +535,8 @@ function updateDimensionState(dims, state) {
 function isUsableCacheEntry(cachedValue, settings, expectedDims, text) {
     if (!cachedValue || typeof cachedValue !== 'object') return false;
     if (cachedValue.model !== settings.model) return false;
-    if (cachedValue.provider && cachedValue.provider !== settings.provider) return false;
+    if (cachedValue.provider !== settings.provider) return false;
+    if (cachedValue.recipeKey !== getEmbeddingRecipeKey(settings)) return false;
     // Require exact text match to prevent accidental hash collision reuse.
     if (typeof cachedValue.text !== 'string' || cachedValue.text !== text) return false;
     if (!Array.isArray(cachedValue.vector) || cachedValue.vector.length === 0) return false;
@@ -479,15 +552,18 @@ function isUsableCacheEntry(cachedValue, settings, expectedDims, text) {
  * @returns {Promise<number[]|null>}
  */
 export async function getCachedEmbeddingForText(text) {
-    const settings = ensureEmbeddingSettings();
+    const operation = captureEmbeddingOperation();
+    const settings = operation.settings;
     const normalizedText = String(text ?? '');
     const expectedDims = Number.isInteger(settings.dimensions) && settings.dimensions > 0
         ? settings.dimensions
         : null;
 
     const cache = getEmbeddingCache();
-    const key = makeTextCacheKey(normalizedText);
+    const key = makeRecipeCacheKey(settings, normalizedText);
+    await cacheMutationTail;
     const cached = await cache.getItem(key);
+    assertEmbeddingOperationCurrent(operation);
     if (!isUsableCacheEntry(cached, settings, expectedDims, normalizedText)) {
         return null;
     }
@@ -520,7 +596,8 @@ async function batchCacheGet(cache, items, concurrency = 50, project = value => 
  * @returns {Promise<(number[]|null)[]>}
  */
 export async function getCachedEmbeddingsForTexts(texts) {
-    const settings = ensureEmbeddingSettings();
+    const operation = captureEmbeddingOperation();
+    const settings = operation.settings;
     const expectedDims = Number.isInteger(settings.dimensions) && settings.dimensions > 0
         ? settings.dimensions
         : null;
@@ -528,17 +605,20 @@ export async function getCachedEmbeddingsForTexts(texts) {
     const cache = getEmbeddingCache();
     const items = texts.map(t => {
         const normalized = String(t ?? '');
-        return { hash: makeTextCacheKey(normalized), text: normalized };
+        return { hash: makeRecipeCacheKey(settings, normalized), text: normalized };
     });
-    return batchCacheGet(cache, items, 50, (value, item) =>
+    await cacheMutationTail;
+    const vectors = await batchCacheGet(cache, items, 50, (value, item) =>
         isUsableCacheEntry(value, settings, expectedDims, item.text) ? value.vector : null,
     );
+    assertEmbeddingOperationCurrent(operation);
+    return vectors;
 }
 
 /**
  * Provider dispatch + batching + cache.
  * @param {string[]} texts
- * @param {{ level?: 'chat'|'message'|'query', onProgress?: (completed:number, total:number)=>void, _recovered?: boolean }} [options]
+ * @param {{ level?: 'chat'|'message'|'query', onProgress?: (completed:number, total:number)=>void }} [options]
  * @returns {Promise<number[][]>}
  */
 export async function embedTexts(texts, options = {}) {
@@ -550,7 +630,8 @@ export async function embedTexts(texts, options = {}) {
     const total = normalizedTexts.length;
     if (total === 0) return [];
 
-    const settings = ensureEmbeddingSettings();
+    const operation = captureEmbeddingOperation();
+    const settings = operation.settings;
     if (!isEmbeddingConfigured()) {
         throw new Error('Embeddings are not configured. Set provider/model (and API key for cloud providers).');
     }
@@ -565,7 +646,10 @@ export async function embedTexts(texts, options = {}) {
     const onProgress = options.onProgress;
     const cache = getEmbeddingCache();
 
-    await maybeHandleModelChange(provider, settings.model.trim());
+    // Recipe namespaces make old model/server caches harmless. Settings UI owns
+    // any user-requested clearing; generating never clears another recipe.
+    await cacheMutationTail;
+    assertEmbeddingOperationCurrent(operation);
 
     const vectors = new Array(total);
     let completed = 0;
@@ -575,7 +659,7 @@ export async function embedTexts(texts, options = {}) {
     const uniqueByText = new Map();
     for (let i = 0; i < normalizedTexts.length; i++) {
         const text = normalizedTexts[i];
-        const hash = makeTextCacheKey(text);
+        const hash = makeRecipeCacheKey(settings, text);
         const existing = uniqueByText.get(text);
         if (existing) {
             existing.indices.push(i);
@@ -593,6 +677,7 @@ export async function embedTexts(texts, options = {}) {
 
     const uniqueItems = [...uniqueByText.values()];
     const cachedValues = await batchCacheGet(cache, uniqueItems);
+    assertEmbeddingOperationCurrent(operation);
     for (let ci = 0; ci < uniqueItems.length; ci++) {
         const item = uniqueItems[ci];
         const cached = cachedValues[ci];
@@ -609,100 +694,105 @@ export async function embedTexts(texts, options = {}) {
     notifyProgress(completed, total, onProgress);
 
     try {
-        if (provider === 'ollama') {
-            const batchSize = OLLAMA_BATCH_SIZE;
-            for (let i = 0; i < pending.length; i += batchSize) {
-                const batch = pending.slice(i, i + batchSize);
-                await sleep(0);
-                let batchVectors;
-                if (ollamaBatchSupported) {
-                    try {
-                        batchVectors = await embedOllamaBatch(settings, batch.map(item => item.text));
-                    } catch {
-                        ollamaBatchSupported = false;
-                        batchVectors = null;
+        const batchSize = provider === 'ollama' ? OLLAMA_BATCH_SIZE : BATCH_SIZE;
+        for (let i = 0; i < pending.length; i += batchSize) {
+            assertEmbeddingOperationCurrent(operation);
+            const batch = pending.slice(i, i + batchSize);
+            await sleep(0);
+            assertEmbeddingOperationCurrent(operation);
+            let batchVectors;
+            if (provider === 'ollama') {
+                const endpoint = settings.ollamaUrl;
+                if (!unsupportedOllamaBatchEndpoints.has(endpoint)) {
+                    for (let attempt = 0; attempt < 2; attempt++) {
+                        try {
+                            batchVectors = await embedOllamaBatch(settings, batch.map(item => item.text));
+                            break;
+                        } catch (error) {
+                            assertEmbeddingOperationCurrent(operation);
+                            if (isUnsupportedOllamaBatchError(error)) {
+                                unsupportedOllamaBatchEndpoints.add(endpoint);
+                                break;
+                            }
+                            if (attempt > 0 || !isTransientEmbeddingRequestError(error)) throw error;
+                            await sleep(150);
+                            assertEmbeddingOperationCurrent(operation);
+                        }
                     }
                 }
                 if (!batchVectors) {
-                    // Fallback: sequential single-text calls for this batch
                     batchVectors = [];
                     for (const item of batch) {
+                        assertEmbeddingOperationCurrent(operation);
                         batchVectors.push(await embedOllamaSingle(settings, item.text));
                     }
                 }
-                const writes = [];
-                for (let j = 0; j < batch.length; j++) {
-                    const item = batch[j];
-                    const vector = batchVectors[j];
-                    const dims = getVectorDimensions(vector);
-                    updateDimensionState(dims, dimensionState);
-                    writes.push(cache.setItem(item.hash, {
-                        vector,
-                        dims,
-                        model: settings.model,
-                        provider: settings.provider,
-                        text: item.text,
-                    }));
-                    for (const idx of item.indices) {
-                        vectors[idx] = vector;
-                    }
-                    completed += item.indices.length;
-                }
-                await Promise.all(writes);
-                notifyProgress(completed, total, onProgress);
+            } else {
+                batchVectors = await embedOpenAICompatible(provider, settings, batch.map(item => item.text));
             }
-        } else {
-            for (let i = 0; i < pending.length; i += BATCH_SIZE) {
-                const batch = pending.slice(i, i + BATCH_SIZE);
-                await sleep(0);
-                const batchVectors = await embedOpenAICompatible(provider, settings, batch.map(item => item.text));
-                const writes = [];
-                for (let j = 0; j < batch.length; j++) {
-                    const item = batch[j];
-                    const vector = batchVectors[j];
-                    const dims = getVectorDimensions(vector);
-                    updateDimensionState(dims, dimensionState);
-                    writes.push(cache.setItem(item.hash, {
-                        vector,
-                        dims,
-                        model: settings.model,
-                        provider: settings.provider,
-                        text: item.text,
-                    }));
-                    for (const idx of item.indices) {
-                        vectors[idx] = vector;
-                    }
-                    completed += item.indices.length;
-                }
-                await Promise.all(writes);
-                notifyProgress(completed, total, onProgress);
+            assertEmbeddingOperationCurrent(operation);
+            // Validate the entire batch before scheduling any persistent writes.
+            for (const vector of batchVectors) {
+                updateDimensionState(getVectorDimensions(vector), dimensionState);
             }
+            await mutateEmbeddingCache(async () => {
+                assertEmbeddingOperationCurrent(operation);
+                const writes = await Promise.allSettled(batch.map((item, j) => cache.setItem(item.hash, {
+                    vector: batchVectors[j],
+                    dims: batchVectors[j].length,
+                    model: settings.model,
+                    provider,
+                    recipeKey: operation.recipeKey,
+                    text: item.text,
+                })));
+                const failedWrite = writes.find(result => result.status === 'rejected');
+                if (failedWrite) throw failedWrite.reason;
+            });
+            assertEmbeddingOperationCurrent(operation);
+            for (let j = 0; j < batch.length; j++) {
+                for (const idx of batch[j].indices) vectors[idx] = batchVectors[j];
+                completed += batch[j].indices.length;
+            }
+            notifyProgress(completed, total, onProgress);
         }
     } catch (error) {
-        if (error instanceof EmbeddingDimensionMismatchError && !options._recovered) {
-            if (typeof toastr !== 'undefined') {
-                toastr.warning('Embedding dimensions changed. Clearing cache and re-embedding.');
-            }
+        if (error instanceof EmbeddingDimensionMismatchError) {
+            assertEmbeddingOperationCurrent(operation);
             await clearEmbeddingCache();
+            const nextOperation = captureEmbeddingOperation();
+            if (nextOperation.configurationKey !== operation.configurationKey) throw new StaleEmbeddingOperationError();
             const current = ensureEmbeddingSettings();
             current.dimensions = null;
             saveEmbeddingSettings();
-            return embedTexts(normalizedTexts, { ...options, _recovered: true });
+            notifyEmbeddingDimensionsInvalidated();
+            if (typeof toastr !== 'undefined') {
+                toastr.warning('Embedding dimensions changed. Cached vectors were cleared.');
+            }
+            // The caller's attachment token is now stale. Retry from a fresh UI
+            // operation instead of returning vectors that its guard must drop.
+            throw new StaleEmbeddingOperationError('dimensions');
         }
         throw error;
     }
 
+    assertEmbeddingOperationCurrent(operation);
     const finalDims = dimensionState.expected ?? dimensionState.observed;
-    if (finalDims && settings.dimensions !== finalDims) {
-        settings.dimensions = finalDims;
+    const current = ensureEmbeddingSettings();
+    if (finalDims && current.dimensions !== finalDims) {
+        current.dimensions = finalDims;
         saveEmbeddingSettings();
     }
 
-    await cache.setItem(CACHE_META_KEY, {
-        provider,
-        model: settings.model,
-        dimensions: finalDims ?? null,
+    await mutateEmbeddingCache(() => {
+        assertEmbeddingOperationCurrent(operation);
+        return cache.setItem(CACHE_META_KEY, {
+            provider,
+            model: settings.model,
+            recipeKey: operation.recipeKey,
+            dimensions: finalDims ?? null,
+        });
     });
+    assertEmbeddingOperationCurrent(operation);
 
     return /** @type {number[][]} */ (vectors);
 }
@@ -740,8 +830,9 @@ export function getEmbeddingDimensions() {
 }
 
 export async function clearEmbeddingCache() {
+    invalidateEmbeddingOperations();
     const cache = getEmbeddingCache();
-    await cache.clear();
+    await mutateEmbeddingCache(() => cache.clear());
 }
 
 /**
@@ -753,10 +844,17 @@ export async function clearEmbeddingCache() {
  */
 export async function acknowledgeEmbeddingModelChange(provider, model) {
     const cache = getEmbeddingCache();
-    await cache.setItem(CACHE_META_KEY, {
-        provider: String(provider ?? ''),
-        model: String(model ?? ''),
-        dimensions: null,
+    const operation = captureEmbeddingOperation();
+    const settings = operation.settings;
+    if (provider !== settings.provider || String(model ?? '').trim() !== settings.model) return;
+    await mutateEmbeddingCache(() => {
+        assertEmbeddingOperationCurrent(operation);
+        return cache.setItem(CACHE_META_KEY, {
+            provider: String(provider ?? ''),
+            model: settings.model,
+            dimensions: null,
+            recipeKey: operation.recipeKey,
+        });
     });
 }
 

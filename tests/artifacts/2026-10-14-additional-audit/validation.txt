@@ -1,0 +1,70 @@
+PROBE navigation: exit 0
+EMPTY HYDRATION: {"mounted":false,"flatNodes":0,"html":"<div class=\"chat-manager-empty\">No loaded chats to visualize.</div>"}
+FILTERED FOCUS: {"focusedResult":false,"pending":null,"nodes":20}
+SWALLOWED SAVE FAILURE: {"switched":true,"opens":1,"saveErrorToast":1}
+DEEP 1000 OK 1000 1ms
+DEEP 2000 OK 2000 2ms
+DEEP 3000 OK 3000 2ms
+DEEP 4000 OK 4000 3ms
+DEEP 6000 RangeError Maximum call stack size exceeded RangeError: Maximum call stack size exceeded |     at file:///Users/macbookpro/projects/extensions/sillytavern/chat_manager/src/icicle-data.js:352:40 |     at Array.reduce (<anonymous>) |     at computeLayout (file:///Users/macbookpro/projects/extensions/sillytavern/chat_manager/src/icicle-data.js:352:33)
+DEEP 8000 RangeError Maximum call stack size exceeded RangeError: Maximum call stack size exceeded |     at annotateSemanticFields (file:///Users/macbookpro/projects/extensions/sillytavern/chat_manager/src/icicle-data.js:270:32) |     at annotateSemanticFields (file:///Users/macbookpro/projects/extensions/sillytavern/chat_manager/src/icicle-data.js:288:9) |     at annotateSemanticFields (file:///Users/macbookpro/projects/extensions/sillytavern/chat_manager/src/icicle-data.js:288:9)
+
+
+PROBE host-jumps: exit 0
+ACTUAL HOST SAVE FAILURE: swallowed HTTP 500, switch succeeds, opens=1, error toasts=1
+ACTUAL HANDLERS + HOST CHAT-JUMP: [{"active":"new","index":5},{"active":"new","index":1}]
+
+
+PROBE index: exit 0
+[chat_manager] Hydrating 1 chats in background (1 total)
+HTTP hydration message indices: [ 1, 2 ]
+Same messages after live update indices: [ 0, 1 ]
+After successful empty archive list: index size=0, version unchanged, searchable count= 2
+[chat_manager] Failed to open IndexedDB: Error: synthetic no cache
+    at file:///Users/macbookpro/projects/extensions/sillytavern/chat_manager/tests/artifacts/2026-10-14-additional-audit/probes/index.mjs:3:97
+[chat_manager] Failed to open IndexedDB: Error: synthetic no cache
+    at file:///Users/macbookpro/projects/extensions/sillytavern/chat_manager/tests/artifacts/2026-10-14-additional-audit/probes/index.mjs:3:97
+[chat_manager] Failed to open IndexedDB: Error: synthetic no cache
+    at file:///Users/macbookpro/projects/extensions/sillytavern/chat_manager/tests/artifacts/2026-10-14-additional-audit/probes/index.mjs:3:97
+
+
+PROBE ui: exit 0
+TITLE CLEAR: visible title=target.jsonl; saved title=Old title
+EDITED TITLE CLICK: one bubbling click called openCharacterChat twice
+SEARCH CLEAR RACE: thread-list was overwritten by stale semantic-results
+LOCAL DATE FILTER: Oct 14 matches=["previous-evening","selected-morning"]; excludes selected-evening
+LEGACY TIMESTAMP: fully loaded chat with host-supported humanized timestamp produces empty heatmap
+KNOWN RENAME BUG: affirmative confirmation with removed dialog calls renameChat zero times
+
+
+PROBE embeddings: exit 0
+NEW endpoint identity: changing Ollama server reused A vector; provider calls = 1
+PRIOR-KNOWN recipe race: model-a response persisted as model-b after clear.
+NEW alternate-only work: missing alternate vector, run skipped, queue size 0, threadNeedsEmbeddings false.
+NEW partial-embedding hybrid search: exact keyword match in b.jsonl excluded; mode = semantic.
+NEW clear-search race: cleared query rendered cards, old semantic request then rendered pending treasure.
+NEW alternate excerpt mismatch: matched swipe 1; displayed item.text = active unrelated answer
+NEW transient fallback: one HTTP 503 caused 6 single calls; healthy second batch never retried /api/embed.
+
+
+PROBE semantic: exit 0
+PCA constant e0 -> [
+  0, 0, 0, 0,
+  0, 0, 0, 0
+] diagonal covariance -> [
+  -2, -2, -2, -2,
+   2,  2,  2,  2
+]
+Semantic mount empty then update: {"bind":0,"resize":0,"observer":0}
+Clear kept score job id 2 and late result restored [ 0.800000011920929, 0.10000000149011612 ]
+Graph mount empty then update: {"bind":0,"resize":0,"observer":0}
+Clear while embedding -> late pins 1
+Pin Beta index after scope -> Gamma neighbors [ 'Beta' ]
+Settled graph after rebuild simRunning: false nodes: 2
+10 duplicate concurrent pin requests -> 10 pins (MAX_PINS=8)
+Opposed vectors -> similarity -1 -> negative Canvas arc radius -1 (render throws)
+Map hit-test at point 9.55px away (inside 10px threshold) -> -1 due to fixed adjacent-cell scan
+
+
+PROBE queue-cost: exit 0
+{ cachedChats: 1000, queueFilterVisits: 500500, expected: 500500 }

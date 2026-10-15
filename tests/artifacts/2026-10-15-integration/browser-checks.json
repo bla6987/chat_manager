@@ -1,0 +1,18 @@
+[
+  {
+    "fixture": "performance",
+    "result": "PASS first render is bounded to 50 of 125 threads\nPASS next page appends 50 cards without replacing existing cards\nPASS message update preserves page count and reorders by recency\nPASS message update preserves unrelated card DOM\nPASS changed card shows new message count\nPASS last page shows remainder and removes load-more control\nPASS delegated checkbox action works on appended cards\nPASS message-count filters apply before pagination\nPASS an updated card leaves the list when it no longer matches\nPASS cluster dividers remain correct across page boundaries\nPASS search target starts outside the rendered page\nPASS keyword search searches beyond the rendered thread page\nPASS message update preserves search view\nALL BROWSER CHECKS PASSED"
+  },
+  {
+    "fixture": "browser-branch-navigation.html",
+    "result": "PASS empty cold mount keeps a canvas ready for hydration\nPASS hydration clears the empty state\nPASS refresh preserves every rendered pixel after scrolling and zooming\nPASS active search refresh does not animate back to its first match\nPASS focused message opens its navigation popup\nPASS background refresh keeps the open popup usable\nPASS wheel zoom stays inside the explored thread\nPASS explored thread keeps its layout during refresh\nPASS explicit focus outside Explore reveals the target\nPASS explicit focus widens a current-thread filter hiding the loaded target\nPASS loaded target hidden by the old filter receives its focus popup\nALL BROWSER CHECKS PASSED"
+  },
+  {
+    "fixture": "browser-chat-navigation.html",
+    "result": "PASS failed save keeps the source chat active\nPASS failed save preserves unsaved messages and never opens a target\nPASS the first jump waits for an initially truncated message\nPASS a second jump waits for the complete first load and scroll\nPASS both serialized jumps finish successfully\nPASS the first scroll happens before the second chat opens\nPASS the second jump also loads its initially truncated message\nPASS the final active chat and rendered target are the second request\nPASS real smooth scrolling moves and aligns the requested message with the chat viewport\nPASS an external chat change cancels the old jump\nPASS the stale jump does not scroll the new chat DOM\nPASS all requests and earlier-message loading used injected synthetic dependencies\nCOMPLETE: 12 checks passed.\n"
+  },
+  {
+    "fixture": "browser-semantic-regressions.html",
+    "result": "PASS empty mounts size real canvases\nPASS empty mounts bind wheel controls\nPASS query submits mocked worker score\nPASS Clear rejects late score response\nPASS graph pins mocked vector against negative-cosine message\nPASS negative cosine renders through real Canvas at dot zoom without exceptions\nPASS real worker preserves variance with constant first coordinate\nALL BROWSER CHECKS PASSED"
+  }
+]

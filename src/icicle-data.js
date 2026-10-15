@@ -4,7 +4,7 @@
  * Pipeline:
  * 1. Trie construction: each chat's message sequence = root-to-leaf path.
  *    Trie key at each depth = normalized message text.
- * 2. Layout: recursive top-down y0/y1 assignment in [0,1] space.
+ * 2. Layout: iterative top-down y0/y1 assignment in [0,1] space.
  *    Children divide parent's span proportionally by chat count.
  * 3. Flatten: pre-order traversal → flat array for rendering + hit testing.
  */
@@ -43,23 +43,21 @@ function normalizeText(text) {
  * @returns {Array<{fileName: string, entry: Object}>}
  */
 function filterToThread(loadedEntries, activeChatFile) {
-    const activeEntry = loadedEntries.find(e => e.fileName === activeChatFile);
-    if (!activeEntry || activeEntry.entry.messages.length < 2) return loadedEntries;
+    const activeEntry = loadedEntries.find(e => e.fileName === activeChatFile)?.entry;
+    return loadedEntries.filter(({ fileName, entry }) => fileName === activeChatFile
+        || sharesActiveThread(entry, activeEntry));
+}
 
-    const activeKeys = activeEntry.entry.messages.map(
-        msg => `${msg.role}:${normalizeText(msg.text)}`,
-    );
-
-    return loadedEntries.filter(({ fileName, entry }) => {
-        if (fileName === activeChatFile) return true;
-        if (entry.messages.length < 2) return false;
-
-        for (let i = 0; i < 2; i++) {
-            const key = `${entry.messages[i].role}:${normalizeText(entry.messages[i].text)}`;
-            if (key !== activeKeys[i]) return false;
-        }
-        return true;
-    });
+/** Whether the current-thread filter includes an entry alongside the active chat. */
+export function sharesActiveThread(entry, activeEntry) {
+    if (!activeEntry?.isLoaded || !activeEntry.messages || activeEntry.messages.length < 2) return true;
+    if (!entry?.messages || entry.messages.length < 2) return false;
+    for (let i = 0; i < 2; i++) {
+        const message = entry.messages[i];
+        const active = activeEntry.messages[i];
+        if (message.role !== active.role || normalizeText(message.text) !== normalizeText(active.text)) return false;
+    }
+    return true;
 }
 
 /**
@@ -67,7 +65,7 @@ function filterToThread(loadedEntries, activeChatFile) {
  *
  * @param {Object} chatIndex - keyed by fileName
  * @param {string|null} activeChatFile
- * @param {{ threadFocus?: boolean }} [options]
+ * @param {{ threadFocus?: boolean, previousRoot?: TrieNode|null }} [options]
  * @returns {{ root: TrieNode, flatNodes: Array, maxDepth: number, loadedCount: number, pcaRanges: { x: [number, number], y: [number, number], z: [number, number] }|null }}
  */
 export async function buildIcicleData(chatIndex, activeChatFile, options = {}) {
@@ -120,7 +118,7 @@ export async function buildIcicleData(chatIndex, activeChatFile, options = {}) {
     annotateSemanticFields(root, chatIndex, semanticContext, new WeakMap());
 
     // ── Phase 2: Layout computation ──
-    computeLayout(root, 0, 1, activeChatFile);
+    computeLayout(root, 0, 1, activeChatFile, options.previousRoot);
 
     // ── Phase 3: Flatten ──
     const flatNodes = [];
@@ -150,11 +148,17 @@ function makeNode(normalizedText, role, depth) {
     };
 }
 
-function compactSharedMembership(node, parentChatFiles) {
-    if (parentChatFiles && node.chatFiles.length === parentChatFiles.length) {
-        node.chatFiles = parentChatFiles;
+function compactSharedMembership(root, parentChatFiles) {
+    const stack = [{ node: root, parentChatFiles }];
+    while (stack.length) {
+        const { node, parentChatFiles: parentFiles } = stack.pop();
+        if (parentFiles && node.chatFiles.length === parentFiles.length) {
+            node.chatFiles = parentFiles;
+        }
+        for (const child of node.children.values()) {
+            stack.push({ node: child, parentChatFiles: node.chatFiles });
+        }
     }
-    for (const child of node.children.values()) compactSharedMembership(child, node.chatFiles);
 }
 
 /**
@@ -267,25 +271,26 @@ function projectToPca3(vector, mean, components) {
  * @param {Object} chatIndex
  * @param {{ mean: number[]|null, components: number[][]|null }} semanticContext
  */
-function annotateSemanticFields(node, chatIndex, semanticContext, aggregateCache) {
-    let aggregate = aggregateCache.get(node.chatFiles);
-    if (!aggregate) {
-        aggregate = {
-            clusterLabel: majorityCluster(node.chatFiles, chatIndex),
-            chatEmbedding: meanPoolEmbeddings(node.chatFiles, chatIndex),
-            pca3d: null,
-        };
-        if (aggregate.chatEmbedding && semanticContext.mean && semanticContext.components) {
-            aggregate.pca3d = projectToPca3(aggregate.chatEmbedding, semanticContext.mean, semanticContext.components);
+function annotateSemanticFields(root, chatIndex, semanticContext, aggregateCache) {
+    const stack = [root];
+    while (stack.length) {
+        const node = stack.pop();
+        let aggregate = aggregateCache.get(node.chatFiles);
+        if (!aggregate) {
+            aggregate = {
+                clusterLabel: majorityCluster(node.chatFiles, chatIndex),
+                chatEmbedding: meanPoolEmbeddings(node.chatFiles, chatIndex),
+                pca3d: null,
+            };
+            if (aggregate.chatEmbedding && semanticContext.mean && semanticContext.components) {
+                aggregate.pca3d = projectToPca3(aggregate.chatEmbedding, semanticContext.mean, semanticContext.components);
+            }
+            aggregateCache.set(node.chatFiles, aggregate);
         }
-        aggregateCache.set(node.chatFiles, aggregate);
-    }
-    node.clusterLabel = aggregate.clusterLabel;
-    node.chatEmbedding = aggregate.chatEmbedding;
-    node.pca3d = aggregate.pca3d;
-
-    for (const child of node.children.values()) {
-        annotateSemanticFields(child, chatIndex, semanticContext, aggregateCache);
+        node.clusterLabel = aggregate.clusterLabel;
+        node.chatEmbedding = aggregate.chatEmbedding;
+        node.pca3d = aggregate.pca3d;
+        for (const child of node.children.values()) stack.push(child);
     }
 }
 
@@ -320,36 +325,50 @@ function computePcaRanges(nodes) {
 }
 
 /**
- * Recursively assign y0/y1 to each node.
+ * Iteratively assign y0/y1 to each node.
  * Children divide the parent's vertical span proportionally by chat count.
  * Sort: active-chat child first, then by weight descending.
  */
-function computeLayout(node, y0, y1, activeChatFile) {
-    node.y0 = y0;
-    node.y1 = y1;
+function computeLayout(root, y0, y1, activeChatFile, previousNode = null) {
+    const stack = [{ node: root, y0, y1, previousNode }];
+    while (stack.length) {
+        const { node, y0, y1, previousNode } = stack.pop();
+        node.y0 = y0;
+        node.y1 = y1;
 
-    if (node.children.size === 0) return;
+        if (node.children.size === 0) continue;
 
-    const children = [...node.children.values()];
+        const children = [...node.children.values()];
+        const previousOrder = new Map();
+        if (previousNode) {
+            const ordered = [...previousNode.children.values()].sort((a, b) => a.y0 - b.y0);
+            ordered.forEach((child, i) => previousOrder.set(`${child.role}:${child.normalizedText}`, i));
+        }
 
-    // Sort: active path first, then by chat count descending
-    children.sort((a, b) => {
-        const aActive = activeChatFile && a.chatFiles.includes(activeChatFile) ? 1 : 0;
-        const bActive = activeChatFile && b.chatFiles.includes(activeChatFile) ? 1 : 0;
-        if (aActive !== bActive) return bActive - aActive;
-        return b.chatFiles.length - a.chatFiles.length;
-    });
+        // Keep existing branches in place during refreshes and chat switches. New
+        // branches follow them; the initial layout still prioritizes the active chat.
+        children.sort((a, b) => {
+            const aOrder = previousOrder.get(`${a.role}:${a.normalizedText}`) ?? Infinity;
+            const bOrder = previousOrder.get(`${b.role}:${b.normalizedText}`) ?? Infinity;
+            if (aOrder !== bOrder) return aOrder - bOrder;
+            const aActive = activeChatFile && a.chatFiles.includes(activeChatFile) ? 1 : 0;
+            const bActive = activeChatFile && b.chatFiles.includes(activeChatFile) ? 1 : 0;
+            if (aActive !== bActive) return bActive - aActive;
+            return b.chatFiles.length - a.chatFiles.length;
+        });
 
-    const totalChats = children.reduce((sum, c) => sum + c.chatFiles.length, 0);
-    if (totalChats === 0) return;
-    const span = y1 - y0;
-    let cursor = y0;
+        const totalChats = children.reduce((sum, c) => sum + c.chatFiles.length, 0);
+        if (totalChats === 0) continue;
+        const span = y1 - y0;
+        let cursor = y0;
 
-    for (const child of children) {
-        const proportion = child.chatFiles.length / totalChats;
-        const childSpan = span * proportion;
-        computeLayout(child, cursor, cursor + childSpan, activeChatFile);
-        cursor += childSpan;
+        for (const child of children) {
+            const proportion = child.chatFiles.length / totalChats;
+            const childSpan = span * proportion;
+            const previousChild = previousNode?.children.get(`${child.role}:${child.normalizedText}`);
+            stack.push({ node: child, y0: cursor, y1: cursor + childSpan, previousNode: previousChild });
+            cursor += childSpan;
+        }
     }
 }
 
@@ -357,16 +376,14 @@ function computeLayout(node, y0, y1, activeChatFile) {
  * Pre-order traversal producing a flat array.
  * Skips the virtual root (depth -1).
  */
-function flattenTrie(node, out) {
-    if (node.depth >= 0) {
-        out.push(node);
-    }
-    // Iterate children in sorted order (Map preserves insertion order,
-    // but computeLayout sorted the values — re-sort for traversal)
-    const children = [...node.children.values()];
-    children.sort((a, b) => a.y0 - b.y0);
-    for (const child of children) {
-        flattenTrie(child, out);
+function flattenTrie(root, out) {
+    const stack = [root];
+    while (stack.length) {
+        const node = stack.pop();
+        if (node.depth >= 0) out.push(node);
+        const children = [...node.children.values()].sort((a, b) => a.y0 - b.y0);
+        // Reverse the push order to retain pre-order traversal in screen order.
+        for (let i = children.length - 1; i >= 0; i--) stack.push(children[i]);
     }
 }
 
@@ -376,10 +393,11 @@ function flattenTrie(node, out) {
  *
  * @param {TrieNode} node - subtree root to explore
  * @param {string|null} activeChatFile
+ * @param {{ preserveOrder?: boolean }} [options]
  * @returns {{ flatNodes: Array, maxDepth: number, depthOffset: number }}
  */
-export function reLayoutSubtree(node, activeChatFile) {
-    computeLayout(node, 0, 1, activeChatFile);
+export function reLayoutSubtree(node, activeChatFile, { preserveOrder = false } = {}) {
+    computeLayout(node, 0, 1, activeChatFile, preserveOrder ? node : null);
     const flatNodes = [];
     flattenTrie(node, flatNodes);
     let maxDepth = node.depth;

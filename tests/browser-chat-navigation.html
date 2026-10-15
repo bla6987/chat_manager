@@ -1,0 +1,216 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta http-equiv="Content-Security-Policy" content="connect-src 'none'">
+<title>Chat navigation browser regression checks</title>
+<style>
+body { margin:24px; background:#18212b; color:#e4e9ee; font:15px system-ui; }
+button { padding:8px 14px; }
+pre { white-space:pre-wrap; }
+#chat { height:240px; width:min(700px, 100%); overflow-y:auto; overflow-anchor:none; outline:1px solid #718096; }
+.mes { box-sizing:border-box; height:80px; padding:16px; background:#253446; }
+.mes:nth-child(even) { background:#2c3e52; }
+</style>
+<h1>Chat navigation checks</h1>
+<p>Uses synthetic messages, in-memory saves, and a real scrolling chat container. Server and provider requests are blocked.</p>
+<button id="run">Run checks</button>
+<pre id="results" role="status">Ready.</pre>
+<div id="chat" aria-label="Synthetic chat"></div>
+<script type="module">
+import { navigateToChat } from '../src/chat-navigation.js';
+
+const results = document.getElementById('results');
+const run = document.getElementById('run');
+const chat = document.getElementById('chat');
+const nativeScrollTo = chat.scrollTo.bind(chat);
+const clone = value => JSON.parse(JSON.stringify(value));
+const frame = () => new Promise(resolve => requestAnimationFrame(resolve));
+const events = [];
+let context;
+let disk;
+let blockedRequests = 0;
+let passCount = 0;
+
+// Both the CSP and this guard make an accidental un-injected request fail.
+window.fetch = async () => { blockedRequests++; throw Error('Browser fixture blocked a real network request'); };
+chat.scrollTo = options => {
+    events.push({ type:'scroll', chat:context.chatId, from:chat.scrollTop, top:options.top, behavior:options.behavior });
+    nativeScrollTo(options);
+};
+
+function assert(condition, label) {
+    if (!condition) throw Error(label);
+    passCount++;
+    results.textContent += `PASS ${label}\n`;
+}
+
+function deferred() {
+    let resolve;
+    const promise = new Promise(r => { resolve = r; });
+    return { promise, resolve };
+}
+
+async function bounded(promise, label) {
+    let timer;
+    try {
+        return await Promise.race([promise, new Promise((_, reject) => {
+            timer = setTimeout(() => reject(Error(`Timed out: ${label}`)), 4000);
+        })]);
+    } finally { clearTimeout(timer); }
+}
+
+function messages(label) {
+    return Array.from({length:20}, (_, index) => ({mes:`${label} message ${index}`, is_user:index % 2 === 0}));
+}
+
+function element(index) {
+    const el = document.createElement('div');
+    el.className = 'mes';
+    el.setAttribute('mesid', index);
+    el.textContent = context.chat[index].mes;
+    return el;
+}
+
+function render(firstId = 10) {
+    const fragment = document.createDocumentFragment();
+    for (let i = firstId; i < context.chat.length; i++) fragment.appendChild(element(i));
+    chat.replaceChildren(fragment);
+    nativeScrollTo({top:0, behavior:'instant'});
+}
+
+function seed() {
+    events.length = 0;
+    context = {
+        characterId:0, groupId:null, chatId:'source',
+        characters:[{avatar:'navigation-fixture.png', name:'Synthetic character'}],
+        chatMetadata:{integrity:'synthetic-source'}, chat:messages('unsaved source'),
+        getRequestHeaders:() => ({'Content-Type':'application/json'}),
+        saveChat:async () => {
+            events.push({type:'save', chat:context.chatId});
+            disk.set(context.chatId, [{chat_metadata:clone(context.chatMetadata)}, ...clone(context.chat)]);
+        },
+        openCharacterChat:async filename => {
+            events.push({type:'open', chat:filename});
+            context.chatId = filename;
+            const saved = disk.get(filename) || [{chat_metadata:{integrity:`synthetic-${filename}`}}, ...messages(filename)];
+            context.chatMetadata = clone(saved[0].chat_metadata);
+            context.chat = clone(saved.slice(1));
+            render();
+        },
+    };
+    disk = new Map([['source', [{chat_metadata:clone(context.chatMetadata)}, ...messages('older disk source')]]]);
+    render();
+}
+
+async function loadEarlierMessages(count) {
+    events.push({type:'load', chat:context.chatId, count});
+    const firstId = Number(chat.querySelector('.mes')?.getAttribute('mesid') ?? context.chat.length);
+    const fragment = document.createDocumentFragment();
+    for (let i = Math.max(0, firstId - count); i < firstId; i++) fragment.appendChild(element(i));
+    const previousHeight = chat.scrollHeight;
+    const previousTop = chat.scrollTop;
+    chat.prepend(fragment);
+    // Model the host's restoration of the visible content when its Show more
+    // control is in view. The subsequent navigation must actually scroll.
+    nativeScrollTo({top:previousTop + chat.scrollHeight - previousHeight, behavior:'instant'});
+}
+
+function options(overrides = {}) {
+    return {
+        getContext:() => context,
+        document,
+        fetch:async (url, init) => {
+            if (url !== '/api/chats/get') throw Error(`Unexpected synthetic endpoint: ${url}`);
+            if (init.cache !== 'no-store') throw Error('Read-back must bypass caches');
+            const request = JSON.parse(init.body);
+            if (request.avatar_url !== 'navigation-fixture.png') throw Error('Wrong synthetic character');
+            events.push({type:'verify', chat:request.file_name});
+            return {ok:true, json:async () => clone(disk.get(request.file_name) || [])};
+        },
+        loadEarlierMessages,
+        onError:error => events.push({type:'error', message:error.message}),
+        ...overrides,
+    };
+}
+
+async function waitForScroll(top) {
+    const start = performance.now();
+    let settledFrames = 0;
+    while (performance.now() - start < 3000) {
+        await frame();
+        settledFrames = Math.abs(chat.scrollTop - top) <= 1 ? settledFrames + 1 : 0;
+        if (settledFrames >= 3) return;
+    }
+    throw Error(`Smooth scroll did not reach ${top}; actual ${chat.scrollTop}`);
+}
+
+run.onclick = async () => {
+    run.disabled = true;
+    passCount = 0;
+    results.textContent = '';
+    results.dataset.status = 'running';
+    window.navigationFixtureResult = {status:'running'};
+    try {
+        seed();
+        context.saveChat = async () => events.push({type:'save absorbed failure'});
+        const failed = await bounded(navigateToChat('other', 1, options()), 'failed-save check');
+        assert(failed === false && context.chatId === 'source', 'failed save keeps the source chat active');
+        assert(context.chat[0].mes === 'unsaved source message 0' && !events.some(event => event.type === 'open'), 'failed save preserves unsaved messages and never opens a target');
+
+        seed();
+        const loading = deferred();
+        const started = deferred();
+        const serializedOptions = options({loadEarlierMessages:async count => {
+            if (context.chatId === 'first') { started.resolve(); await loading.promise; }
+            await loadEarlierMessages(count);
+        }});
+        const first = navigateToChat('first', 1, serializedOptions);
+        await bounded(started.promise, 'first truncated-message load');
+        assert(!chat.querySelector('.mes[mesid="1"]'), 'the first jump waits for an initially truncated message');
+        const second = navigateToChat('second', 3, serializedOptions);
+        await frame();
+        assert(!events.some(event => event.type === 'open' && event.chat === 'second'), 'a second jump waits for the complete first load and scroll');
+        loading.resolve();
+        assert(await bounded(first, 'first jump') && await bounded(second, 'second jump'), 'both serialized jumps finish successfully');
+        const firstScroll = events.findIndex(event => event.type === 'scroll' && event.chat === 'first');
+        const secondOpen = events.findIndex(event => event.type === 'open' && event.chat === 'second');
+        assert(firstScroll >= 0 && firstScroll < secondOpen, 'the first scroll happens before the second chat opens');
+        assert(events.some(event => event.type === 'load' && event.chat === 'second' && event.count === 7), 'the second jump also loads its initially truncated message');
+        const finalScroll = events.filter(event => event.type === 'scroll').at(-1);
+        await waitForScroll(finalScroll.top);
+        const target = chat.querySelector('.mes[mesid="3"]');
+        assert(context.chatId === 'second' && target?.textContent === 'second message 3', 'the final active chat and rendered target are the second request');
+        assert(finalScroll.behavior === 'smooth' && finalScroll.from > finalScroll.top + 1
+            && Math.abs(target.getBoundingClientRect().top - chat.getBoundingClientRect().top) <= 1, 'real smooth scrolling moves and aligns the requested message with the chat viewport');
+
+        seed();
+        const staleLoading = deferred();
+        const staleStarted = deferred();
+        const stale = navigateToChat('source', 1, options({loadEarlierMessages:async () => {
+            staleStarted.resolve(); await staleLoading.promise;
+        }}));
+        await bounded(staleStarted.promise, 'external-switch load');
+        context.chatId = 'external';
+        context.chatMetadata = {integrity:'synthetic-external'};
+        context.chat = messages('external');
+        render(0);
+        nativeScrollTo({top:130, behavior:'instant'});
+        const externalPosition = chat.scrollTop;
+        staleLoading.resolve();
+        assert(await bounded(stale, 'stale jump') === false, 'an external chat change cancels the old jump');
+        await frame(); await frame();
+        assert(!events.some(event => event.type === 'scroll') && Math.abs(chat.scrollTop - externalPosition) <= 1, 'the stale jump does not scroll the new chat DOM');
+        assert(blockedRequests === 0, 'all requests and earlier-message loading used injected synthetic dependencies');
+
+        results.textContent += `COMPLETE: ${passCount} checks passed.\n`;
+        results.dataset.status = 'passed';
+        window.navigationFixtureResult = {status:'passed', passCount, blockedRequests, events:clone(events)};
+    } catch (error) {
+        results.textContent += `FAIL ${error.stack || error}\n`;
+        results.dataset.status = 'failed';
+        window.navigationFixtureResult = {status:'failed', passCount, blockedRequests, error:String(error), events:clone(events)};
+        console.error(error);
+    } finally { run.disabled = false; }
+};
+</script>
+</html>

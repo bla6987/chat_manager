@@ -1,0 +1,97 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<title>Chat Manager semantic view regressions</title>
+<link rel="stylesheet" href="../style.css">
+<style>
+body { margin:24px; background:#18212b; color:#e4e9ee; font:15px system-ui; }
+.fixture { width:600px; height:400px; position:relative; margin:16px 0; overflow:hidden; }
+pre { white-space:pre-wrap; }
+</style>
+<h1>Semantic view regression checks</h1>
+<p>Uses generated messages, an in-memory cache, and mocked embedding responses. Makes no provider requests.</p>
+<button id="run">Run checks</button><pre id="results">Ready.</pre>
+<div id="map" class="fixture"></div><div id="graph" class="fixture"></div>
+<script type="module">
+import { clearIndex, getIndex, setMessageEmbedding } from '../src/chat-reader.js';
+import { mountSemanticMap, updateSemanticMapData, unmountSemanticMap } from '../src/semantic-map-view.js';
+import { mountGraphView, updateGraphViewData, unmountGraphView } from '../src/graph-view.js';
+const cache = new Map();
+const context = {
+    characterId:0, characters:[{avatar:'semantic-fixture.png'}], saveSettingsDebounced(){},
+    extensionSettings:{chat_manager:{embeddings:{enabled:true,provider:'ollama',model:'synthetic',
+        ollamaUrl:'http://synthetic.invalid',dimensions:2,embeddingLevels:{chat:false,message:false,query:true}}}},
+};
+window.SillyTavern = {getContext:()=>context,libs:{
+    DOMPurify:{sanitize:value=>value},
+    localforage:{createInstance:()=>({
+        getItem:async key=>cache.get(key)??null,
+        setItem:async(key,value)=>{cache.set(key,value);return value;},
+        clear:async()=>cache.clear(),keys:async()=>[...cache.keys()],
+    })},
+}};
+window.toastr={warning(){},error(){}};
+const results=document.getElementById('results'), map=document.getElementById('map'), graph=document.getElementById('graph');
+const pause=ms=>new Promise(resolve=>setTimeout(resolve,ms));
+function assert(value,label){if(!value)throw Error(label);results.textContent+=`PASS ${label}\n`;}
+function seed(){
+    const entry={isLoaded:true,messages:[{index:0,text:'opposed vector',role:'assistant',swipeId:0}],messageEmbeddings:new Map()};
+    setMessageEmbedding(entry,0,0,[-1,0]);getIndex()['fixture.jsonl']=entry;
+}
+function wheel(canvas){const event=new WheelEvent('wheel',{deltaY:100,clientX:100,clientY:100,cancelable:true});canvas.dispatchEvent(event);return event.defaultPrevented;}
+document.getElementById('run').onclick=async()=>{
+    const NativeWorker=window.Worker, originalFetch=window.fetch, errors=[];
+    const capture=event=>{errors.push(event.error||event.message);event.preventDefault();};
+    results.textContent='';document.getElementById('run').disabled=true;
+    window.addEventListener('error',capture);
+    try{
+        clearIndex();cache.clear();
+        window.fetch=async(url,options)=>{
+            if(!String(url).startsWith('http://synthetic.invalid/'))throw Error(`Unexpected network request: ${url}`);
+            const body=JSON.parse(options.body),inputs=Array.isArray(body.input)?body.input:[body.input];
+            return {ok:true,text:async()=>JSON.stringify({embeddings:inputs.map(()=>[1,0])})};
+        };
+        class DeferredWorker{
+            constructor(){this.sent=[];DeferredWorker.last=this;}
+            postMessage(message){this.sent.push(message);}
+            terminate(){}
+            deliver(message){this.onmessage({data:message});}
+        }
+        window.Worker=DeferredWorker;
+        await mountSemanticMap(map);await mountGraphView(graph);
+        assert(map.querySelector('canvas').width===600&&graph.querySelector('canvas').width===600,'empty mounts size real canvases');
+        assert(wheel(map.querySelector('canvas'))&&wheel(graph.querySelector('canvas')),'empty mounts bind wheel controls');
+        seed();await updateSemanticMapData();updateGraphViewData();
+        const worker=DeferredWorker.last,build=worker.sent.find(message=>message.type==='buildMapData');
+        worker.deliver({type:'mapDataReady',jobId:build.jobId,points2dBuffer:new Float32Array([0,0]).buffer,
+            labelsBuffer:new Uint16Array([0]).buffer,centroids2dBuffer:new Float32Array([0,0]).buffer,
+            clusterSizesBuffer:new Uint32Array([1]).buffer,bounds:{minX:-1,maxX:1,minY:-1,maxY:1}});
+        const query=map.querySelector('.chat-manager-semantic-map-query');query.value='synthetic query';
+        [...map.querySelectorAll('button')].find(button=>button.textContent==='Search').click();
+        for(let i=0;i<100&&!worker.sent.some(message=>message.type==='scoreQuery');i++)await pause(10);
+        const score=worker.sent.find(message=>message.type==='scoreQuery');assert(score,'query submits mocked worker score');
+        [...map.querySelectorAll('button')].find(button=>button.textContent==='Clear').click();
+        worker.deliver({type:'queryScoresReady',jobId:score.jobId,scoresBuffer:new Float32Array([1]).buffer,min:1,max:1});
+        assert(!map.querySelector('.chat-manager-semantic-map-info').textContent.startsWith('Scored'),'Clear rejects late score response');
+        const pinQuery=graph.querySelector('.chat-manager-graph-view-query');pinQuery.value='synthetic anchor';
+        graph.querySelector('.chat-manager-graph-view-btn').click();
+        for(let i=0;i<100&&!graph.querySelector('.chat-manager-graph-view-info').textContent.includes('1 pin');i++)await pause(10);
+        assert(graph.querySelector('.chat-manager-graph-view-info').textContent.includes('1 pin'),'graph pins mocked vector against negative-cosine message');
+        for(let i=0;i<30;i++)wheel(graph.querySelector('canvas'));
+        await pause(100);
+        assert(errors.length===0,'negative cosine renders through real Canvas at dot zoom without exceptions');
+        unmountSemanticMap();unmountGraphView();window.Worker=NativeWorker;
+        const realWorker=new NativeWorker(new URL('../src/semantic-map-worker.js',import.meta.url),{type:'module'});
+        try{
+            const ready=new Promise((resolve,reject)=>{realWorker.onmessage=event=>event.data.type==='mapDataReady'?resolve(event.data):reject(Error(event.data.message));realWorker.onerror=reject;});
+            const vectors=new Float32Array([0,-2,-1,0,-2,1,0,2,-1,0,2,1]);
+            realWorker.postMessage({type:'buildMapData',jobId:1,dims:3,vectorsFlatBuffer:vectors.buffer,fixedK:2},[vectors.buffer]);
+            const built=await ready,points=new Float32Array(built.points2dBuffer);
+            assert(new Set(Array.from({length:4},(_,i)=>`${points[i*2]},${points[i*2+1]}`)).size===4,'real worker preserves variance with constant first coordinate');
+        }finally{realWorker.terminate();}
+        results.textContent+='ALL BROWSER CHECKS PASSED';
+    }catch(error){results.textContent+=`FAIL ${error.stack}`;}
+    finally{window.Worker=NativeWorker;window.fetch=originalFetch;window.removeEventListener('error',capture);unmountSemanticMap();unmountGraphView();clearIndex();document.getElementById('run').disabled=false;}
+};
+</script>
+</html>

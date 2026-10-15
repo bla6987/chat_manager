@@ -11,7 +11,7 @@
  */
 
 import { getIndex, getMessageEmbedding, getMessageActiveSwipeIndex } from './chat-reader.js';
-import { embedText, isEmbeddingConfigured } from './embedding-service.js';
+import { embedText, isEmbeddingConfigured, getEmbeddingRecipeKey } from './embedding-service.js';
 import { clusterColor, cosineSimilarity } from './semantic-engine.js';
 import { getDisplayName, getEmbeddingSettings } from './metadata-store.js';
 import { selectTopStable } from './view-efficiency-utils.js';
@@ -111,6 +111,9 @@ let messageNorms = [];    // precomputed L2 norms
 /** @type {PinNode[]} */
 let pins = [];
 let nextColorIndex = 0;
+let pinEpoch = 0;
+const pendingTermPins = new Map();
+let embeddingRecipeKey = null;
 
 /* ── Simulation Nodes ── */
 
@@ -189,6 +192,8 @@ export function setGraphScope(provider) {
 
 export async function mountGraphView(containerEl) {
     if (mounted) unmountGraphView();
+    pinEpoch += 1;
+    embeddingRecipeKey = getEmbeddingRecipeKey(getEmbeddingSettings());
 
     container = containerEl;
     container.innerHTML = '';
@@ -196,6 +201,10 @@ export async function mountGraphView(containerEl) {
 
     createCanvas();
     createOverlay();
+    mounted = true;
+    bindEvents();
+    bindResizeObserver();
+    resizeCanvas();
     showLoading('Preparing graph view…');
 
     collectMessageVectors();
@@ -211,13 +220,12 @@ export async function mountGraphView(containerEl) {
     mounted = true;
     setInfo(`${messageRefs.length.toLocaleString()} messages available · Pin a search term to begin`);
 
-    bindEvents();
-    bindResizeObserver();
-    resizeCanvas();
     queueRender();
 }
 
 export function unmountGraphView() {
+    pinEpoch += 1;
+    pendingTermPins.clear();
     if (rafId) {
         cancelAnimationFrame(rafId);
         rafId = null;
@@ -267,6 +275,7 @@ export function unmountGraphView() {
 
 export function updateGraphViewData() {
     if (!mounted || !container) return;
+    synchronizeEmbeddingRecipe();
     const prevRefs = messageRefs;
     const prevVectors = messageVectors;
     const prevNorms = messageNorms;
@@ -305,7 +314,28 @@ export function updateGraphViewData() {
     queueRender();
 }
 
+/** Clear all retained vectors, including hydration fallbacks and term pins. */
+export function invalidateGraphEmbeddings() {
+    embeddingRecipeKey = getEmbeddingRecipeKey(getEmbeddingSettings());
+    messageRefs = [];
+    messageVectors = [];
+    messageNorms = [];
+    messageDims = 0;
+    clearGraphDataState();
+    hideLoading();
+    showEmpty('No message embeddings found. Generate message embeddings first.');
+    updatePinInfo();
+}
+
+function synchronizeEmbeddingRecipe() {
+    const current = getEmbeddingRecipeKey(getEmbeddingSettings());
+    if (embeddingRecipeKey !== current) invalidateGraphEmbeddings();
+    return current;
+}
+
 function clearGraphDataState() {
+    pinEpoch += 1;
+    pendingTermPins.clear();
     pins = [];
     nextColorIndex = 0;
     simNodes = [];
@@ -407,13 +437,24 @@ function isPinVectorCompatible(pin) {
     return true;
 }
 
+function messageKey(ref) {
+    return JSON.stringify([ref.fileName, ref.msgIndex, ref.swipeIndex]);
+}
+
+function pinKey(pin) {
+    return pin.kind === 'message' ? `message:${pin.messageKey}` : `term:${pin.label.toLowerCase()}`;
+}
+
 /* ══════════════════════════════════════════════
    Pin Management
    ══════════════════════════════════════════════ */
 
 async function addSearchTermPin(query) {
+    if (!mounted) return;
+    const recipeKey = synchronizeEmbeddingRecipe();
+    query = (query || '').trim();
     if (!query || query.length < MIN_QUERY_CHARS) return;
-    if (pins.length >= MAX_PINS) {
+    if (pins.length + pendingTermPins.size >= MAX_PINS) {
         setInfo(`Maximum ${MAX_PINS} pins reached. Remove a pin first.`);
         return;
     }
@@ -424,7 +465,7 @@ async function addSearchTermPin(query) {
 
     // Check for duplicate term pins
     const lowerQuery = query.toLowerCase().trim();
-    if (pins.some(p => p.kind === 'term' && p.label.toLowerCase() === lowerQuery)) {
+    if (pendingTermPins.has(lowerQuery) || pins.some(p => p.kind === 'term' && p.label.toLowerCase() === lowerQuery)) {
         setInfo(`"${truncate(query, 30)}" is already pinned.`);
         return;
     }
@@ -432,13 +473,30 @@ async function addSearchTermPin(query) {
     setInfo(`Embedding "${truncate(query, 30)}"…`);
 
     let vector;
+    const epoch = pinEpoch;
+    const reservation = {};
+    pendingTermPins.set(lowerQuery, reservation);
     try {
         vector = await embedText(query, { level: 'query' });
     } catch (err) {
+        if (recipeKey !== getEmbeddingRecipeKey(getEmbeddingSettings())) {
+            synchronizeEmbeddingRecipe();
+            return;
+        }
+        if (!mounted || epoch !== pinEpoch) return;
         console.warn(`[${MODULE_NAME}] Failed to embed search term:`, err);
         setInfo('Failed to embed search term.');
         return;
+    } finally {
+        if (pendingTermPins.get(lowerQuery) === reservation) pendingTermPins.delete(lowerQuery);
     }
+
+    if (recipeKey !== getEmbeddingRecipeKey(getEmbeddingSettings())) {
+        synchronizeEmbeddingRecipe();
+        return;
+    }
+    if (!mounted || epoch !== pinEpoch || pins.length >= MAX_PINS) return;
+    if (pins.some(p => p.kind === 'term' && p.label.toLowerCase() === lowerQuery)) return;
 
     if (!Array.isArray(vector) || vector.length === 0) {
         setInfo('Embedding returned empty vector.');
@@ -472,8 +530,10 @@ async function addSearchTermPin(query) {
 }
 
 function addMessagePin(msgRefIndex) {
+    if (!mounted) return;
+    synchronizeEmbeddingRecipe();
     if (msgRefIndex < 0 || msgRefIndex >= messageRefs.length) return;
-    if (pins.length >= MAX_PINS) {
+    if (pins.length + pendingTermPins.size >= MAX_PINS) {
         setInfo(`Maximum ${MAX_PINS} pins reached. Remove a pin first.`);
         return;
     }
@@ -497,6 +557,7 @@ function addMessagePin(msgRefIndex) {
         y: Math.sin(angle) * radius,
         fixed: true,
         msgRefIndex,
+        messageKey: messageKey(ref),
     };
 
     pins.push(pin);
@@ -525,6 +586,8 @@ function removePin(pinIndex) {
 }
 
 function clearAllPins() {
+    pinEpoch += 1;
+    pendingTermPins.clear();
     pins = [];
     nextColorIndex = 0;
     simNodes = [];
@@ -558,8 +621,23 @@ function updatePinInfo() {
    ══════════════════════════════════════════════ */
 
 function rebuildSimulation() {
+    container?.querySelector?.('.chat-manager-graph-view-context')?.remove();
+    const refIndices = pins.some(pin => pin.kind === 'message')
+        ? new Map(messageRefs.map((ref, index) => [messageKey(ref), index]))
+        : null;
+    pins = pins.filter(pin => {
+        if (pin.kind !== 'message') return true;
+        const index = refIndices.get(pin.messageKey);
+        if (index === undefined) return false;
+        pin.msgRefIndex = index;
+        pin.vector = messageVectors[index];
+        pin.vectorNorm = messageNorms[index];
+        pin.label = truncate(messageRefs[index].text, LABEL_MAX_CHARS);
+        return true;
+    });
     if (pins.length === 0) {
         simNodes = [];
+        simRunning = false;
         queueRender();
         return;
     }
@@ -581,6 +659,7 @@ function rebuildSimulation() {
             msgRefIndex: pin.msgRefIndex,
             label: pin.label,
             kind: pin.kind,
+            key: `pin:${pinKey(pin)}`,
         });
     }
 
@@ -650,12 +729,32 @@ function rebuildSimulation() {
                 msgRefIndex: s.msgIndex,
                 label: truncate(ref.text, LABEL_MAX_CHARS),
                 kind: 'message',
+                key: `neighbor:${messageKey(ref)}`,
             });
         }
     }
 
+    const previous = new Map(simNodes.map(node => [node.key, node]));
+    let changed = nodes.length !== simNodes.length;
+    for (const node of nodes) {
+        const old = previous.get(node.key);
+        if (!old) {
+            changed = true;
+            continue;
+        }
+        if (old.pinIndex !== node.pinIndex || old.similarity !== node.similarity || old.label !== node.label) changed = true;
+        if (!node.isPin) {
+            node.x = old.x;
+            node.y = old.y;
+            node.vx = old.vx;
+            node.vy = old.vy;
+        }
+    }
     simNodes = nodes;
-    settleCounter = 0;
+    hoveredNodeIndex = -1;
+    selectedNodeIndex = -1;
+    if (nodes.length === pins.length) simRunning = false;
+    else if (changed && mounted) startSimulation();
 }
 
 function vectorNorm(vector) {
@@ -889,7 +988,7 @@ function drawEdges() {
         const pinNode = simNodes[node.pinIndex];
         if (!pinNode) continue;
 
-        const alpha = 0.06 + node.similarity * 0.14;
+        const alpha = 0.06 + clamp01(node.similarity) * 0.14;
         const color = PALETTE[node.colorIndex % PALETTE.length];
         ctx.strokeStyle = hexToRgba(color, alpha);
 
@@ -920,11 +1019,12 @@ function drawNeighborNodes() {
         if (node.isPin) continue;
 
         const color = PALETTE[node.colorIndex % PALETTE.length];
-        const alpha = 0.3 + node.similarity * 0.55;
+        const similarity = clamp01(node.similarity);
+        const alpha = 0.3 + similarity * 0.55;
 
         // Dots (fade out as text fades in)
         if (drawDots) {
-            const radius = NEIGHBOR_MIN_RADIUS + node.similarity * (NEIGHBOR_MAX_RADIUS - NEIGHBOR_MIN_RADIUS);
+            const radius = NEIGHBOR_MIN_RADIUS + similarity * (NEIGHBOR_MAX_RADIUS - NEIGHBOR_MIN_RADIUS);
             ctx.fillStyle = hexToRgba(color, alpha * (1 - textBlend));
             ctx.beginPath();
             ctx.arc(node.x, node.y, radius, 0, Math.PI * 2);
@@ -1006,7 +1106,7 @@ function drawNodeHighlight(index) {
     }
 
     // Circle highlight (pins and zoomed-out neighbor dots)
-    const radius = node.isPin ? PIN_RADIUS + 4 : NEIGHBOR_MIN_RADIUS + node.similarity * (NEIGHBOR_MAX_RADIUS - NEIGHBOR_MIN_RADIUS) + 3;
+    const radius = node.isPin ? PIN_RADIUS + 4 : NEIGHBOR_MIN_RADIUS + clamp01(node.similarity) * (NEIGHBOR_MAX_RADIUS - NEIGHBOR_MIN_RADIUS) + 3;
 
     ctx.strokeStyle = hexToRgba(color, 0.7);
     ctx.lineWidth = 2 / camera.zoom;
@@ -1033,6 +1133,7 @@ function drawTooltip(index) {
         text = `Pin: "${node.label}"`;
     } else if (node.msgRefIndex != null && node.msgRefIndex >= 0) {
         const ref = messageRefs[node.msgRefIndex];
+        if (!ref) return;
         const roleBadge = ref.role === 'user' ? 'User' : 'AI';
         const simPct = (node.similarity * 100).toFixed(1);
         const swipeBadge = ref.isActiveSwipe ? 'Active' : `Alt #${Number(ref.swipeIndex) + 1}`;
@@ -1598,5 +1699,5 @@ function hideEmpty() {
 }
 
 function clamp01(v) {
-    return v < 0 ? 0 : v > 1 ? 1 : v;
+    return Number.isFinite(v) ? Math.max(0, Math.min(1, v)) : 0;
 }

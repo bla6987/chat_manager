@@ -1,0 +1,6 @@
+03c5de5edfbbbaab2a0ade80903b1f2dd0b266eea7458e86a625307d787469f7  /private/tmp/chat-manager-memory-test/baseline/index.js
+4eecf24d688564e22ebe5572dbaa065ac987b42167ca4c6f10022c9e0bae8e95  /private/tmp/chat-manager-memory-test/baseline/src/ui-controller.js
+9440e56b7a87d78f3f938e3a1d86cc55ab26f9d51b7196d44ab16afcb4efe8c0  /private/tmp/chat-manager-memory-test/baseline/src/embedding-service.js
+a1a8f5a54337bf46046aaede4436535ee086415440b783612d7a54bb4118f508  index.js
+ab603e79b2d5bf03ffe0d945eb1e2b5a51facbde34c5a9239418a436a35cb449  src/ui-controller.js
+59a526271c5628f15be180b9ea755c75907351a3c0ede4024f09d35d5d32d8c3  src/embedding-service.js

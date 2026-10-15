@@ -1,0 +1,65 @@
+Parent browser validation — October 14, 2026, America/New_York
+Codex in-app browser, localhost:8770, Cache-Control: no-store.
+All fixtures use synthetic messages. Provider responses and chat persistence
+are mocked; Canvas, scrolling, DOM events, and native Workers are real browser APIs.
+
+tests/browser-branch-navigation.html — 11 checks passed
+PASS empty cold mount keeps a canvas ready for hydration
+PASS hydration clears the empty state
+PASS refresh preserves every rendered pixel after scrolling and zooming
+PASS active search refresh does not animate back to its first match
+PASS focused message opens its navigation popup
+PASS background refresh keeps the open popup usable
+PASS wheel zoom stays inside the explored thread
+PASS explored thread keeps its layout during refresh
+PASS explicit focus outside Explore reveals the target
+PASS explicit focus widens a current-thread filter hiding the loaded target
+PASS loaded target hidden by the old filter receives its focus popup
+
+tests/browser-view-efficiency.html — 17 checks passed
+PASS initial map submits one build
+PASS refresh burst stays coalesced while build is active
+PASS settled build collects and submits exactly one latest refresh
+PASS completed map exposes its matching message snapshot
+PASS replacement submits one build
+PASS old mapping remains active while replacement builds
+PASS replacement mapping is hidden until matching points arrive
+PASS message mapping switches atomically with replacement points
+PASS failed replacement submits a build
+PASS latest recovery waits behind the failing build
+PASS worker error retains the last completed mapping
+PASS queued latest refresh starts after worker build error
+PASS recovery publishes only its matching mapping
+PASS second refresh burst waits behind its active build
+PASS unmount discards queued refresh without another vector snapshot
+PASS async icicle mount cannot remount after unmount
+PASS real semantic worker builds projected points
+
+tests/browser-semantic-regressions.html — 7 checks passed
+PASS empty mounts size real canvases
+PASS empty mounts bind wheel controls
+PASS query submits mocked worker score
+PASS Clear rejects late score response
+PASS graph pins mocked vector against negative-cosine message
+PASS negative cosine renders through real Canvas at dot zoom without exceptions
+PASS real worker preserves variance with constant first coordinate
+
+tests/browser-chat-navigation.html — 12 checks passed
+PASS failed save keeps the source chat active
+PASS failed save preserves unsaved messages and never opens a target
+PASS the first jump waits for an initially truncated message
+PASS a second jump waits for the complete first load and scroll
+PASS both serialized jumps finish successfully
+PASS the first scroll happens before the second chat opens
+PASS the second jump also loads its initially truncated message
+PASS the final active chat and rendered target are the second request
+PASS real smooth scrolling moves and aligns the requested message with the chat viewport
+PASS an external chat change cancels the old jump
+PASS the stale jump does not scroll the new chat DOM
+PASS all requests and earlier-message loading used injected synthetic dependencies
+
+TOTAL: 47 passed, 0 failed.
+
+The initial default Python server allowed cached modules from a previous run;
+the final runs above used a fresh origin and no-store headers. A stale-module
+startup error observed on the old origin did not reproduce with fresh source.

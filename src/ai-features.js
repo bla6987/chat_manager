@@ -142,37 +142,33 @@ let profileLock = Promise.resolve();
 /**
  * Execute `fn` under the configured AI connection profile.
  * Switches to the target profile before calling fn, and restores the original afterward.
- * If no AI profile is configured, or it's already active, calls fn directly.
- * Uses a serialization lock to prevent concurrent profile switches.
+ * All calls join the same queue, including calls using the current profile.
+ * This also protects the shared quiet-prompt injection until cleanup finishes.
  * @param {() => Promise<T>} fn
  * @returns {Promise<T>}
  * @template T
  */
 async function withAIProfile(fn) {
     const targetId = getAIConnectionProfile();
-    if (!targetId) return fn();
-
-    const context = SillyTavern.getContext();
-    const cmProfiles = context.extensionSettings?.connectionManager?.profiles;
-    if (!Array.isArray(cmProfiles) || cmProfiles.length === 0) return fn();
-
-    const targetProfile = cmProfiles.find(p => p.id === targetId);
-    if (!targetProfile) {
-        console.warn(`[${MODULE_NAME}] AI profile "${targetId}" not found, using current connection`);
-        return fn();
-    }
-
-    // Check if target is already the selected profile
-    const selectedProfileId = context.extensionSettings?.connectionManager?.selectedProfile;
-    if (selectedProfileId === targetId) return fn();
-
-    // Serialize through the lock to prevent interleaving
     const ticket = profileLock;
     let release;
     profileLock = new Promise(resolve => { release = resolve; });
 
     try {
         await ticket;
+        // Read ownership after acquiring the queue, not while another call is
+        // temporarily using the configured AI profile.
+        const context = SillyTavern.getContext();
+        const cmProfiles = context.extensionSettings?.connectionManager?.profiles;
+        if (!targetId || !Array.isArray(cmProfiles) || cmProfiles.length === 0) return await fn();
+
+        const targetProfile = cmProfiles.find(p => p.id === targetId);
+        if (!targetProfile) {
+            console.warn(`[${MODULE_NAME}] AI profile "${targetId}" not found, using current connection`);
+            return await fn();
+        }
+        const selectedProfileId = context.extensionSettings?.connectionManager?.selectedProfile;
+        if (selectedProfileId === targetId) return await fn();
         return await switchAndRun(targetProfile, selectedProfileId, cmProfiles, fn);
     } finally {
         release();
@@ -220,13 +216,18 @@ async function switchAndRun(targetProfile, originalProfileId, cmProfiles, fn) {
     try {
         return await fn();
     } finally {
-        // Restore the original profile
+        // A user selection during generation takes ownership of the connection.
+        // Restore only while our temporary profile remains selected.
         try {
-            const originalProfile = originalProfileId
-                ? cmProfiles.find(p => p.id === originalProfileId)
-                : null;
-            const restoreName = originalProfile ? originalProfile.name : NO_CONNECTION_PROFILE;
-            await selectConnectionProfile(context, restoreName);
+            const current = SillyTavern.getContext();
+            if (current.extensionSettings?.connectionManager?.selectedProfile === targetProfile.id) {
+                const profiles = current.extensionSettings?.connectionManager?.profiles || cmProfiles;
+                const originalProfile = originalProfileId
+                    ? profiles.find(p => p.id === originalProfileId)
+                    : null;
+                const restoreName = originalProfile ? originalProfile.name : NO_CONNECTION_PROFILE;
+                await selectConnectionProfile(current, restoreName);
+            }
         } catch (err) {
             console.warn(`[${MODULE_NAME}] Failed to restore original profile:`, err);
         }
@@ -285,12 +286,13 @@ export async function generateTitleForActiveChat() {
  * @returns {Promise<string|null>}
  */
 export async function generateTitleForChat(messages, characterName) {
+    const sourceMessages = messages.slice(-15).map(message => ({ role: message.role, text: message.text }));
     return withAIProfile(async () => {
         if (!requireLLM()) return null;
 
         const context = SillyTavern.getContext();
 
-        const messageContext = messages.slice(-15).map(m =>
+        const messageContext = sourceMessages.map(m =>
             `${m.role === 'user' ? 'User' : characterName}: ${m.text}`,
         ).join('\n');
 
@@ -372,14 +374,15 @@ export async function generateSummaryForActiveChat() {
  * @returns {Promise<string|null>}
  */
 export async function generateSummaryForChat(messages, characterName, branchPoint = null, branchContextText = '') {
+    const windowSize = 30;
+    const windowStart = Math.max(0, messages.length - windowSize);
+    const sourceMessages = messages.slice(-windowSize).map(message => ({ role: message.role, text: message.text }));
     return withAIProfile(async () => {
         if (!requireLLM()) return null;
 
         const context = SillyTavern.getContext();
 
-        const windowSize = 30;
-        const windowStart = Math.max(0, messages.length - windowSize);
-        const recentMsgs = messages.slice(-windowSize);
+        const recentMsgs = sourceMessages;
 
         let messageContext;
         let branchHint = '';

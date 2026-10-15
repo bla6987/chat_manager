@@ -3,6 +3,8 @@ import assert from 'node:assert/strict';
 import { getIndex, clearIndex, updateActiveChat, ensureMessageEmbeddingMap, setMessageEmbedding, getMessageEmbedding } from '../src/chat-reader.js';
 import { getEmbeddingSettings, setEmbeddingSettings, getFilterState, setFilterState, getDisplayName, getSummary, getChatTags, getSelectedEmbeddingChats, setSelectedEmbeddingChats, isEmbeddingChatSelected, setEmbeddingChatSelected } from '../src/metadata-store.js';
 
+globalThis.fetch = async () => { throw new Error('Unexpected provider request in cache-only performance test.'); };
+
 function setup() {
     clearIndex();
     const context = {
@@ -137,7 +139,7 @@ test('settings reads reuse normalized data; writes and replacement settings rema
 
 test('incremental generation reads only the new message from persistent cache', async () => {
     const context = setup();
-    const { hashEmbeddingText } = await import('../src/embedding-service.js');
+    const { hashEmbeddingText, getEmbeddingRecipeKey } = await import('../src/embedding-service.js');
     const { generateEmbeddingsForCurrentIndex } = await import('../src/ui-controller.js');
     setEmbeddingSettings({ enabled: true, provider: 'ollama', model: 'synthetic', dimensions: 2, embeddingLevels: { chat: true, message: true, query: false } });
     context.extensionSettings.chat_manager.metadata['synthetic.png'] = { 'synthetic.jsonl': { summary: 'Stable summary' } };
@@ -149,7 +151,9 @@ test('incremental generation reads only the new message from persistent cache', 
     context.chat = [...messages.map(msg => raw(msg.text)), raw('new message')];
     await updateActiveChat(chat.fileName);
     const reads = [];
-    const cacheEntries = new Map([[hashEmbeddingText('new message'), { text: 'new message', vector: [0, 1], dims: 2, provider: 'ollama', model: 'synthetic' }]]);
+    const recipeKey = getEmbeddingRecipeKey(getEmbeddingSettings());
+    const cacheKey = text => `${hashEmbeddingText(recipeKey)}:${hashEmbeddingText(text)}`;
+    const cacheEntries = new Map([[cacheKey('new message'), { text: 'new message', vector: [0, 1], dims: 2, provider: 'ollama', model: 'synthetic', recipeKey }]]);
     globalThis.SillyTavern.libs = { localforage: { createInstance: () => ({
         async getItem(key) {
             reads.push(key);
@@ -176,7 +180,7 @@ test('incremental generation reads only the new message from persistent cache', 
     getIndex()[inactive.fileName] = inactive;
     for (let i = 5000 - 256; i < 5000; i++) {
         const text = `large ${i}`;
-        cacheEntries.set(hashEmbeddingText(text), { text, vector: [1, i], dims: 2, provider: 'ollama', model: 'synthetic' });
+        cacheEntries.set(cacheKey(text), { text, vector: [1, i], dims: 2, provider: 'ollama', model: 'synthetic', recipeKey });
     }
     reads.length = 0;
     const { getAutomaticEmbeddingRunOptions } = await import('../src/ui-controller.js');

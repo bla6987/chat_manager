@@ -3,7 +3,7 @@
  */
 
 import { getIndex, getMessageEmbedding, getMessageActiveSwipeIndex } from './chat-reader.js';
-import { embedText, isEmbeddingConfigured } from './embedding-service.js';
+import { embedText, isEmbeddingConfigured, getEmbeddingRecipeKey } from './embedding-service.js';
 import { clusterColor } from './semantic-engine.js';
 import { getDisplayName, getEmbeddingSettings, setEmbeddingSettings } from './metadata-store.js';
 
@@ -72,6 +72,7 @@ let scoreMin = 0;
 let scoreMax = 0;
 let queryText = '';
 let queryVectorCache = new Map();
+let embeddingRecipeKey = null;
 
 let activePointIndex = -1;
 let hoveredPointIndex = -1;
@@ -142,6 +143,7 @@ export async function mountSemanticMap(containerEl, mode = 'mini') {
     if (mounted) {
         unmountSemanticMap();
     }
+    embeddingRecipeKey = getEmbeddingRecipeKey(getEmbeddingSettings());
 
     container = containerEl;
     container.innerHTML = '';
@@ -149,6 +151,9 @@ export async function mountSemanticMap(containerEl, mode = 'mini') {
 
     createCanvas();
     createOverlay();
+    mounted = true;
+    bindEvents();
+    resizeCanvas();
     showLoading('Preparing semantic map…');
 
     if (!ensureWorker()) {
@@ -170,14 +175,13 @@ export async function mountSemanticMap(containerEl, mode = 'mini') {
     setInfo(`Building map for ${data.count.toLocaleString()} messages…`);
     queueBuild(data);
 
-    bindEvents();
-    resizeCanvas();
     queueRender();
 
     void mode; // reserved for future full-screen tuning
 }
 
 export function unmountSemanticMap() {
+    workerScoreJobId += 1;
     if (rafId) {
         cancelAnimationFrame(rafId);
         rafId = null;
@@ -245,6 +249,7 @@ export function unmountSemanticMap() {
 
 export async function updateSemanticMapData() {
     if (!mounted || !container) return;
+    synchronizeEmbeddingRecipe();
 
     if (!worker && !ensureWorker()) {
         hideLoading();
@@ -301,6 +306,30 @@ export function focusMessageInSemanticMap(filename, msgIndex, options = {}) {
     return tryApplyPendingFocus();
 }
 
+/** Discard vectors and pending work even when the caller suppresses rerendering. */
+export function invalidateSemanticMapEmbeddings() {
+    embeddingRecipeKey = getEmbeddingRecipeKey(getEmbeddingSettings());
+    workerBuildJobId += 1;
+    worker?.terminate();
+    worker = null;
+    workerBuildInFlight = false;
+    workerBuildPending = false;
+    pendingBuildSnapshot = null;
+    queryVectorCache.clear();
+    queryText = '';
+    if (queryInputEl) queryInputEl.value = '';
+    clearMapDataState();
+    hideLoading();
+    showEmpty('No message embeddings found. Generate message embeddings to use Semantic Map.');
+    setInfo('0 points');
+}
+
+function synchronizeEmbeddingRecipe() {
+    const current = getEmbeddingRecipeKey(getEmbeddingSettings());
+    if (embeddingRecipeKey !== current) invalidateSemanticMapEmbeddings();
+    return current;
+}
+
 function ensureWorker() {
     if (worker) return true;
     try {
@@ -310,7 +339,11 @@ function ensureWorker() {
         return false;
     }
 
+    const currentWorker = worker;
     worker.onmessage = (event) => {
+        if (!mounted || worker !== currentWorker) return;
+        synchronizeEmbeddingRecipe();
+        if (worker !== currentWorker) return;
         const msg = event.data || {};
         if (msg.type === 'mapDataReady') {
             if (msg.jobId !== workerBuildJobId) return;
@@ -349,6 +382,7 @@ function ensureWorker() {
     };
 
     worker.onerror = (err) => {
+        if (!mounted || worker !== currentWorker) return;
         console.warn(`[${MODULE_NAME}] Semantic worker crashed:`, err);
         setInfo('Semantic map worker crashed.');
         worker?.terminate();
@@ -538,6 +572,7 @@ function handleQueryScoresReady(msg) {
 }
 
 function clearMapDataState() {
+    workerScoreJobId += 1;
     messageRefs = [];
     messageLookup = new Map();
     dims = 0;
@@ -791,6 +826,7 @@ function bindOverlayEvents() {
     });
 
     clearBtnEl?.addEventListener('click', () => {
+        workerScoreJobId += 1;
         queryText = '';
         if (queryInputEl) queryInputEl.value = '';
         scoreValues = null;
@@ -834,7 +870,9 @@ function bindOverlayEvents() {
 
 async function runSemanticQuery(query) {
     if (!mounted) return;
+    const recipeKey = synchronizeEmbeddingRecipe();
     const requestedQuery = (query || '').trim();
+    const jobId = ++workerScoreJobId;
     queryText = requestedQuery;
 
     if (requestedQuery.length < MIN_QUERY_CHARS) {
@@ -863,6 +901,11 @@ async function runSemanticQuery(query) {
         try {
             queryVector = await embedText(requestedQuery, { level: 'query' });
         } catch (err) {
+            if (recipeKey !== getEmbeddingRecipeKey(getEmbeddingSettings())) {
+                synchronizeEmbeddingRecipe();
+                return;
+            }
+            if (!mounted || jobId !== workerScoreJobId) return;
             console.warn(`[${MODULE_NAME}] Failed to embed map query:`, err);
             scoreValues = null;
             scoreMin = 0;
@@ -873,7 +916,11 @@ async function runSemanticQuery(query) {
             return;
         }
 
-        if (queryText !== requestedQuery) {
+        if (recipeKey !== getEmbeddingRecipeKey(getEmbeddingSettings())) {
+            synchronizeEmbeddingRecipe();
+            return;
+        }
+        if (!mounted || jobId !== workerScoreJobId) {
             return;
         }
 
@@ -884,7 +931,7 @@ async function runSemanticQuery(query) {
         }
     }
 
-    if (queryText !== requestedQuery) {
+    if (!mounted || jobId !== workerScoreJobId) {
         return;
     }
 
@@ -897,8 +944,6 @@ async function runSemanticQuery(query) {
         return;
     }
 
-    workerScoreJobId += 1;
-    const jobId = workerScoreJobId;
     setInfo(`Scoring "${requestedQuery}"…`);
     worker.postMessage({
         type: 'scoreQuery',
@@ -1229,11 +1274,11 @@ function hitTestPoint(px, py) {
     if (getPointCount() === 0) return -1;
 
     const world = screenToWorld(px, py);
-    const thresholdWorld = Math.max(
-        (camera.w / Math.max(1, canvasWidth)) * 10,
-        (camera.h / Math.max(1, canvasHeight)) * 10,
-    );
-    const thresholdSq = thresholdWorld * thresholdWorld;
+    const scaleX = Math.max(1, canvasWidth) / camera.w;
+    const scaleY = Math.max(1, canvasHeight) / camera.h;
+    const radiusX = 10 / scaleX;
+    const radiusY = 10 / scaleY;
+    const thresholdSq = 100;
 
     const tx = clamp01((world.x - gridIndex.minX) / gridIndex.spanX);
     const ty = clamp01((world.y - gridIndex.minY) / gridIndex.spanY);
@@ -1243,17 +1288,15 @@ function hitTestPoint(px, py) {
     let best = -1;
     let bestDist = Infinity;
 
-    for (let oy = -1; oy <= 1; oy++) {
-        const y = gy + oy;
-        if (y < 0 || y >= gridIndex.rows) continue;
-        for (let ox = -1; ox <= 1; ox++) {
-            const x = gx + ox;
-            if (x < 0 || x >= gridIndex.cols) continue;
+    const radiusCols = Math.ceil(radiusX / gridIndex.spanX * gridIndex.cols);
+    const radiusRows = Math.ceil(radiusY / gridIndex.spanY * gridIndex.rows);
+    for (let y = Math.max(0, gy - radiusRows); y <= Math.min(gridIndex.rows - 1, gy + radiusRows); y++) {
+        for (let x = Math.max(0, gx - radiusCols); x <= Math.min(gridIndex.cols - 1, gx + radiusCols); x++) {
 
             const bucket = gridIndex.buckets[(y * gridIndex.cols) + x];
             for (const idx of bucket) {
-                const dx = points2d[idx * 2] - world.x;
-                const dy = points2d[(idx * 2) + 1] - world.y;
+                const dx = (points2d[idx * 2] - world.x) * scaleX;
+                const dy = (points2d[(idx * 2) + 1] - world.y) * scaleY;
                 const dist = (dx * dx) + (dy * dy);
                 if (dist < bestDist && dist <= thresholdSq) {
                     best = idx;

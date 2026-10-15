@@ -3,6 +3,8 @@
  * No DOM dependencies. Reads from chat index, caches results keyed by indexVersion.
  */
 
+import { timestampMs } from './timestamps.js';
+
 let cachedStats = null;
 let cachedStatsVersion = -1;
 let cachedHeatmap = null;
@@ -10,8 +12,7 @@ let cachedHeatmapVersion = -1;
 
 function normalizeTimestampMs(value) {
     if (value === null || value === undefined || value === '') return null;
-    const parsed = new Date(value).getTime();
-    return Number.isFinite(parsed) ? parsed : null;
+    return timestampMs(value);
 }
 
 function resolveComparableTimestamp(rawValue, cachedMs) {
@@ -48,7 +49,7 @@ export function computeStats(chatIndex, indexVersion) {
         totalMessages += entry.messageCount;
 
         if (entry.isLoaded) {
-            loadedChats++;
+            if (!entry.needsHydration) loadedChats++;
             for (const msg of entry.messages) {
                 if (msg.role === 'user') userMessages++;
                 else assistantMessages++;
@@ -67,13 +68,13 @@ export function computeStats(chatIndex, indexVersion) {
         const firstMs = resolveComparableTimestamp(entry.firstMessageTimestamp, entry.firstTimestampMs);
         if (firstMs !== null && (oldestMs === null || firstMs < oldestMs)) {
             oldestMs = firstMs;
-            oldestTs = entry.firstMessageTimestamp ?? firstMs;
+            oldestTs = firstMs;
         }
 
         const lastMs = resolveComparableTimestamp(entry.lastMessageTimestamp, entry.lastTimestampMs);
         if (lastMs !== null && (newestMs === null || lastMs > newestMs)) {
             newestMs = lastMs;
-            newestTs = entry.lastMessageTimestamp ?? lastMs;
+            newestTs = lastMs;
         }
     }
 
@@ -118,12 +119,13 @@ export function computeHeatmapData(chatIndex, indexVersion) {
 
     for (const entry of Object.values(chatIndex)) {
         if (!entry.isLoaded) continue;
-        loadedCount++;
+        if (!entry.needsHydration) loadedCount++;
 
         for (const msg of entry.messages) {
-            if (!msg.timestamp) continue;
-            const d = new Date(msg.timestamp);
-            if (isNaN(d.getTime())) continue;
+            if (msg.timestamp === null || msg.timestamp === undefined || msg.timestamp === '') continue;
+            const ms = Number.isFinite(msg.timestampMs) ? msg.timestampMs : timestampMs(msg.timestamp);
+            if (ms === null) continue;
+            const d = new Date(ms);
 
             const dateKey = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
 

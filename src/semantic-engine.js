@@ -339,6 +339,33 @@ function vectorNorm(vector) {
     return Math.sqrt(dot(vector, vector));
 }
 
+/** Choose a non-null covariance direction after removing existing components. */
+function pcaSeed(centered, dims, components) {
+    const variances = new Float64Array(dims);
+    for (const row of centered) {
+        const projections = components.map(component => dot(row, component));
+        for (let d = 0; d < dims; d++) {
+            let residual = row[d];
+            for (let c = 0; c < components.length; c++) residual -= projections[c] * components[c][d];
+            variances[d] += residual * residual;
+        }
+    }
+    let seed = 0;
+    for (let d = 1; d < dims; d++) {
+        if (variances[d] > variances[seed]) seed = d;
+    }
+    if (variances[seed] / Math.max(1, centered.length - 1) <= EPSILON) return null;
+    const vector = new Array(dims).fill(0);
+    vector[seed] = 1;
+    for (const component of components) {
+        const projection = dot(vector, component);
+        for (let d = 0; d < dims; d++) vector[d] -= projection * component[d];
+    }
+    const length = vectorNorm(vector);
+    if (!Number.isFinite(length) || length <= EPSILON) return null;
+    return vector.map(value => value / length);
+}
+
 /**
  * PCA projection to 3 dimensions using covariance + power iteration.
  * @param {number[][]} vectors
@@ -402,9 +429,8 @@ export function pca3D(vectors) {
     const components = [];
 
     for (let c = 0; c < componentCount; c++) {
-        const init = new Array(dims).fill(0);
-        init[c % dims] = 1;
-        let v = init;
+        let v = pcaSeed(centered, dims, components);
+        if (!v) break;
 
         for (let iter = 0; iter < POWER_ITER_MAX; iter++) {
             let w = matrixVectorMultiply(cov, v);
@@ -718,9 +744,8 @@ export async function pca3DAsync(vectors) {
     const components = [];
 
     for (let c = 0; c < componentCount; c++) {
-        const init = new Array(dims).fill(0);
-        init[c % dims] = 1;
-        let v = init;
+        let v = pcaSeed(centered, dims, components);
+        if (!v) break;
 
         for (let iter = 0; iter < POWER_ITER_MAX; iter++) {
             if (iter > 0 && iter % YIELD_INTERVAL === 0) {

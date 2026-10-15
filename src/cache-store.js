@@ -4,7 +4,9 @@
  */
 
 const DB_NAME = 'chat_manager_cache';
-const DB_VERSION = 1;
+// Version 2 discards records whose message IDs included the JSONL header.
+const DB_VERSION = 2;
+const CACHE_FORMAT_VERSION = 2;
 const STORE_NAME = 'chats';
 const READ_BATCH_SIZE = 50;
 
@@ -26,6 +28,9 @@ function openDB() {
 
         request.onupgradeneeded = (event) => {
             const database = event.target.result;
+            if (event.oldVersion < 2 && database.objectStoreNames.contains(STORE_NAME)) {
+                database.deleteObjectStore(STORE_NAME);
+            }
             if (!database.objectStoreNames.contains(STORE_NAME)) {
                 const store = database.createObjectStore(STORE_NAME, { keyPath: 'key' });
                 store.createIndex('avatar', 'avatar', { unique: false });
@@ -34,6 +39,7 @@ function openDB() {
 
         request.onsuccess = (event) => {
             db = event.target.result;
+            db.onversionchange = () => { db.close(); db = null; dbPromise = null; };
             resolve(db);
         };
 
@@ -41,6 +47,12 @@ function openDB() {
             dbPromise = null; // allow retry on failure
             console.error('[chat_manager] Failed to open IndexedDB:', event.target.error);
             reject(event.target.error);
+        };
+        request.onblocked = () => {
+            // An older tab may hold v1 open without a versionchange handler.
+            // Continue with server hydration instead of hanging the index build.
+            dbPromise = null;
+            reject(new Error('Chat cache upgrade is blocked by another tab'));
         };
     });
 
@@ -77,11 +89,12 @@ export async function getCachedChatsForCharacter(avatar, fileNames) {
                     const request = store.get(makeKey(avatar, fileName));
                     request.onsuccess = () => {
                         const entry = request.result;
-                        if (entry) result.set(fileName, entry);
+                        if (entry?.cacheFormatVersion === CACHE_FORMAT_VERSION) result.set(fileName, entry);
                     };
                 }
                 tx.oncomplete = resolve;
                 tx.onerror = resolve;
+                tx.onabort = resolve;
             });
         }
         return result;
@@ -114,6 +127,7 @@ export function putCachedChats(avatar, chats) {
             if (!fileName || !entry) continue;
             store.put({
                 key: makeKey(avatar, fileName),
+                cacheFormatVersion: CACHE_FORMAT_VERSION,
                 avatar,
                 fileName,
                 lastModified: entry.lastModified,
@@ -122,6 +136,9 @@ export function putCachedChats(avatar, chats) {
                 firstMessageTimestamp: entry.firstMessageTimestamp,
                 lastMessageTimestamp: entry.lastMessageTimestamp,
                 sortTimestamp: entry.sortTimestamp,
+                validatedAt: entry.validatedAt,
+                serverSignature: entry.serverSignature,
+                mainChat: entry.mainChat,
             });
         }
     }).catch(() => {

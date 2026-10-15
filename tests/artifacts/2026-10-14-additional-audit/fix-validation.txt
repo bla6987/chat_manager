@@ -1,0 +1,269 @@
+✔ background refresh preserves the viewport and remaps zoom breadcrumbs (10.41125ms)
+✔ scrolling and dragging during an asynchronous rebuild use the latest viewport (1.6185ms)
+✔ newly hydrated branches keep the viewed message at the same screen position and size (1.335917ms)
+✔ switching active threads does not reorder existing branches or recenter the chart (2.646ms)
+✔ exploring a subtree survives refresh and wheel zoom without a delayed coordinate reset (2.442916ms)
+✔ refreshing search results retains the selected match without starting a pan animation (0.76175ms)
+✔ late semantic search results cannot move the view after the user scrolls (0.493541ms)
+✔ wheel and explicit navigation stop older touch momentum (0.341708ms)
+✔ queued refreshes coalesce and a completed build cannot revive an unmounted view (1.627917ms)
+✔ explicit reset requests survive a queued background refresh (6.520542ms)
+✔ a chat switch during a build discards the obsolete snapshot and rebuilds for the latest chat (0.584958ms)
+✔ CHAT_CHANGED finishes while archive refresh is still pending (0.468625ms)
+[chat_manager] Navigation stopped: Error: The saved chat does not match the current messages. Navigation was stopped to preserve your edits.
+    at saveAndVerify (file:///Users/macbookpro/projects/extensions/sillytavern/chat_manager/src/chat-navigation.js:60:15)
+    at async file:///Users/macbookpro/projects/extensions/sillytavern/chat_manager/src/chat-navigation.js:122:13
+[chat_manager] Navigation stopped: Error: The saved chat does not match the current messages. Navigation was stopped to preserve your edits.
+    at saveAndVerify (file:///Users/macbookpro/projects/extensions/sillytavern/chat_manager/src/chat-navigation.js:60:15)
+    at async file:///Users/macbookpro/projects/extensions/sillytavern/chat_manager/src/chat-navigation.js:122:13
+[chat_manager] Navigation stopped: Error: The saved chat could not be verified.
+    at saveAndVerify (file:///Users/macbookpro/projects/extensions/sillytavern/chat_manager/src/chat-navigation.js:54:29)
+    at async file:///Users/macbookpro/projects/extensions/sillytavern/chat_manager/src/chat-navigation.js:122:13
+[chat_manager] Navigation stopped: Error: The saved chat does not match the current messages. Navigation was stopped to preserve your edits.
+    at saveAndVerify (file:///Users/macbookpro/projects/extensions/sillytavern/chat_manager/src/chat-navigation.js:60:15)
+    at async file:///Users/macbookpro/projects/extensions/sillytavern/chat_manager/src/chat-navigation.js:122:13
+[chat_manager] Navigation stopped: Error: The saved chat does not match the current messages. Navigation was stopped to preserve your edits.
+    at saveAndVerify (file:///Users/macbookpro/projects/extensions/sillytavern/chat_manager/src/chat-navigation.js:60:15)
+    at async file:///Users/macbookpro/projects/extensions/sillytavern/chat_manager/src/chat-navigation.js:122:13
+[chat_manager] Navigation stopped: Error: The active character or chat changed during navigation.
+    at checkIdentity (file:///Users/macbookpro/projects/extensions/sillytavern/chat_manager/src/chat-navigation.js:21:15)
+    at saveAndVerify (file:///Users/macbookpro/projects/extensions/sillytavern/chat_manager/src/chat-navigation.js:44:5)
+    at async file:///Users/macbookpro/projects/extensions/sillytavern/chat_manager/src/chat-navigation.js:122:13
+[chat_manager] Navigation stopped: Error: The active character or chat changed during navigation.
+    at checkIdentity (file:///Users/macbookpro/projects/extensions/sillytavern/chat_manager/src/chat-navigation.js:21:15)
+    at saveAndVerify (file:///Users/macbookpro/projects/extensions/sillytavern/chat_manager/src/chat-navigation.js:44:5)
+    at async file:///Users/macbookpro/projects/extensions/sillytavern/chat_manager/src/chat-navigation.js:122:13
+[chat_manager] Navigation stopped: Error: The selected character changed before navigation started.
+    at file:///Users/macbookpro/projects/extensions/sillytavern/chat_manager/src/chat-navigation.js:117:63
+[chat_manager] Navigation stopped: Error: The chat changed while it was being saved. Please try again.
+    at saveAndVerify (file:///Users/macbookpro/projects/extensions/sillytavern/chat_manager/src/chat-navigation.js:45:56)
+    at async file:///Users/macbookpro/projects/extensions/sillytavern/chat_manager/src/chat-navigation.js:122:13
+[chat_manager] Navigation stopped: Error: The chat changed during save verification. Please try again.
+    at saveAndVerify (file:///Users/macbookpro/projects/extensions/sillytavern/chat_manager/src/chat-navigation.js:57:56)
+    at async file:///Users/macbookpro/projects/extensions/sillytavern/chat_manager/src/chat-navigation.js:122:13
+[chat_manager] Navigation stopped: Error: The active character or chat changed during navigation.
+    at checkIdentity (file:///Users/macbookpro/projects/extensions/sillytavern/chat_manager/src/chat-navigation.js:21:15)
+    at scrollToMessage (file:///Users/macbookpro/projects/extensions/sillytavern/chat_manager/src/chat-navigation.js:81:9)
+    at async file:///Users/macbookpro/projects/extensions/sillytavern/chat_manager/src/chat-navigation.js:131:13
+[chat_manager] Navigation stopped: Error: The active character or chat changed during navigation.
+    at checkIdentity (file:///Users/macbookpro/projects/extensions/sillytavern/chat_manager/src/chat-navigation.js:21:15)
+    at file:///Users/macbookpro/projects/extensions/sillytavern/chat_manager/src/chat-navigation.js:130:13
+[chat_manager] Navigation stopped: Error: The active character or chat changed during navigation.
+    at checkIdentity (file:///Users/macbookpro/projects/extensions/sillytavern/chat_manager/src/chat-navigation.js:21:15)
+    at file:///Users/macbookpro/projects/extensions/sillytavern/chat_manager/src/chat-navigation.js:125:13
+[chat_manager] Navigation stopped: Error: The target message changed while it was being rendered. Please try again.
+    at scrollToMessage (file:///Users/macbookpro/projects/extensions/sillytavern/chat_manager/src/chat-navigation.js:90:15)
+    at async file:///Users/macbookpro/projects/extensions/sillytavern/chat_manager/src/chat-navigation.js:131:13
+[chat_manager] Navigation stopped: Error: A target chat filename is required.
+    at file:///Users/macbookpro/projects/extensions/sillytavern/chat_manager/src/chat-navigation.js:114:69
+[chat_manager] Navigation stopped: Error: The message index is invalid.
+    at file:///Users/macbookpro/projects/extensions/sillytavern/chat_manager/src/chat-navigation.js:115:99
+[chat_manager] Navigation stopped: Error: The message index is invalid.
+    at file:///Users/macbookpro/projects/extensions/sillytavern/chat_manager/src/chat-navigation.js:115:99
+[chat_manager] Navigation stopped: Error: save rejected
+    at f.context.saveChat (file:///Users/macbookpro/projects/extensions/sillytavern/chat_manager/tests/chat-navigation.test.mjs:220:46)
+    at saveAndVerify (file:///Users/macbookpro/projects/extensions/sillytavern/chat_manager/src/chat-navigation.js:43:19)
+    at file:///Users/macbookpro/projects/extensions/sillytavern/chat_manager/src/chat-navigation.js:122:19
+[chat_manager] Navigation stopped: Error: That message no longer exists in the target chat.
+    at scrollToMessage (file:///Users/macbookpro/projects/extensions/sillytavern/chat_manager/src/chat-navigation.js:67:57)
+    at file:///Users/macbookpro/projects/extensions/sillytavern/chat_manager/src/chat-navigation.js:131:19
+[chat_manager] Navigation stopped: Error: The target message could not be rendered.
+    at scrollToMessage (file:///Users/macbookpro/projects/extensions/sillytavern/chat_manager/src/chat-navigation.js:86:34)
+    at async file:///Users/macbookpro/projects/extensions/sillytavern/chat_manager/src/chat-navigation.js:131:13
+✔ a swallowed host save failure preserves the active unsaved chat (5.239333ms)
+✔ successful navigation verifies full saved content before open and scroll (1.389916ms)
+✔ read-back comparison includes metadata and accepts reordered object keys (2.929834ms)
+✔ failed or malformed read-back responses stop switching (0.384542ms)
+✔ the complete load and scroll finishes before another navigation starts (2.066625ms)
+✔ a character switch during saving prevents opening a same-named target for the wrong character (0.801875ms)
+✔ a queued request retains its requested character (0.267875ms)
+✔ edits during saving or read-back stop navigation instead of discarding newer content (0.593625ms)
+✔ an external chat switch during earlier-message loading cannot scroll the new chat (0.29325ms)
+✔ identity is rechecked after the UI hook and target open (4.523958ms)
+✔ message deletion during loading cannot redirect the same index to another message (0.2675ms)
+✔ failures release the queue for later navigation and invalid inputs do no work (0.46075ms)
+✔ same-chat jumps skip save and read-back, and missing messages fail safely (0.166416ms)
+[chat_manager] Hydrating 1 chats in background (1 total)
+✔ historical ST, meridiem, epoch and ISO timestamps retain host timezone semantics (3.953041ms)
+✔ local calendar boundaries use exclusive next midnight across 23/25-hour DST days (0.153625ms)
+✔ reader calendar filter matches local heatmap dates and excludes next midnight (0.95525ms)
+✔ historical hydrated timestamps participate in recency, date filters, stats and heatmaps (4.450958ms)
+✔ statistics retain last good counts while reporting pending revalidation incomplete (0.852916ms)
+✔ persistent cache isolates same model alias on different endpoints and reuses only the matching recipe (12.942583ms)
+✔ pending provider responses cannot survive model, provider, endpoint, or explicit cache invalidation (6.620166ms)
+✔ clear waits for already-issued cache writes, then removes them before resolving (2.953291ms)
+✔ one rejected cache write cannot release a clear while another issued write remains pending (1.836042ms)
+✔ unexpected dimension drift clears old vectors and permits a fresh operation with learned dimensions (3.896458ms)
+✔ dimension invalidation subscribers run after reset, ignore unsubscribe, and receive no ordinary clear events (2.314917ms)
+✔ a cache-read completion is rejected when its endpoint changes while IndexedDB is pending (1.024125ms)
+✔ transient Ollama batch errors get one bounded retry and never disable later batching (154.413625ms)
+✔ persistent transient failures stop after the retry and a later request tries batching again (155.201542ms)
+✔ explicit unsupported routes fall back only for that endpoint; a missing model does not disable batching (7.303958ms)
+✔ AI calls queue before checking the temporary selected profile and restore after each owner completes (1.2505ms)
+✔ AI cleanup preserves a user-selected profile and queued calls capture the new restoration owner (0.221042ms)
+✔ quiet title and summary share one injection owner even with no configured AI profile (0.453417ms)
+✔ queued raw AI actions snapshot source text before waiting for the profile lock (0.443333ms)
+✔ 5,000 vector insertions do not repeatedly scan the growing map (5.694375ms)
+✔ legacy migration preserves mixed maps and never lends another swipe its vector (0.141166ms)
+✔ appending to a long chat keeps unchanged vectors without copying vector arrays (16.133042ms)
+✔ edits, swipe changes, deletions, and JSONL metadata offsets retain only matching text (0.495ms)
+✔ a stable summary preserves the chat vector when new messages arrive (0.141125ms)
+✔ settings reads reuse normalized data; writes and replacement settings remain visible (1.148167ms)
+✔ incremental generation reads only the new message from persistent cache (21.612083ms)
+✔ deleting the last message uses the empty live chat and drops its vectors (0.14175ms)
+✔ automatic embedding work is bounded to active-message tails and excludes alternate swipes (0.15275ms)
+✔ generation lifecycle defers automatic timers and ignores dry runs (0.393625ms)
+✔ command-only starts and pre-request exits release real deferred embedding jobs (0.94775ms)
+✔ body lifecycle follows a delayed request and releases without terminal events (0.402834ms)
+✔ a long valid foreground generation stays deferred while the host remains busy (0.100333ms)
+[chat_manager] Response generation failed (no response received).
+[chat_manager] Response generation failed (streaming error).
+✔ actual host command-only Generate preamble returns without leaving embeddings suspended (3.625167ms)
+✔ dry runs do not suspend embeddings and manual stops cancel reconciliation (0.482625ms)
+✔ alerts require an unsuccessful termination, ignore unrelated toasts, and clean attempt timers (1.330708ms)
+✔ entry point invalidates local edits before optional display/embedding updates (0.644167ms)
+✔ branch injection refreshes the live edited snapshot with panel and embeddings off (0.293875ms)
+✔ endpoint-only settings changes invalidate in-flight work, dimensions, and live vectors (0.54725ms)
+✔ explicit reopen revalidates cached files while host chat switching keeps default refresh (0.373917ms)
+✔ settings generate action reports superseded runs without a success toast (0.470417ms)
+✔ empty cold mount recovers as hydration arrives and removes its empty overlay (6.316833ms)
+✔ focus reveals loaded targets excluded by the current-thread filter (5.006792ms)
+✔ focus requested before mount resolves even when the target begins outside the filter (1.633417ms)
+✔ pending focus survives an empty mount and hydration without widening the same thread (2.029791ms)
+✔ focus outside Explore exits the subtree and retains current-thread mode (2.219708ms)
+✔ a truly missing nonpersistent focus clears without widening or rebuilding (0.753083ms)
+✔ all trie passes and Explore handle 12000 messages with semantic fields and stable branch order (52.4845ms)
+✔ same-dimension endpoint/model recipe changes cannot reuse cached icicle query vectors (1.263625ms)
+✔ explicit embedding invalidation retires pending queries, cached vectors and held semantic fields without navigation (2.014417ms)
+✔ clearing embeddings during a data rebuild cannot republish its captured semantic fields (2.871292ms)
+✔ embedding invalidation cancels the old semantic-result animation at its current viewport (0.540542ms)
+✔ historical host timestamps retain recency ordering and format tooltips from normalized milliseconds (2.660375ms)
+[chat_manager] Hydrating 1 chats in background (1 total)
+✔ cache upgrade and format guard discard records containing legacy message IDs (4.472708ms)
+[chat_manager] Failed to fetch chat content for a.jsonl: 500
+[chat_manager] Failed to hydrate a.jsonl: Error: Failed to fetch a.jsonl (500)
+    at fetchChatContent (file:///Users/macbookpro/projects/extensions/sillytavern/chat_manager/src/chat-reader.js:273:15)
+    at async file:///Users/macbookpro/projects/extensions/sillytavern/chat_manager/src/chat-reader.js:612:28
+[chat_manager] Failed to fetch chat list: 500
+[chat_manager] Error building index: Error: Failed to fetch chat list (500)
+    at fetchChatList (file:///Users/macbookpro/projects/extensions/sillytavern/chat_manager/src/chat-reader.js:241:15)
+    at async Module.buildIndex (file:///Users/macbookpro/projects/extensions/sillytavern/chat_manager/src/chat-reader.js:769:26)
+    at async TestContext.<anonymous> (file:///Users/macbookpro/projects/extensions/sillytavern/chat_manager/tests/index-cache-regressions.test.mjs:99:27)
+    at async Test.run (node:internal/test_runner/test:1409:7)
+    at async Test.processPendingSubtests (node:internal/test_runner/test:974:7)
+[chat_manager] Failed to fetch chat content for a.jsonl: 500
+[chat_manager] Failed to hydrate a.jsonl: Error: Failed to fetch a.jsonl (500)
+    at fetchChatContent (file:///Users/macbookpro/projects/extensions/sillytavern/chat_manager/src/chat-reader.js:273:15)
+    at async file:///Users/macbookpro/projects/extensions/sillytavern/chat_manager/src/chat-reader.js:612:28
+[chat_manager] Hydrating 1 chats in background (1 total)
+✔ disk and live parsing keep host IDs, ancestry and swipe content consistent (4.081917ms)
+[chat_manager] Hydrating 1 chats in background (1 total)
+[chat_manager] Hydrating 1 chats in background (1 total)
+✔ failed cold hydration stays retryable; successful empty content is loaded (0.700583ms)
+[chat_manager] Hydrating 1 chats in background (1 total)
+✔ list failure and body revalidation failure preserve known good search content (1.262667ms)
+[chat_manager] Hydrating 1 chats in background (1 total)
+[chat_manager] Hydrating 1 chats in background (1 total)
+[chat_manager] Hydrating 1 chats in background (1 total)
+✔ successful empty archive invalidates search results and releases cached bodies (0.977875ms)
+✔ same-length earlier edits revalidate explicitly, when dirty, and after bounded reuse (1.009125ms)
+[chat_manager] Hydrating 4 chats in background (4 total)
+✔ warm cached restoration reconciles queue membership with linear work (12.425666ms)
+[chat_manager] Hydrating 1 chats in background (1 total)
+✔ prompt sibling context requires host provenance and compares message roles (1.563583ms)
+[chat_manager] Hydrating 1 chats in background (1 total)
+✔ hydration retries an older same-timestamp body after a metadata signature (0.450625ms)
+[chat_manager] Hydrating 1 chats in background (1 total)
+✔ hydration retries an older same-timestamp body after a dirty event (0.37ms)
+✔ explicit local thread deletion removes search content immediately (0.362125ms)
+[chat_manager] Error building index: Error: Invalid chat list response
+    at fetchChatList (file:///Users/macbookpro/projects/extensions/sillytavern/chat_manager/src/chat-reader.js:245:37)
+    at async Module.buildIndex (file:///Users/macbookpro/projects/extensions/sillytavern/chat_manager/src/chat-reader.js:769:26)
+    at async TestContext.<anonymous> (file:///Users/macbookpro/projects/extensions/sillytavern/chat_manager/tests/index-cache-regressions.test.mjs:219:5)
+    at async Test.run (node:internal/test_runner/test:1409:7)
+    at async Test.processPendingSubtests (node:internal/test_runner/test:974:7)
+[chat_manager] Failed to hydrate a.jsonl: Error: Invalid chat content response for a.jsonl
+    at fetchChatContent (file:///Users/macbookpro/projects/extensions/sillytavern/chat_manager/src/chat-reader.js:277:37)
+    at async file:///Users/macbookpro/projects/extensions/sillytavern/chat_manager/src/chat-reader.js:612:28
+    at async Module.loadEntryNow (file:///Users/macbookpro/projects/extensions/sillytavern/chat_manager/src/chat-reader.js:958:20)
+    at async TestContext.<anonymous> (file:///Users/macbookpro/projects/extensions/sillytavern/chat_manager/tests/index-cache-regressions.test.mjs:220:51)
+    at async Test.run (node:internal/test_runner/test:1409:7)
+    at async Test.processPendingSubtests (node:internal/test_runner/test:974:7)
+[chat_manager] Hydrating 1 chats in background (1 total)
+✔ a blocked legacy-cache upgrade falls back instead of hanging hydration (0.84925ms)
+✔ malformed successful HTTP responses cannot replace known-good bodies (0.518625ms)
+✔ unchanged active updates preserve entry identity and version while all indexed changes invalidate (2.390834ms)
+✔ branch comparisons are reused while message array identities are unchanged (0.139542ms)
+[chat_manager] Hydrating 1 chats in background (1 total)
+[chat_manager] Hydrating 1 chats in background (2 total)
+[chat_manager] Hydrating 1 chats in background (1 total)
+✔ cache batch writes share one IndexedDB transaction (1.510875ms)
+✔ cache reads use transactions of at most 50 records (0.77475ms)
+✔ cold metadata is published before delayed cached bodies finish reading (0.703083ms)
+✔ active update that lands during a cache read wins over the older build (0.641084ms)
+✔ an entry replaced during a cache read is not deleted by an older server list (0.371875ms)
+✔ a reset and newer character build win while an older cache read is pending (0.21875ms)
+✔ an internal character switch retains build ownership across a delayed list fetch (0.141583ms)
+✔ empty chat lists release build ownership for the next build (0.143708ms)
+✔ unchanged clustering reuses exact inputs and invalidates fixed-k, mutations, and replacements (35.759208ms)
+✔ bounded map batches consume only the requested iterator prefix (4.374208ms)
+✔ query embeddings coalesce by provider identity, survive failures, and ignore dimensions learned by the request (321.547166ms)
+✔ semantic aggregation ranks before allocating results and preserves dedup filename order (1.027875ms)
+✔ map initializes canvas input and sizing on empty mount before data arrives (33.098958ms)
+✔ graph initializes canvas input and sizing on empty mount before data arrives (1.527041ms)
+✔ map invalidates posted scores and embedding completions on Clear, newer query and remount (1.967ms)
+✔ graph reserves pin capacity, coalesces duplicate terms and cancels pending work on Clear/remount (2.14725ms)
+✔ message pins remap stable filename/message/swipe identity and refresh their vector (1.689375ms)
+✔ graph preserves settled positions on unchanged refresh and resumes after topology changes (0.975416ms)
+✔ negative cosine neighbors draw finite positive radii and valid alpha at dot/text zooms (1.107708ms)
+✔ worker PCA preserves varying axes with constant/diagonal coordinates and handles zero variance (1.65575ms)
+✔ map grid hit testing covers its tolerance across multiple cells and zoom levels (1.846042ms)
+✔ sync PCA recovers variance beyond constant leading coordinates (0.470333ms)
+✔ async PCA recovers variance beyond constant leading coordinates (4.851542ms)
+✔ map recipe swaps and explicit cache clear discard cached queries, worker scores and hydration fallbacks (2.011292ms)
+✔ graph endpoint changes and explicit cache clear cannot retain pending pins or old hydration vectors (0.915583ms)
+[chat_manager] Rename failed: Error: The host did not confirm the rename
+    at Object.handleRenameFile (evalmachine.<anonymous>:3983:35)
+    at async TestContext.<anonymous> (file:///Users/macbookpro/projects/extensions/sillytavern/chat_manager/tests/ui-actions-regression.test.mjs:192:5)
+    at async Test.run (node:internal/test_runner/test:1409:7)
+    at async Test.processPendingSubtests (node:internal/test_runner/test:974:7)
+✔ clearing/reverting edited titles persists the reset and replacement title has one delegated navigation handler (3.934334ms)
+✔ pending semantic response cannot overwrite clear-input (0.641417ms)
+✔ pending semantic response cannot overwrite short-direct-query (0.437916ms)
+✔ pending semantic response cannot overwrite stats (0.448625ms)
+✔ pending semantic response cannot overwrite timeline (0.45225ms)
+✔ pending semantic response cannot overwrite semantic-map (0.437042ms)
+✔ pending semantic response cannot overwrite graph (1.293458ms)
+✔ pending semantic response cannot overwrite close (0.650292ms)
+✔ handleAITitle keeps click-time messages and writes only the original character (1.081459ms)
+✔ handleRegenSummary keeps click-time messages and writes only the original character (0.559041ms)
+✔ handleAISummaryAndTitle keeps click-time messages and writes only the original character (0.457667ms)
+✔ native input rename survives dialog removal and migrates only confirmed original-character metadata (1.316792ms)
+✔ resolved host rename failure neither migrates metadata nor reports success (1.017125ms)
+✔ cancelled native input does not rename (0.382167ms)
+✔ alternate-only missing coverage queues work, stays incomplete until fulfilled, then reports full (1.046375ms)
+✔ late cached or provider embedding results never attach after clear/settings invalidation (0.81125ms)
+✔ semantic results retain the matched alternate text and render its excerpt (0.720792ms)
+✔ thread cards and timeline/search jumps use the same navigation operation with the message inside it (0.433417ms)
+✔ search-jump confirmation cannot switch an identically named thread under a newly selected character (0.326208ms)
+✔ explicit refresh forwards force revalidation to both thread and alternate-view index builds (0.840417ms)
+✔ fresh alternate work drains after a cleared in-flight flush and its already-fired timer (4.108042ms)
+✔ silent vector clear invalidates every view cache even without rerendering (0.431166ms)
+✔ dimension recovery clears old vectors and retries a foreground run once, without retrying explicit clears (0.478125ms)
+✔ historical host timestamps are normalized before card and search date formatting (1.399208ms)
+✔ archived AI and embedding actions do not consume retained bodies pending file revalidation (0.523833ms)
+✔ dimension drift first discovered by direct embedText clears UI and index vectors centrally (19.087125ms)
+✔ bounded selection matches stable descending full sort including ties (0.674292ms)
+✔ heatmap coordinate lookup rejects gaps and resolves column-major cells (0.107542ms)
+✔ icicle aggregation preserves membership, pooling, cluster ties, and active layout (5.724417ms)
+✔ semantic worker no longer allocates the unused per-iteration distance buffer (2.158584ms)
+ℹ tests 147
+ℹ suites 0
+ℹ pass 147
+ℹ fail 0
+ℹ cancelled 0
+ℹ skipped 0
+ℹ todo 0
+ℹ duration_ms 504.636084
+
+Final verification: all source and Node test syntax checks passed; git diff --check passed.

@@ -310,10 +310,11 @@ export function setSummary(fileName, summary, editedByUser = false) {
  * When a file is renamed, migrate its metadata to the new key.
  * @param {string} oldFileName
  * @param {string} newFileName
+ * @param {string} [charKey] Character avatar captured before the rename
  */
-export function migrateFileKey(oldFileName, newFileName) {
+export function migrateFileKey(oldFileName, newFileName, charKey) {
     ensureSettings();
-    const key = getCharacterKey();
+    const key = charKey || getCharacterKey();
     if (!key) return;
 
     const { extensionSettings, saveSettingsDebounced } = SillyTavern.getContext();

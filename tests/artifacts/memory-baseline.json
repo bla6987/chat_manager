@@ -1,0 +1,10 @@
+{
+  "browser":"Codex built-in browser",
+  "sillyTavernVersion":"1.18.0",
+  "url":"http://127.0.0.1:8123/",
+  "provider":"local synthetic OpenAI-compatible streaming and Ollama-compatible embeddings at127.0.0.1:8124",
+  "fixture":{"inactiveChats":20,"messagesPerChat":250,"cachedVectors":5000,"dimensions":1536},
+  "sendOnlyMissingActive":{"reads":0,"retainedVectors":0,"heapStartMiB":33.2,"heapPeakMiB":34.2,"heapEndMiB":32.7},
+  "automaticRestoreDuringNativeGeneration":{"reads":5000,"peakConcurrent":50,"readsDuringGeneration":5000,"retainedVectors":5000,"heapStartMiB":33.2,"heapPeakMiB":155.7,"heapEndMiB":147.8,"firstReadMs":53805.8,"lastReadMs":55958.9,"generationStartMs":52836.5,"generationEndMs":65149.2},
+  "limitations":"Synthetic loaded index and cache; actual host generation/message events, real IndexedDB and production extension modules. Automatic bootstrap deliberately scheduled through its production scheduler. performance.memory is browser-reported, no forced GC or whole-process RSS measurement. Not a reproduction of supplied489000-record profile."
+}

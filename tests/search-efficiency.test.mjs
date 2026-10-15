@@ -3,6 +3,8 @@ import assert from 'node:assert/strict';
 import { clearIndex, getIndex } from '../src/chat-reader.js';
 import { setEmbeddingSettings } from '../src/metadata-store.js';
 
+globalThis.fetch = async () => { throw new Error('Unexpected provider request outside a synthetic fetch fixture.'); };
+
 function setup() {
     clearIndex();
     const store = new Map();
@@ -120,9 +122,10 @@ test('query embeddings coalesce by provider identity, survive failures, and igno
         };
         const late = getSemanticQueryEmbedding('late query');
         while (!releaseLate) await new Promise(resolve => setTimeout(resolve, 1));
+        const rejectedLate = assert.rejects(late, { name: 'StaleEmbeddingOperationError' });
         clearInMemoryEmbeddings({ rerender: false });
         releaseLate({ ok: true, text: async () => JSON.stringify({ embeddings: [[4, 5, 6]] }) });
-        await late;
+        await rejectedLate;
         await store.deleteItem?.(hashEmbeddingText('late query'));
         // The fixture store exposes Map semantics through the closure; clear all
         // persistent entries so this assertion isolates the UI memory cache.

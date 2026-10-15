@@ -3,11 +3,11 @@
  * Lifecycle hooks, event listeners, UI injection.
  */
 
-import { clearIndex, getIndex, getIndexCharacterAvatar, updateActiveChat } from './src/chat-reader.js';
+import { clearIndex, getIndex, getIndexCharacterAvatar, markChatDirty, removeChatFromIndex, updateActiveChat } from './src/chat-reader.js';
 import {
     togglePanel, closePanel, refreshPanel, renderThreadCards, refreshThreadCardsAfterMessage, onSearchInput, isPanelOpen, resetSearchState,
     toggleTimeline, isTimelineActive, toggleSemanticMap, isSemanticMapActive, toggleGraphView, isGraphViewActive, toggleStats, isStatsActive, toggleBranchContext, isBranchContextActive,
-    clearInMemoryEmbeddings, generateEmbeddingsForCurrentIndex, scheduleEmbeddingBootstrap, scheduleIncrementalEmbedding, setEmbeddingGenerationActive, onEmbeddingGenerationStarted, performSearch,
+    clearInMemoryEmbeddings, generateEmbeddingsForCurrentIndex, scheduleEmbeddingBootstrap, scheduleIncrementalEmbedding, setEmbeddingGenerationActive, performSearch,
 } from './src/ui-controller.js';
 import {
     getDisplayMode, setDisplayMode, getBranchContextEnabled, getAIConnectionProfile, setAIConnectionProfile,
@@ -15,10 +15,11 @@ import {
 } from './src/metadata-store.js';
 import { updateBranchContextInjection, clearBranchContextInjection } from './src/branch-context.js';
 import { attachMomentumScroll } from './src/momentum-scroll.js';
-import { acknowledgeEmbeddingModelChange, clearEmbeddingCache, getCacheStats } from './src/embedding-service.js';
+import { acknowledgeEmbeddingModelChange, clearEmbeddingCache, getCacheStats, getEmbeddingRecipeKey, invalidateEmbeddingOperations } from './src/embedding-service.js';
 import { updateGraphViewData, isGraphViewMounted } from './src/graph-view.js';
 import { resolveActiveChatFilename } from './src/active-chat.js';
 import { initGenerationFailureAlert, primeFailureAlertAudio } from './src/generation-failure-alert.js';
+import { initEmbeddingGenerationLifecycle } from './src/generation-lifecycle.js';
 
 const MODULE_NAME = 'chat_manager';
 const EXTENSION_PATH = '/scripts/extensions/third-party/chat_manager';
@@ -53,6 +54,10 @@ function getActiveChatFile(context = null) {
 const onMessageUpdate = (() => {
     let timer = null;
     return function () {
+        const eventContext = SillyTavern.getContext();
+        const eventAvatar = eventContext.characters?.[eventContext.characterId]?.avatar;
+        const eventFile = getActiveChatFile(eventContext);
+        if (eventFile && eventAvatar === getIndexCharacterAvatar()) markChatDirty(eventFile);
         if (timer) clearTimeout(timer);
         timer = setTimeout(async () => {
             timer = null;
@@ -62,7 +67,7 @@ const onMessageUpdate = (() => {
             const embeddingGenerationEnabled = isEmbeddingGenerationEnabled();
 
             let updated = false;
-            if (activeChatFile && (isPanelOpen() || embeddingGenerationEnabled)) {
+            if (activeChatFile && (isPanelOpen() || embeddingGenerationEnabled || isBranchContextActive())) {
                 updated = await updateActiveChat(activeChatFile);
             }
 
@@ -120,13 +125,17 @@ const onMessageUpdate = (() => {
         eventSource.on(eventTypes.CHAT_CHANGED, onChatChanged);
         eventSource.on(eventTypes.MESSAGE_SENT, onMessageUpdate);
         eventSource.on(eventTypes.MESSAGE_RECEIVED, onMessageUpdate);
-        for (const name of ['MESSAGE_EDITED', 'MESSAGE_DELETED', 'MESSAGE_SWIPED']) {
+        for (const name of ['MESSAGE_EDITED', 'MESSAGE_DELETED', 'MESSAGE_SWIPED', 'MESSAGE_SWIPE_DELETED', 'MESSAGE_UPDATED', 'CHAT_CREATED']) {
             if (eventTypes[name]) eventSource.on(eventTypes[name], onMessageUpdate);
         }
-        if (eventTypes.GENERATION_STARTED) eventSource.on(eventTypes.GENERATION_STARTED, (_type, _params, isDryRun) => onEmbeddingGenerationStarted(isDryRun));
-        for (const name of ['GENERATION_ENDED', 'GENERATION_STOPPED']) {
-            if (eventTypes[name]) eventSource.on(eventTypes[name], () => setEmbeddingGenerationActive(false));
+        if (eventTypes.CHAT_DELETED) {
+            eventSource.on(eventTypes.CHAT_DELETED, fileName => {
+                const eventContext = SillyTavern.getContext();
+                const eventAvatar = eventContext.characters?.[eventContext.characterId]?.avatar;
+                if (eventAvatar && eventAvatar === getIndexCharacterAvatar()) removeChatFromIndex(fileName);
+            });
         }
+        initEmbeddingGenerationLifecycle({ eventSource, eventTypes, setActive: setEmbeddingGenerationActive, getContext: () => SillyTavern.getContext() });
 
         // Ensure the top bar toggle button exists once all extensions are ready
         if (eventTypes.APP_READY) {
@@ -289,7 +298,7 @@ async function openChatManager(event) {
     if (!ready) return false;
 
     if (isPanelOpen()) {
-        await refreshPanel();
+        await refreshPanel({ forceRevalidate: true });
     } else {
         await togglePanel();
     }
@@ -780,6 +789,7 @@ function bindEmbeddingSettingsUI(container) {
     };
 
     const persistForm = () => {
+        const previousRecipe = getEmbeddingRecipeKey(getEmbeddingSettings());
         setEmbeddingSettings({
             enabled: enabledEl.checked,
             embeddingLevels: {
@@ -799,6 +809,11 @@ function bindEmbeddingSettingsUI(container) {
             swipeBackgroundBatchSize: Number(swipeBatchEl.value) || 24,
             swipeBackgroundDelayMs: Number(swipeDelayEl.value) || 650,
         });
+        if (previousRecipe !== getEmbeddingRecipeKey(getEmbeddingSettings())) {
+            invalidateEmbeddingOperations();
+            setEmbeddingSettings({ dimensions: null });
+            clearInMemoryEmbeddings();
+        }
     };
 
     const refreshCacheStats = async () => {
@@ -837,7 +852,7 @@ function bindEmbeddingSettingsUI(container) {
 
         await acknowledgeEmbeddingModelChange(next.provider, next.model);
         if (typeof toastr !== 'undefined') {
-            toastr.warning('Provider/model changed without clearing cache. Existing embeddings may be inconsistent.');
+            toastr.info('Previous model cache retained; vectors for the current model will be generated or restored separately.');
         }
     };
 
@@ -974,6 +989,12 @@ function bindEmbeddingSettingsUI(container) {
                 onProgress: (completed, total) => setProgress(completed, total),
             });
             await refreshCacheStats();
+            if (result?.superseded) {
+                if (typeof toastr !== 'undefined') {
+                    toastr.info('Embedding settings or chat content changed. Run embeddings again to use the current data.');
+                }
+                return;
+            }
             if (typeof toastr !== 'undefined') {
                 const messagePart = Number.isFinite(result?.messageVectors) && result.messageVectors > 0
                     ? `, ${result.messageVectors} messages`
@@ -1332,7 +1353,9 @@ async function onChatChanged() {
     // If same character, keep index for incremental update
 
     if (isPanelOpen()) {
-        await refreshPanel();
+        // The host awaits CHAT_CHANGED listeners before openCharacterChat resolves.
+        // Archive indexing must not hold up rendering/jumping in the new chat.
+        void refreshPanel().catch(err => console.warn(`[${MODULE_NAME}] Panel refresh failed:`, err));
     }
 
     // Reset search input and state

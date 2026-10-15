@@ -5,10 +5,16 @@
 
 import { getCachedChatsForCharacter, putCachedChat, putCachedChats, removeCachedChat } from './cache-store.js';
 import { getRepresentativeEmbeddingText } from './embedding-text.js';
+import { timestampMs, localDateBoundary } from './timestamps.js';
+import { resolveActiveChatFilename } from './active-chat.js';
 
 const MODULE_NAME = 'chat_manager';
-const HYDRATION_BATCH_SIZE = 50;
+const HYDRATION_BATCH_SIZE = 6;
+const HYDRATION_YIELD_MS = 16;
 const FALLBACK_SORT_TIMESTAMP = 0;
+// The host list has no file revision: last_mes survives edits. Limit reuse even
+// when size/count match; explicit refreshes and local dirty events bypass this.
+const REVALIDATE_AFTER_MS = 60_000;
 
 /** @type {Object<string, ChatIndexEntry>} filename -> index entry */
 let chatIndex = {};
@@ -234,10 +240,12 @@ export async function fetchChatList() {
 
     if (!response.ok) {
         console.error(`[${MODULE_NAME}] Failed to fetch chat list:`, response.status);
-        return [];
+        throw new Error(`Failed to fetch chat list (${response.status})`);
     }
 
-    return await response.json();
+    const data = await response.json();
+    if (!Array.isArray(data)) throw new Error('Invalid chat list response');
+    return data;
 }
 
 /**
@@ -264,10 +272,12 @@ export async function fetchChatContent(fileName) {
 
     if (!response.ok) {
         console.error(`[${MODULE_NAME}] Failed to fetch chat content for ${fileName}:`, response.status);
-        return [];
+        throw new Error(`Failed to fetch ${fileName} (${response.status})`);
     }
 
-    return await response.json();
+    const data = await response.json();
+    if (!Array.isArray(data)) throw new Error(`Invalid chat content response for ${fileName}`);
+    return data;
 }
 
 /**
@@ -278,7 +288,9 @@ export async function fetchChatContent(fileName) {
  */
 function parseMessages(chatData, fileName) {
     const messages = [];
-    for (let i = 0; i < chatData.length; i++) {
+    // Disk arrays include a header; the host's live chat array does not.
+    const offset = chatData[0] && typeof chatData[0].mes !== 'string' ? 1 : 0;
+    for (let i = offset; i < chatData.length; i++) {
         const msg = chatData[i];
         // Skip metadata-only entries (no 'mes' field)
         if (!msg || typeof msg.mes !== 'string') continue;
@@ -305,10 +317,12 @@ function parseMessages(chatData, fileName) {
 
         messages.push({
             filename: fileName,
-            index: i,
+            index: i - offset,
             role: msg.is_user ? 'user' : 'assistant',
             text: msg.mes,
             timestamp: msg.send_date || '',
+            timestampMs: timestampMs(msg.send_date),
+            branches: Array.isArray(msg.extra?.branches) ? msg.extra.branches.map(canonicalFilename).filter(Boolean) : [],
             swipes: swipes || undefined,
             swipeId,
         });
@@ -386,8 +400,24 @@ function normalizeTimestamp(value) {
         return FALLBACK_SORT_TIMESTAMP;
     }
 
-    const parsed = new Date(value).getTime();
-    return Number.isFinite(parsed) ? parsed : FALLBACK_SORT_TIMESTAMP;
+    return timestampMs(value) ?? FALLBACK_SORT_TIMESTAMP;
+}
+
+function canonicalFilename(value) {
+    return typeof value === 'string' && value.trim() ? `${value.trim().replace(/\.jsonl$/i, '')}.jsonl` : null;
+}
+
+function mainChatFromData(chatData, metadata = null) {
+    return canonicalFilename(metadata?.main_chat ?? chatData[0]?.chat_metadata?.main_chat);
+}
+
+function metaSignature(meta) {
+    return JSON.stringify([meta?.file_size ?? null, getMetaMessageCount(meta)]);
+}
+
+function recentlyValidated(entry) {
+    const age = Date.now() - entry?.validatedAt;
+    return Number.isFinite(age) && age >= 0 && age < REVALIDATE_AFTER_MS;
 }
 
 function allocateInitialOrder() {
@@ -465,7 +495,7 @@ function emitHydrationUpdate() {
 
 function markEntryForHydration(fileName) {
     const entry = chatIndex[fileName];
-    if (!entry || entry.isLoaded) return;
+    if (!entry || (entry.isLoaded && !entry.needsHydration)) return;
     if (queuedFiles.has(fileName)) return;
     if (entryHydrationPromises.has(fileName)) return;
 
@@ -483,6 +513,13 @@ export function prioritizeInQueue(fileName) {
         hydrationQueue.splice(idx, 1);
         hydrationQueue.unshift(fileName);
     }
+}
+
+/** Prioritize the active and visible chats without changing their requested order. */
+export function prioritizeHydrationFiles(fileNames) {
+    if (!Array.isArray(fileNames)) return;
+    const wanted = [...new Set(fileNames.filter(Boolean))];
+    for (let i = wanted.length - 1; i >= 0; i--) prioritizeInQueue(wanted[i]);
 }
 
 function bumpIndexVersion() {
@@ -548,6 +585,7 @@ function messagesEqual(a, b) {
             || left?.role !== right?.role
             || left?.text !== right?.text
             || left?.timestamp !== right?.timestamp
+            || JSON.stringify(left?.branches || []) !== JSON.stringify(right?.branches || [])
             || getMessageActiveSwipeIndex(left) !== getMessageActiveSwipeIndex(right)) return false;
         const leftSwipes = left?.swipes;
         const rightSwipes = right?.swipes;
@@ -575,7 +613,7 @@ async function hydrateEntry(fileName, sessionId, persist = true) {
         while (sessionId === hydrationSessionId) {
             const entry = chatIndex[fileName];
             if (!entry) return false;
-            if (entry.isLoaded) return true;
+            if (entry.isLoaded && !entry.needsHydration) return true;
 
             const expectedTimestamp = entry.lastModified;
             let chatData;
@@ -592,10 +630,10 @@ async function hydrateEntry(fileName, sessionId, persist = true) {
             if (!current) return false;
             // An active-chat event may have populated the entry while the
             // network request was in flight. Its newer in-memory state wins.
-            if (current.isLoaded) return true;
+            if (current.isLoaded && !current.needsHydration) return true;
 
             // Metadata changed while this request was in flight.
-            if (current.lastModified !== expectedTimestamp) {
+            if (current !== entry || current.lastModified !== expectedTimestamp) {
                 continue;
             }
 
@@ -613,8 +651,16 @@ async function hydrateEntry(fileName, sessionId, persist = true) {
                 lastTimestampMs: normalizeTimestamp(lastTs),
                 branchPoint: null,
                 isLoaded: true,
-                messageEmbeddings: null,
+                needsHydration: false,
+                validatedAt: Date.now(),
+                mainChat: mainChatFromData(chatData),
+                messageEmbeddings: retainMessageEmbeddings(current, messages),
             };
+            if (!current.isLoaded || getRepresentativeEmbeddingText(current) !== getRepresentativeEmbeddingText(chatIndex[fileName])) {
+                chatIndex[fileName].chatEmbedding = null;
+                chatIndex[fileName].chatEmbeddingHash = null;
+                chatIndex[fileName].clusterLabel = null;
+            }
             bumpIndexVersion();
 
             if (persist && currentCharacterAvatar) {
@@ -656,11 +702,14 @@ function startHydrationLoop() {
                     const hydrated = [];
                     for (let i = 0; i < batch.length; i++) {
                         const entry = chatIndex[batch[i]];
-                        if (results[i] && entry?.isLoaded) hydrated.push({ fileName: batch[i], entry });
+                        if (results[i] && entry?.isLoaded && !entry.needsHydration) hydrated.push({ fileName: batch[i], entry });
                     }
                     putCachedChats(currentCharacterAvatar, hydrated);
                 }
                 if (sessionId === hydrationSessionId) emitHydrationUpdate();
+                if (sessionId === hydrationSessionId && hydrationQueue.length > 0) {
+                    await new Promise(resolve => setTimeout(resolve, HYDRATION_YIELD_MS));
+                }
             }
         } catch (err) {
             console.error('[chat_manager] Hydration loop error:', err);
@@ -685,7 +734,7 @@ function startHydrationLoop() {
  * @param {Function} [onMetadataReady] - Called once metadata is available for immediate UI rendering
  * @returns {Promise<{ index: Object, changed: boolean, buildInProgress: boolean, hydrationStarted: boolean, isComplete: boolean }>}
  */
-export async function buildIndex(onProgress, onMetadataReady) {
+export async function buildIndex(onProgress, onMetadataReady, options = {}) {
     progressCallback = onProgress || null;
 
     if (indexBuildInProgress) {
@@ -735,7 +784,9 @@ export async function buildIndex(onProgress, onMetadataReady) {
         }
         if (!chatList || !chatList.length) {
             changed = Object.keys(chatIndex).length > 0;
+            for (const fileName of Object.keys(chatIndex)) removeCachedChat(character.avatar, fileName);
             chatIndex = {};
+            if (changed) bumpIndexVersion();
             resetHydrationQueue();
             notifyMetadataReady(onMetadataReady, changed);
             emitHydrationUpdate();
@@ -768,6 +819,10 @@ export async function buildIndex(onProgress, onMetadataReady) {
                 initialOrder: allocateInitialOrder(),
                 branchPoint: null,
                 isLoaded: false,
+                needsHydration: true,
+                validatedAt: 0,
+                serverSignature: metaSignature(metaObj),
+                mainChat: canonicalFilename(metaObj.chat_metadata?.main_chat),
                 chatEmbedding: null,
                 chatEmbeddingHash: null,
                 clusterLabel: null,
@@ -792,7 +847,7 @@ export async function buildIndex(onProgress, onMetadataReady) {
         const cacheFiles = [];
         for (const [fileName, metaObj] of serverChats) {
             const entry = chatIndex[fileName];
-            if (!entry?.isLoaded || entry.lastModified !== getMetaTimestamp(metaObj)) {
+            if (!options.forceRevalidate && !entry?.isLoaded) {
                 cacheFiles.push(fileName);
             }
         }
@@ -825,137 +880,61 @@ export async function buildIndex(onProgress, onMetadataReady) {
             }
 
             const serverTimestamp = getMetaTimestamp(metaObj);
-            const metaLastTimestamp = getMetaTimestampString(metaObj);
-            const metaMessageCount = getMetaMessageCount(metaObj);
+            const signature = metaSignature(metaObj);
+            const entry = chatIndex[fileName];
+            normalizeEntryShape(entry);
+            const metadataChanged = entry.lastModified !== serverTimestamp || entry.serverSignature !== signature;
+            const reusable = !options.forceRevalidate && !entry.needsHydration && entry.isLoaded
+                && !metadataChanged && recentlyValidated(entry);
+            if (reusable) continue;
 
-            const cached = chatIndex[fileName];
-            if (!cached) {
-                // Check IndexedDB cache before scheduling hydration
-                const idbEntry = idbCache.get(fileName);
-                if (idbEntry && idbEntry.lastModified === serverTimestamp && Array.isArray(idbEntry.messages) && idbEntry.messages.length > 0) {
-                    changed = true;
-                    const idbLastTs = idbEntry.lastMessageTimestamp || metaLastTimestamp;
-                    chatIndex[fileName] = {
-                        fileName,
-                        lastModified: serverTimestamp,
-                        messageCount: idbEntry.messageCount,
-                        messages: idbEntry.messages,
-                        firstMessageTimestamp: idbEntry.firstMessageTimestamp,
-                        lastMessageTimestamp: idbLastTs,
-                        firstTimestampMs: normalizeTimestamp(idbEntry.firstMessageTimestamp),
-                        lastTimestampMs: normalizeTimestamp(idbLastTs),
-                        sortTimestamp: idbEntry.sortTimestamp || serverTimestamp,
-                        initialOrder: allocateInitialOrder(),
-                        branchPoint: null,
-                        isLoaded: true,
-                        chatEmbedding: null,
-                        chatEmbeddingHash: null,
-                        clusterLabel: null,
-                        messageEmbeddings: null,
-                    };
-                    continue;
-                }
-
-                changed = true;
+            const cached = idbCache.get(fileName);
+            if (!options.forceRevalidate && !entry.isLoaded && cached
+                && cached.lastModified === serverTimestamp && cached.serverSignature === signature
+                && recentlyValidated(cached) && Array.isArray(cached.messages)) {
                 chatIndex[fileName] = {
-                    fileName,
-                    lastModified: serverTimestamp,
-                    messageCount: metaMessageCount ?? 0,
-                    messages: [],
-                    firstMessageTimestamp: null,
-                    lastMessageTimestamp: metaLastTimestamp,
-                    firstTimestampMs: FALLBACK_SORT_TIMESTAMP,
-                    lastTimestampMs: normalizeTimestamp(metaLastTimestamp),
-                    sortTimestamp: serverTimestamp,
-                    initialOrder: allocateInitialOrder(),
-                    branchPoint: null,
-                    isLoaded: false,
-                    chatEmbedding: null,
-                    chatEmbeddingHash: null,
-                    clusterLabel: null,
-                    messageEmbeddings: null,
+                    ...entry, ...cached, fileName, initialOrder: entry.initialOrder,
+                    firstTimestampMs: normalizeTimestamp(cached.firstMessageTimestamp),
+                    lastTimestampMs: normalizeTimestamp(cached.lastMessageTimestamp),
+                    branchPoint: null, isLoaded: true, needsHydration: false,
+                    chatEmbedding: null, chatEmbeddingHash: null, clusterLabel: null, messageEmbeddings: null,
+                };
+                queuedFiles.delete(fileName);
+                changed = true;
+            } else {
+                // Keep the last successful body visible while revalidating; a
+                // failed request must not turn known-good data into an empty chat.
+                chatIndex[fileName] = {
+                    ...entry, lastModified: serverTimestamp, serverSignature: signature,
+                    sortTimestamp: metadataChanged ? serverTimestamp : entry.sortTimestamp,
+                    needsHydration: true,
                 };
                 markEntryForHydration(fileName);
-                continue;
-            }
-
-            normalizeEntryShape(cached);
-
-            const timestampChanged = cached.lastModified !== serverTimestamp;
-            cached.lastModified = serverTimestamp;
-            if (timestampChanged) {
-                cached.sortTimestamp = serverTimestamp;
-            }
-
-            if (metaLastTimestamp) {
-                cached.lastMessageTimestamp = metaLastTimestamp;
-                cached.lastTimestampMs = normalizeTimestamp(metaLastTimestamp);
-            }
-
-            if (timestampChanged) {
                 changed = true;
-                // Check IndexedDB cache for updated entry
-                const idbEntry = idbCache.get(fileName);
-                if (idbEntry && idbEntry.lastModified === serverTimestamp && Array.isArray(idbEntry.messages) && idbEntry.messages.length > 0) {
-                    cached.isLoaded = true;
-                    cached.messages = idbEntry.messages;
-                    cached.messageCount = idbEntry.messageCount;
-                    cached.firstMessageTimestamp = idbEntry.firstMessageTimestamp;
-                    cached.firstTimestampMs = normalizeTimestamp(idbEntry.firstMessageTimestamp);
-                    cached.lastMessageTimestamp = idbEntry.lastMessageTimestamp || metaLastTimestamp;
-                    cached.lastTimestampMs = normalizeTimestamp(cached.lastMessageTimestamp);
-                    cached.branchPoint = null;
-                    cached.messageEmbeddings = null;
-                } else {
-                    cached.isLoaded = false;
-                    cached.messages = [];
-                    cached.branchPoint = null;
-                    cached.firstMessageTimestamp = null;
-                    cached.firstTimestampMs = FALLBACK_SORT_TIMESTAMP;
-                    cached.messageEmbeddings = null;
-                    if (metaMessageCount !== null) {
-                        cached.messageCount = metaMessageCount;
-                    } else {
-                        cached.messageCount = 0;
-                    }
-                    markEntryForHydration(fileName);
-                }
-                cached.chatEmbedding = null;
-                cached.chatEmbeddingHash = null;
-                cached.clusterLabel = null;
-            } else if (!cached.isLoaded) {
-                // Check IndexedDB cache before scheduling hydration
-                const idbEntry = idbCache.get(fileName);
-                if (idbEntry && idbEntry.lastModified === serverTimestamp && Array.isArray(idbEntry.messages) && idbEntry.messages.length > 0) {
-                    cached.isLoaded = true;
-                    cached.messages = idbEntry.messages;
-                    cached.messageCount = idbEntry.messageCount;
-                    cached.firstMessageTimestamp = idbEntry.firstMessageTimestamp;
-                    cached.firstTimestampMs = normalizeTimestamp(idbEntry.firstMessageTimestamp);
-                    cached.lastMessageTimestamp = idbEntry.lastMessageTimestamp || metaLastTimestamp;
-                    cached.lastTimestampMs = normalizeTimestamp(cached.lastMessageTimestamp);
-                    cached.branchPoint = null;
-                    cached.messageEmbeddings = null;
-                    queuedFiles.delete(fileName);
-                    hydrationQueue = hydrationQueue.filter(name => name !== fileName);
-                    changed = true;
-                } else {
-                    if (metaMessageCount !== null) {
-                        cached.messageCount = metaMessageCount;
-                    }
-                    markEntryForHydration(fileName);
-                }
             }
         }
 
-        // existingKeys now contains deleted chats
+        // Reconcile queue membership once, including all restored and deleted files.
         for (const deletedKey of existingKeys) {
             if (chatIndex[deletedKey] !== entriesBeforeCacheRead.get(deletedKey)) continue;
             delete chatIndex[deletedKey];
             queuedFiles.delete(deletedKey);
-            hydrationQueue = hydrationQueue.filter(name => name !== deletedKey);
             removeCachedChat(character.avatar, deletedKey);
             changed = true;
+        }
+        hydrationQueue = hydrationQueue.filter(fileName => queuedFiles.has(fileName));
+
+        // Seed only an identified, fully loaded live chat. Keep the current
+        // invalidation/embedding guards in updateActiveChat rather than copy the
+        // older branch's separate, less complete parsing implementation.
+        const live = SillyTavern.getContext();
+        const liveAvatar = live.characters?.[live.characterId]?.avatar;
+        if (liveAvatar === buildAvatar && Array.isArray(live.chat) && live.chat.length > 0) {
+            const activeFile = resolveActiveChatFilename(live, chatIndex);
+            if (activeFile) changed = (await updateActiveChat(activeFile)) || changed;
+            if (buildSessionId !== hydrationSessionId || currentCharacterAvatar !== buildAvatar) {
+                return getBuildStateResponse(false);
+            }
         }
 
         if (changed) {
@@ -970,6 +949,10 @@ export async function buildIndex(onProgress, onMetadataReady) {
         emitHydrationUpdate();
 
         if (hydrationQueue.length > 0) {
+            const activeFile = resolveActiveChatFilename(SillyTavern.getContext(), chatIndex);
+            const recent = getSortedEntries().filter(entry => !entry.isLoaded || entry.needsHydration)
+                .slice(0, 12).map(entry => entry.fileName);
+            prioritizeHydrationFiles([activeFile, ...recent]);
             console.log(`[${MODULE_NAME}] Hydrating ${hydrationQueue.length} chats in background (${Object.keys(chatIndex).length} total)`);
             startHydrationLoop();
         }
@@ -996,7 +979,7 @@ export async function loadEntryNow(fileName) {
 
     normalizeEntryShape(entry);
 
-    if (entry.isLoaded) return true;
+    if (entry.isLoaded && !entry.needsHydration) return true;
 
     queuedFiles.delete(fileName);
     hydrationQueue = hydrationQueue.filter(name => name !== fileName);
@@ -1004,6 +987,31 @@ export async function loadEntryNow(fileName) {
     const loaded = await hydrateEntry(fileName, hydrationSessionId);
     emitHydrationUpdate();
     return loaded;
+}
+
+/** Invalidate a locally edited body even when the manager panel is closed. */
+export function markChatDirty(fileName) {
+    const entry = chatIndex[fileName];
+    if (!entry) return false;
+    chatIndex[fileName] = { ...entry, needsHydration: true };
+    // A same-length edit may not change list metadata, even after a page reload.
+    if (currentCharacterAvatar) removeCachedChat(currentCharacterAvatar, fileName);
+    markEntryForHydration(fileName);
+    bumpIndexVersion();
+    return true;
+}
+
+/** Remove an explicitly deleted local chat without retaining stale search results. */
+export function removeChatFromIndex(fileName) {
+    const resolved = canonicalFilename(fileName);
+    if (!resolved || !chatIndex[resolved]) return false;
+    delete chatIndex[resolved];
+    queuedFiles.delete(resolved);
+    hydrationQueue = hydrationQueue.filter(name => name !== resolved);
+    if (currentCharacterAvatar) removeCachedChat(currentCharacterAvatar, resolved);
+    bumpIndexVersion();
+    emitHydrationUpdate();
+    return true;
 }
 
 /**
@@ -1029,11 +1037,12 @@ export async function updateActiveChat(fileName) {
         const cached = chatIndex[fileName];
         const firstTimestamp = messages.length > 0 ? messages[0].timestamp : null;
         const lastTimestamp = messages.length > 0 ? messages[messages.length - 1].timestamp : null;
-        const parsedLastModified = lastTimestamp ? new Date(lastTimestamp).getTime() : NaN;
+        const parsedLastModified = timestampMs(lastTimestamp) ?? NaN;
         const hasValidLastModified = Number.isFinite(parsedLastModified);
         const effectiveLastTs = lastTimestamp || cached.lastMessageTimestamp;
 
-        if (cached.isLoaded && messagesEqual(cached.messages, messages)) {
+        const mainChat = mainChatFromData(chatData, context.chatMetadata);
+        if (cached.isLoaded && !cached.needsHydration && (cached.mainChat || null) === mainChat && messagesEqual(cached.messages, messages)) {
             queuedFiles.delete(fileName);
             hydrationQueue = hydrationQueue.filter(name => name !== fileName);
             return false;
@@ -1051,6 +1060,9 @@ export async function updateActiveChat(fileName) {
             sortTimestamp: hasValidLastModified ? parsedLastModified : cached.sortTimestamp,
             branchPoint: null,
             isLoaded: true,
+            needsHydration: false,
+            validatedAt: Date.now(),
+            mainChat,
             messageEmbeddings: retainMessageEmbeddings(cached, messages),
         };
         if (getRepresentativeEmbeddingText(cached) !== getRepresentativeEmbeddingText(updated)) {
@@ -1096,12 +1108,14 @@ function detectBranches(index, activeFilename) {
 
     const activeEntry = activeFilename ? index[activeFilename] : null;
     if (!activeEntry || !activeEntry.isLoaded || activeEntry.messages.length < 2) return;
+    const related = relatedThreadNames(index, activeFilename);
 
     for (const entry of Object.values(index)) {
         if (entry.fileName === activeFilename) continue;
         if (!entry.isLoaded || entry.messages.length < 2) continue;
+        if (!related.has(entry.fileName)) continue;
 
-        const branchPoint = computeBranchPoint(activeEntry.messages, entry.messages);
+        const branchPoint = computeRelatedBranchPoint(activeEntry.messages, entry.messages);
         if (branchPoint !== null) {
             entry.branchPoint = branchPoint;
         }
@@ -1128,7 +1142,7 @@ export function computeBranchPoint(baseMessages, candidateMessages) {
         return candidateCache.get(candidateMessages);
     }
 
-    if (candidateMessages[0]?.text !== baseMessages[0]?.text) {
+    if (candidateMessages[0]?.text !== baseMessages[0]?.text || candidateMessages[0]?.role !== baseMessages[0]?.role) {
         candidateCache.set(candidateMessages, null);
         return null;
     }
@@ -1137,7 +1151,7 @@ export function computeBranchPoint(baseMessages, candidateMessages) {
     let divergeAt = maxCompare;
 
     for (let k = 1; k < maxCompare; k++) {
-        if (candidateMessages[k]?.text !== baseMessages[k]?.text) {
+        if (candidateMessages[k]?.text !== baseMessages[k]?.text || candidateMessages[k]?.role !== baseMessages[k]?.role) {
             divergeAt = k;
             break;
         }
@@ -1148,12 +1162,19 @@ export function computeBranchPoint(baseMessages, candidateMessages) {
     return result;
 }
 
+function computeRelatedBranchPoint(baseMessages, candidateMessages) {
+    // Provenance also permits a branch made from an alternate first greeting.
+    if (baseMessages.length && candidateMessages.length
+        && (baseMessages[0].text !== candidateMessages[0].text || baseMessages[0].role !== candidateMessages[0].role)) return 0;
+    return computeBranchPoint(baseMessages, candidateMessages);
+}
+
 function sortSiblingContextByRecency(siblings) {
     siblings.sort((a, b) => {
         const aLast = a.messages[a.messages.length - 1];
         const bLast = b.messages[b.messages.length - 1];
-        const aTime = aLast?.timestamp ? new Date(aLast.timestamp).getTime() : 0;
-        const bTime = bLast?.timestamp ? new Date(bLast.timestamp).getTime() : 0;
+        const aTime = aLast?.timestamp ? normalizeTimestamp(aLast.timestamp) : 0;
+        const bTime = bLast?.timestamp ? normalizeTimestamp(bLast.timestamp) : 0;
         return (Number.isFinite(bTime) ? bTime : 0) - (Number.isFinite(aTime) ? aTime : 0);
     });
 }
@@ -1206,12 +1227,14 @@ export function getSiblingBranchContextForThread(baseFilename, maxBranches = 3) 
     if (!baseEntry || !baseEntry.isLoaded || baseEntry.messages.length < 2) return [];
 
     const siblings = [];
+    const related = relatedThreadNames(chatIndex, baseFilename);
 
     for (const entry of Object.values(chatIndex)) {
         if (entry.fileName === baseFilename) continue;
         if (!entry.isLoaded || entry.messages.length < 2) continue;
+        if (!related.has(entry.fileName)) continue;
 
-        const branchPoint = computeBranchPoint(baseEntry.messages, entry.messages);
+        const branchPoint = computeRelatedBranchPoint(baseEntry.messages, entry.messages);
         if (branchPoint === null) continue;
 
         const postBranchMessages = entry.messages.slice(branchPoint);
@@ -1226,6 +1249,34 @@ export function getSiblingBranchContextForThread(baseFilename, maxBranches = 3) 
 
     sortSiblingContextByRecency(siblings);
     return siblings.slice(0, maxBranches);
+}
+
+/** Host provenance defines families; shared greetings alone never authorize injection. */
+function relatedThreadNames(index, baseFilename) {
+    const links = new Map();
+    const connect = (a, b) => {
+        if (!a || !b || a === b) return;
+        if (!links.has(a)) links.set(a, new Set());
+        if (!links.has(b)) links.set(b, new Set());
+        links.get(a).add(b);
+        links.get(b).add(a);
+    };
+    for (const entry of Object.values(index)) {
+        connect(entry.fileName, canonicalFilename(entry.mainChat));
+        for (const message of entry.messages || []) {
+            for (const branch of message.branches || []) connect(entry.fileName, canonicalFilename(branch));
+        }
+    }
+    const related = new Set([baseFilename]);
+    const pending = [baseFilename];
+    while (pending.length) {
+        for (const name of links.get(pending.pop()) || []) {
+            if (related.has(name)) continue;
+            related.add(name);
+            pending.push(name);
+        }
+    }
+    return related;
 }
 
 /**
@@ -1284,7 +1335,7 @@ export function isBuilding() {
  */
 export function isEntryLoaded(fileName) {
     const entry = chatIndex[fileName];
-    return !!entry && !!entry.isLoaded;
+    return !!entry && !!entry.isLoaded && !entry.needsHydration;
 }
 
 /**
@@ -1294,7 +1345,7 @@ export function isEntryLoaded(fileName) {
 export function isHydrationComplete() {
     const entries = Object.values(chatIndex);
     if (entries.length === 0) return true;
-    return entries.every(entry => entry.isLoaded);
+    return entries.every(entry => entry.isLoaded && !entry.needsHydration);
 }
 
 /**
@@ -1307,7 +1358,7 @@ export function getHydrationProgress() {
     let loaded = 0;
 
     for (const entry of entries) {
-        if (entry.isLoaded) loaded++;
+        if (entry.isLoaded && !entry.needsHydration) loaded++;
     }
 
     return { loaded, total };
@@ -1361,8 +1412,8 @@ export function getFilteredSortedEntries(filterState, sortState, getChatMetaFn) 
         return Number.isFinite(ts) ? ts : entry.sortTimestamp;
     };
     if (filterState.dateFrom) {
-        const from = new Date(filterState.dateFrom).getTime();
-        if (Number.isFinite(from)) {
+        const from = localDateBoundary(filterState.dateFrom);
+        if (from !== null) {
             entries = entries.filter(entry => {
                 const ts = entryDateMs(entry);
                 return Number.isFinite(ts) && ts >= from;
@@ -1370,12 +1421,12 @@ export function getFilteredSortedEntries(filterState, sortState, getChatMetaFn) 
         }
     }
     if (filterState.dateTo) {
-        // dateTo is inclusive — add one day
-        const to = new Date(filterState.dateTo).getTime() + 86400000;
-        if (Number.isFinite(to)) {
+        // Exclusive next local midnight keeps both bounds correct across DST.
+        const to = localDateBoundary(filterState.dateTo, true);
+        if (to !== null) {
             entries = entries.filter(entry => {
                 const ts = entryDateMs(entry);
-                return Number.isFinite(ts) && ts <= to;
+                return Number.isFinite(ts) && ts < to;
             });
         }
     }
@@ -1472,8 +1523,8 @@ export function getSearchableMessages() {
 
     // Sort by recency (newest messages first)
     messages.sort((a, b) => {
-        const aTime = a.timestamp ? new Date(a.timestamp).getTime() : 0;
-        const bTime = b.timestamp ? new Date(b.timestamp).getTime() : 0;
+        const aTime = Number.isFinite(a.timestampMs) ? a.timestampMs : normalizeTimestamp(a.timestamp);
+        const bTime = Number.isFinite(b.timestampMs) ? b.timestampMs : normalizeTimestamp(b.timestamp);
         return (Number.isFinite(bTime) ? bTime : 0) - (Number.isFinite(aTime) ? aTime : 0);
     });
 

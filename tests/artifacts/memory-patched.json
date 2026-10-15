@@ -1,0 +1,70 @@
+{
+  "automaticRestoreDuringNativeGeneration": {
+    "reads": 0,
+    "peakConcurrent": 0,
+    "readsDuringGeneration": 0,
+    "retainedVectors": 0,
+    "heapStartMiB": 31.6,
+    "heapPeakMiB": 33.8,
+    "heapEndMiB": 31.4,
+    "generationStartMs": 21918.2,
+    "generationEndMs": 34235.9
+  },
+  "loadedActiveGeneration": {
+    "reads": 35,
+    "readsDuringGeneration": 0,
+    "peakConcurrent": 13,
+    "activeRetainedVectors": 13,
+    "inactiveRetainedVectors": 0,
+    "heapStartMiB": 32.8,
+    "heapPeakMiB": 33.6,
+    "heapEndMiB": 32.7,
+    "firstReadMs": 76049.4,
+    "lastReadMs": 76611.5,
+    "generationStartMs": 62708.9,
+    "generationEndMs": 75132.0
+  },
+  "longActiveAutomaticRestore": {
+    "activeMessages": 5000,
+    "inactiveMessages": 5000,
+    "reads": 256,
+    "peakConcurrent": 50,
+    "activeRetainedVectors": 256,
+    "inactiveRetainedVectors": 0,
+    "heapStartMiB": 32.4,
+    "heapAtFirstObservationMiB": 44.8,
+    "unchangedRepeatAdditionalReads": 0,
+    "unchangedRepeatRetainedVectors": 256
+  },
+  "explicitSelectedScope": {
+    "selectedChats": 1,
+    "reads": 250,
+    "retainedVectors": 250
+  },
+  "embeddingsDisabled": {
+    "automaticAndExplicitAttempted": true,
+    "reads": 0,
+    "retainedVectors": 0
+  },
+  "finalSourceLoadedActiveGeneration": {
+    "reads": 18,
+    "readsDuringGeneration": 0,
+    "peakConcurrent": 15,
+    "activeRetainedVectors": 15,
+    "inactiveRetainedVectors": 0,
+    "firstReadMs": 107472.3,
+    "lastReadMs": 108034.3,
+    "generationStartMs": 94241.3,
+    "generationEndMs": 106556.2,
+    "heapStartMiB": 34.0,
+    "heapPeakMiB": 39.1,
+    "heapEndMiB": 34.2
+  },
+  "validation": {
+    "nodeTestsPassed": 10,
+    "browserUiChecksPassed": 13,
+    "syntaxChecksPassed": true,
+    "diffCheckPassed": true,
+    "browserErrors": "none reported; normal streaming-stats warnings only"
+  }
+}

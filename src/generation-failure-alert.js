@@ -3,8 +3,8 @@
  * play a short, self-contained Web Audio alert.
  *
  * SillyTavern does not expose a dedicated GENERATION_FAILED event. Detection
- * therefore combines its generation lifecycle, response, and stop events with
- * visible error toasts. A short settle delay lets the manual-stop event arrive
+ * therefore combines its generation lifecycle, response, and stop events.
+ * A short settle delay lets the manual-stop event arrive
  * after GENERATION_ENDED before a missing response is classified as a failure.
  */
 
@@ -15,7 +15,6 @@ const ATTEMPT_EXPIRY_MS = 15 * 60 * 1000;
 let audioContext = null;
 let currentAttempt = null;
 let attemptSequence = 0;
-let toastObserver = null;
 let audioWarningShown = false;
 
 function getAudioContext() {
@@ -96,21 +95,15 @@ export async function playFailureAlertSound() {
     }
 }
 
-function isErrorToastNode(node) {
-    if (!(node instanceof Element)) return false;
-    return node.matches('.toast-error') || Boolean(node.querySelector('.toast-error'));
-}
-
 function isAttemptCurrent(attempt) {
     return Boolean(attempt && currentAttempt && attempt.id === currentAttempt.id);
 }
 
-function expireAttempt(attempt) {
-    window.setTimeout(() => {
-        if (isAttemptCurrent(attempt)) {
-            currentAttempt = null;
-        }
-    }, ATTEMPT_EXPIRY_MS);
+function clearAttempt() {
+    if (!currentAttempt) return;
+    window.clearTimeout(currentAttempt.expiryTimer);
+    window.clearTimeout(currentAttempt.settleTimer);
+    currentAttempt = null;
 }
 
 /**
@@ -156,6 +149,8 @@ export function initGenerationFailureAlert({ eventSource, eventTypes, getContext
 
     eventSource.on(eventTypes.GENERATION_STARTED, (type, _options, dryRun = false) => {
         if (dryRun || !RESPONSE_GENERATION_TYPES.has(type)) return;
+        clearAttempt();
+        if (!isEnabled()) return;
 
         const attempt = {
             id: ++attemptSequence,
@@ -165,9 +160,13 @@ export function initGenerationFailureAlert({ eventSource, eventTypes, getContext
             stopped: false,
             alerted: false,
             streamingFailed: false,
+            expiryTimer: null,
+            settleTimer: null,
         };
         currentAttempt = attempt;
-        expireAttempt(attempt);
+        attempt.expiryTimer = window.setTimeout(() => {
+            if (isAttemptCurrent(attempt)) clearAttempt();
+        }, ATTEMPT_EXPIRY_MS);
     });
 
     if (hasAfterCommandsEvent) {
@@ -184,9 +183,7 @@ export function initGenerationFailureAlert({ eventSource, eventTypes, getContext
     });
 
     eventSource.on(eventTypes.GENERATION_STOPPED, () => {
-        if (currentAttempt) {
-            currentAttempt.stopped = true;
-        }
+        clearAttempt();
     });
 
     eventSource.on(eventTypes.GENERATION_ENDED, () => {
@@ -201,7 +198,8 @@ export function initGenerationFailureAlert({ eventSource, eventTypes, getContext
             streamingProcessor?.isStopped === true && streamingProcessor?.isFinished === false,
         );
 
-        window.setTimeout(() => {
+        window.clearTimeout(attempt.settleTimer);
+        attempt.settleTimer = window.setTimeout(() => {
             if (!isAttemptCurrent(attempt)) return;
 
             if (attempt.streamingFailed) {
@@ -211,23 +209,12 @@ export function initGenerationFailureAlert({ eventSource, eventTypes, getContext
             }
 
             if (isAttemptCurrent(attempt)) {
-                currentAttempt = null;
+                clearAttempt();
             }
         }, FAILURE_SETTLE_DELAY_MS);
     });
 
-    // Core API failures are normally rendered as toastr errors. Observing the
-    // DOM avoids replacing toastr's single global subscriber used by ST itself.
-    toastObserver = new MutationObserver((mutations) => {
-        const attempt = currentAttempt;
-        if (!attempt || !attempt.armed || attempt.stopped) return;
-
-        for (const mutation of mutations) {
-            if (Array.from(mutation.addedNodes).some(isErrorToastNode)) {
-                alertForAttempt(attempt, 'API error', isEnabled);
-                break;
-            }
-        }
-    });
-    toastObserver.observe(document.body, { childList: true, subtree: true });
+    // Generic error toasts have no generation identity: background extension
+    // errors can occur during a successful reply. Only a terminated attempt's
+    // missing response or the host's failed stream state can trigger the cue.
 }

@@ -5,13 +5,13 @@
 import {
     buildIndex, getHydrationProgress, getIndex, getSearchableMessages, getSortedEntries,
     getFilteredSortedEntries, getIndexVersion,
-    isHydrationComplete, onHydrationUpdate, prioritizeInQueue, runDeferredBranchDetection,
+    isHydrationComplete, onHydrationUpdate, prioritizeInQueue, prioritizeHydrationFiles, runDeferredBranchDetection,
     getSiblingBranchContextForThread,
     ensureMessageEmbeddingMap, getMessageActiveSwipeIndex, getMessageEmbedding, setMessageEmbedding, makeMessageEmbeddingKey,
 } from './chat-reader.js';
 import {
-    getDisplayName, setDisplayName, getSummary, setSummary,
-    migrateFileKey, getDisplayMode, getChatMeta,
+    getDisplayName, getSummary,
+    migrateFileKey, getDisplayMode, getChatMeta, setChatMeta,
     getThreadFocus, setThreadFocus as persistThreadFocus,
     getBranchContextEnabled, setBranchContextEnabled,
     getTagDefinitions, createTagDefinition, updateTagDefinition, deleteTagDefinition, safeTagColor,
@@ -25,21 +25,23 @@ import {
     updateBranchContextInjection, clearBranchContextInjection, formatBranchContextForSummary,
 } from './branch-context.js';
 import {
-    generateTitleForActiveChat, generateTitleForChat,
-    generateSummaryForActiveChat, generateSummaryForChat,
+    generateTitleForChat, generateSummaryForChat,
 } from './ai-features.js';
 import {
     mountIcicle, unmountIcicle, updateIcicleData,
     focusMessageInIcicle, isIcicleMounted, setIcicleCallbacks,
+    invalidateIcicleEmbeddings,
     setThreadFocus as setIcicleThreadFocus,
 } from './icicle-view.js';
 import {
     mountSemanticMap, unmountSemanticMap, updateSemanticMapData,
     focusMessageInSemanticMap, isSemanticMapMounted, setSemanticMapCallbacks,
+    invalidateSemanticMapEmbeddings,
 } from './semantic-map-view.js';
 import {
     mountGraphView, unmountGraphView, updateGraphViewData,
     isGraphViewMounted, setGraphViewCallbacks, setGraphScope,
+    invalidateGraphEmbeddings,
 } from './graph-view.js';
 import {
     mountStatsView, unmountStatsView, updateStatsView,
@@ -47,10 +49,14 @@ import {
 } from './stats-view.js';
 import {
     embedText, embedTexts, getCachedEmbeddingForText, getCachedEmbeddingsForTexts, hashEmbeddingText, isEmbeddingConfigured,
+    captureEmbeddingOperation, isEmbeddingOperationCurrent, invalidateEmbeddingOperations, isStaleEmbeddingOperationError,
+    onEmbeddingDimensionsInvalidated,
 } from './embedding-service.js';
 import { clusterColor, cosineSimilarity, findOptimalK, findOptimalKAsync, kMeans, kMeansAsync, topicShiftScores } from './semantic-engine.js';
 import { resolveActiveChatFilename } from './active-chat.js';
 import { getRepresentativeEmbeddingText } from './embedding-text.js';
+import { navigateToChat } from './chat-navigation.js';
+import { timestampMs } from './timestamps.js';
 
 const MODULE_NAME = 'chat_manager';
 const HYBRID_SEARCH_MIN_CHARS = 5;
@@ -77,6 +83,7 @@ let refreshSemanticMapFromHydrationTimer = null;
 let refreshGraphViewFromHydrationTimer = null;
 let refreshStatsFromHydrationTimer = null;
 let embedBootstrapTimer = null;
+let branchDetectionTask = null;
 let embedIncrementalTimer = null;
 const EMBED_INCREMENTAL_DELAY_MS = 1200;
 export const AUTOMATIC_MESSAGE_RESTORE_LIMIT = 256;
@@ -102,6 +109,10 @@ const clusterVectorIds = new WeakMap();
 let nextClusterInputId = 1;
 let queryEmbeddingEpoch = 0;
 let driftSummaryCache = new WeakMap();
+
+// A view can discover provider dimension drift before a foreground run does.
+// Retire every transient vector with the persistent cache in that same event.
+onEmbeddingDimensionsInvalidated(() => clearInMemoryEmbeddings({ rerender: false }));
 
 /**
  * Streaming search state — allows early termination and "load more" resumption.
@@ -541,7 +552,7 @@ function collectMessageVariantsForEmbedding(msg, settings, mode = 'all') {
 function getMessageEmbeddingCandidates(entries, settings, mode = 'all', messageWindowLimit = null) {
     const candidates = [];
     for (const entry of entries) {
-        if (!entry?.isLoaded || !Array.isArray(entry.messages) || entry.messages.length === 0) continue;
+        if (!entry?.isLoaded || entry.needsHydration || !Array.isArray(entry.messages) || entry.messages.length === 0) continue;
         ensureMessageEmbeddingMap(entry);
 
         const messages = Number.isFinite(messageWindowLimit) && messageWindowLimit > 0
@@ -601,15 +612,15 @@ function hasChatEmbedding(entry) {
     return Array.isArray(entry?.chatEmbedding) && entry.chatEmbedding.length > 0;
 }
 
-function hasMessageEmbeddingsForAllTextMessages(entry) {
+function hasMessageEmbeddingsForAllTextMessages(entry, settings = getEmbeddingSettings()) {
     if (!entry?.isLoaded || !Array.isArray(entry.messages) || entry.messages.length === 0) return false;
     if (!(entry.messageEmbeddings instanceof Map)) return false;
 
     for (const msg of entry.messages) {
-        const text = typeof msg?.text === 'string' ? msg.text.trim() : '';
-        if (!text) continue;
-        const vector = getMessageEmbedding(entry, msg);
-        if (!Array.isArray(vector) || vector.length === 0) return false;
+        for (const variant of collectMessageVariantsForEmbedding(msg, settings)) {
+            const vector = getMessageEmbedding(entry, msg, variant.swipeIndex);
+            if (!Array.isArray(vector) || vector.length === 0) return false;
+        }
     }
     return true;
 }
@@ -634,7 +645,7 @@ function getEmbeddingStatus(entry) {
     const chatOn = isEmbeddingLevelOn(settings, 'chat');
     const msgOn = isEmbeddingLevelOn(settings, 'message');
     if (!chatOn && !msgOn) return 'disabled';
-    if (!entry?.isLoaded) return 'unknown';
+    if (!entry?.isLoaded || entry.needsHydration) return 'unknown';
 
     let enabledCount = 0;
     let satisfiedCount = 0;
@@ -797,21 +808,36 @@ function refreshAfterEmbeddingUpdate() {
     }
 }
 
-function queueBackgroundSwipeCandidates(candidates, settings) {
+const staleEmbeddingRun = Symbol('stale embedding run');
+
+function requireCurrentEmbeddingRun(operation, entry = null) {
+    if (!isEmbeddingOperationCurrent(operation) || (entry && getIndex()[entry.fileName] !== entry)) {
+        throw staleEmbeddingRun;
+    }
+}
+
+function queueBackgroundSwipeCandidates(candidates, settings, operation) {
     if (!Array.isArray(candidates) || candidates.length === 0) return;
     for (const candidate of candidates) {
         if (!candidate?.entry || !candidate?.key) continue;
         const dedupKey = `${candidate.entry.fileName}:${candidate.key}`;
-        pendingBackgroundSwipeCandidates.set(dedupKey, candidate);
+        pendingBackgroundSwipeCandidates.set(dedupKey, { ...candidate, operation });
     }
+    scheduleBackgroundSwipeEmbeddings(settings);
+}
 
+function scheduleBackgroundSwipeEmbeddings(settings) {
     const delayMs = clampPositiveInt(getEmbeddingOption(settings, 'swipeBackgroundDelayMs', SWIPE_BACKGROUND_EMBED_DELAY_MS), SWIPE_BACKGROUND_EMBED_DELAY_MS);
     if (backgroundSwipeEmbedTimer) {
         clearTimeout(backgroundSwipeEmbedTimer);
     }
     backgroundSwipeEmbedTimer = setTimeout(() => {
         backgroundSwipeEmbedTimer = null;
-        void flushBackgroundSwipeEmbeddings(settings).catch((err) => {
+        void flushBackgroundSwipeEmbeddings(settings, true).catch((err) => {
+            if (isStaleEmbeddingOperationError(err) && err.reason === 'dimensions') {
+                clearInMemoryEmbeddings({ rerender: true });
+            }
+            if (err === staleEmbeddingRun || isStaleEmbeddingOperationError(err)) return;
             console.warn(`[${MODULE_NAME}] Background swipe embedding failed:`, err);
         });
     }, delayMs);
@@ -826,14 +852,16 @@ async function flushBackgroundSwipeEmbeddings(settings, rerender = false) {
 
     try {
         while (pendingBackgroundSwipeCandidates.size > 0) {
-            const batch = takeMapBatch(pendingBackgroundSwipeCandidates, batchSize);
-            if (batch.length === 0) break;
+            const batch = takeMapBatch(pendingBackgroundSwipeCandidates, batchSize)
+                .filter(item => isEmbeddingOperationCurrent(item.operation) && getIndex()[item.entry.fileName] === item.entry);
+            if (batch.length === 0) continue;
 
             const cached = await getCachedEmbeddingsForTexts(batch.map(item => item.text));
             const pending = [];
             for (let i = 0; i < batch.length; i++) {
                 const item = batch[i];
                 const cachedVec = cached[i];
+                if (!isEmbeddingOperationCurrent(item.operation) || getIndex()[item.entry.fileName] !== item.entry) continue;
                 if (Array.isArray(cachedVec) && cachedVec.length > 0) {
                     setMessageEmbedding(item.entry, item.msgIndex, item.swipeIndex, cachedVec);
                 } else {
@@ -847,12 +875,20 @@ async function flushBackgroundSwipeEmbeddings(settings, rerender = false) {
                     { level: 'message' },
                 );
                 for (let i = 0; i < pending.length; i++) {
-                    setMessageEmbedding(pending[i].entry, pending[i].msgIndex, pending[i].swipeIndex, vectors[i]);
+                    const item = pending[i];
+                    if (isEmbeddingOperationCurrent(item.operation) && getIndex()[item.entry.fileName] === item.entry) {
+                        setMessageEmbedding(item.entry, item.msgIndex, item.swipeIndex, vectors[i]);
+                    }
                 }
             }
         }
     } finally {
         backgroundSwipeEmbedActive = false;
+        // A fresh run may have queued work while an obsolete provider request
+        // was unwinding. Its timer cannot drain until this active flush ends.
+        if (pendingBackgroundSwipeCandidates.size > 0 && !backgroundSwipeEmbedTimer) {
+            scheduleBackgroundSwipeEmbeddings(getEmbeddingSettings());
+        }
         if (rerender) {
             refreshAfterEmbeddingUpdate();
         }
@@ -873,11 +909,27 @@ export function takeMapBatch(map, batchSize) {
 }
 
 async function runEmbeddingGeneration(targetFileNames = null, options = {}) {
+    try {
+        return await runEmbeddingGenerationWork(targetFileNames, options);
+    } catch (error) {
+        if (error !== staleEmbeddingRun && !isStaleEmbeddingOperationError(error)) throw error;
+        if (isStaleEmbeddingOperationError(error) && error.reason === 'dimensions') {
+            clearInMemoryEmbeddings({ rerender: false });
+            if (!options.dimensionRetry) {
+                return runEmbeddingGeneration(targetFileNames, { ...options, dimensionRetry: true });
+            }
+        }
+        return { updated: 0, total: 0, clusters: getCurrentClusterCount(), skipped: true, superseded: true, messageVectors: 0, queuedSwipeVectors: 0 };
+    }
+}
+
+async function runEmbeddingGenerationWork(targetFileNames = null, options = {}) {
     if (options.automatic && generationActive) {
         deferAutomaticRun(targetFileNames, options);
         return { updated: 0, total: 0, clusters: getCurrentClusterCount(), skipped: true, deferred: true, messageVectors: 0, queuedSwipeVectors: 0 };
     }
-    const settings = getEmbeddingSettings();
+    const operation = captureEmbeddingOperation();
+    const settings = operation.settings;
     if (settings.includeAlternateSwipes !== true) {
         pendingBackgroundSwipeCandidates.clear();
         if (backgroundSwipeEmbedTimer) {
@@ -905,6 +957,7 @@ async function runEmbeddingGeneration(targetFileNames = null, options = {}) {
         await buildIndex(null, null);
     }
 
+    requireCurrentEmbeddingRun(operation);
     const index = getIndex();
     const sourceEntries = Array.isArray(targetFileNames) && targetFileNames.length > 0
         ? targetFileNames.map(fileName => index[fileName]).filter(Boolean)
@@ -913,6 +966,7 @@ async function runEmbeddingGeneration(targetFileNames = null, options = {}) {
 
     const chatCandidates = chatLevelEnabled
         ? scopedEntries
+            .filter(entry => entry.isLoaded && !entry.needsHydration)
             .map(entry => {
                 const text = getRepresentativeEmbeddingText(entry);
                 return {
@@ -934,7 +988,7 @@ async function runEmbeddingGeneration(targetFileNames = null, options = {}) {
         ? getMessageEmbeddingCandidates(scopedEntries, settings, 'alternate')
         : [];
     const totalWork = chatCandidates.length + messageCandidates.length;
-    if (totalWork === 0) {
+    if (totalWork === 0 && (options.cacheOnly === true || alternateSwipeCandidates.length === 0)) {
         let clusters = getCurrentClusterCount();
         if (!options.incremental) {
             const clusterResult = await recomputeEmbeddingClusters();
@@ -954,6 +1008,7 @@ async function runEmbeddingGeneration(targetFileNames = null, options = {}) {
     let pendingChats = [];
     if (chatCandidates.length > 0) {
         const restored = await restoreCachedCandidates(chatCandidates, (item, cached) => {
+            requireCurrentEmbeddingRun(operation, item.entry);
             const previousHash = item.entry.chatEmbeddingHash || null;
             item.entry.chatEmbedding = cached;
             item.entry.chatEmbeddingHash = item.hash;
@@ -986,6 +1041,7 @@ async function runEmbeddingGeneration(targetFileNames = null, options = {}) {
 
         for (let i = 0; i < pendingChats.length; i++) {
             const item = pendingChats[i];
+            requireCurrentEmbeddingRun(operation, item.entry);
             const previousHash = item.entry.chatEmbeddingHash || null;
             item.entry.chatEmbedding = vectors[i];
             item.entry.chatEmbeddingHash = item.hash;
@@ -1000,6 +1056,7 @@ async function runEmbeddingGeneration(targetFileNames = null, options = {}) {
     let pendingMessages = [];
     if (messageCandidates.length > 0) {
         const restored = await restoreCachedCandidates(messageCandidates, (item, cached) => {
+            requireCurrentEmbeddingRun(operation, item.entry);
             setMessageEmbedding(item.entry, item.msgIndex, item.swipeIndex, cached);
             completed += 1;
             if (onProgress) onProgress(completed, totalWork);
@@ -1029,6 +1086,7 @@ async function runEmbeddingGeneration(targetFileNames = null, options = {}) {
 
         for (let i = 0; i < pendingMessages.length; i++) {
             const item = pendingMessages[i];
+            requireCurrentEmbeddingRun(operation, item.entry);
             setMessageEmbedding(item.entry, item.msgIndex, item.swipeIndex, vectors[i]);
         }
         completed += pendingMessages.length;
@@ -1036,9 +1094,11 @@ async function runEmbeddingGeneration(targetFileNames = null, options = {}) {
     }
 
     if (!cacheOnly && alternateSwipeCandidates.length > 0) {
-        queueBackgroundSwipeCandidates(alternateSwipeCandidates, settings);
+        requireCurrentEmbeddingRun(operation);
+        queueBackgroundSwipeCandidates(alternateSwipeCandidates, settings, operation);
     }
 
+    requireCurrentEmbeddingRun(operation);
     queryEmbeddingCache.clear();
     queryEmbeddingInFlight.clear();
     queryEmbeddingEpoch++;
@@ -1080,6 +1140,7 @@ export async function generateEmbeddingsForCurrentIndex(options = {}) {
 }
 
 export function clearInMemoryEmbeddings(options = {}) {
+    invalidateEmbeddingOperations();
     const rerender = options.rerender !== false;
     clearReclusterTimer();
     if (backgroundSwipeEmbedTimer) {
@@ -1087,7 +1148,6 @@ export function clearInMemoryEmbeddings(options = {}) {
         backgroundSwipeEmbedTimer = null;
     }
     pendingBackgroundSwipeCandidates.clear();
-    backgroundSwipeEmbedActive = false;
     pendingClusterChanges = 0;
     lastClusterK = null;
     lastClusterChatCount = 0;
@@ -1105,6 +1165,9 @@ export function clearInMemoryEmbeddings(options = {}) {
         entry.clusterLabel = null;
         entry.messageEmbeddings = null;
     }
+    invalidateIcicleEmbeddings();
+    invalidateSemanticMapEmbeddings();
+    invalidateGraphEmbeddings();
 
     if (rerender) {
         refreshAfterEmbeddingUpdate();
@@ -1234,6 +1297,10 @@ async function handleTimelineEmbedNode(chatFiles, onProgress) {
         onProgress,
     }));
 
+    if (result?.superseded) {
+        toastr.info('Embedding settings or chat content changed. Run embeddings again to use the current data.');
+        return result;
+    }
     const messagePart = Number.isFinite(result?.messageVectors) && result.messageVectors > 0
         ? `, ${result.messageVectors} messages`
         : '';
@@ -1275,6 +1342,10 @@ async function handleEmbedSingleCard(e) {
             ignoreScope: true,
         }));
 
+        if (result?.superseded) {
+            toastr.info('Embedding settings or chat content changed. Run embeddings again to use the current data.');
+            return;
+        }
         const messagePart = Number.isFinite(result?.messageVectors) && result.messageVectors > 0
             ? `, ${result.messageVectors} messages` : '';
         const queuedSwipePart = Number.isFinite(result?.queuedSwipeVectors) && result.queuedSwipeVectors > 0
@@ -1283,6 +1354,7 @@ async function handleEmbedSingleCard(e) {
     } catch (err) {
         console.error(`[${MODULE_NAME}] Per-card embedding failed:`, err);
         toastr.error(`Embedding failed: ${err.message || err}`);
+    } finally {
         btn.classList.remove('fa-spinner', 'fa-spin', 'chat-manager-embedding-active');
         btn.classList.add('fa-bolt');
     }
@@ -1319,6 +1391,10 @@ async function handleToolbarEmbedTrigger() {
             ignoreScope: true,
         }));
 
+        if (result?.superseded) {
+            toastr.info('Embedding settings or chat content changed. Run embeddings again to use the current data.');
+            return;
+        }
         const messagePart = Number.isFinite(result?.messageVectors) && result.messageVectors > 0
             ? `, ${result.messageVectors} messages` : '';
         const queuedSwipePart = Number.isFinite(result?.queuedSwipeVectors) && result.queuedSwipeVectors > 0
@@ -1334,6 +1410,7 @@ async function handleToolbarEmbedTrigger() {
  * Toggle semantic map view on/off.
  */
 export function toggleSemanticMap() {
+    resetSearchState();
     semanticMapActive = !semanticMapActive;
 
     const btn = document.getElementById('chat-manager-semantic-map-toggle');
@@ -1384,6 +1461,7 @@ export function toggleSemanticMap() {
  * Toggle graph view on/off.
  */
 export function toggleGraphView() {
+    resetSearchState();
     graphViewActive = !graphViewActive;
 
     const btn = document.getElementById('chat-manager-graph-view-toggle');
@@ -1438,6 +1516,7 @@ export function isGraphViewActive() {
  * Expects Cytoscape libs to be loaded before this is called.
  */
 export function toggleTimeline() {
+    resetSearchState();
     timelineActive = !timelineActive;
 
     // Update toggle button active state
@@ -1512,6 +1591,7 @@ export function toggleTimeline() {
  * Toggle stats dashboard on/off. Mutually exclusive with timeline.
  */
 export function toggleStats() {
+    resetSearchState();
     statsActive = !statsActive;
 
     const btn = document.getElementById('chat-manager-stats-toggle');
@@ -1723,19 +1803,7 @@ function scheduleStatsRefresh() {
  * @param {number} msgIndex
  */
 async function handleTimelineJumpToMessage(filename, msgIndex) {
-    const activeChatFile = getActiveFilename();
-
-    if (filename !== activeChatFile) {
-        const displayName = getDisplayName(filename) || filename;
-        const switched = await safeSwitchChatFromJump(filename, displayName);
-        if (!switched) return;
-    }
-
-    if (getDisplayMode() === 'popup') {
-        closePanel();
-    }
-
-    await scrollToMessageInChat(msgIndex);
+    return navigateToChat(filename, msgIndex, chatNavigationOptions(filename));
 }
 
 function getIndexingSuffix() {
@@ -1756,14 +1824,16 @@ function getCurrentSearchQuery() {
 }
 
 function formatDateOrFallback(momentLib, value, fallback = '?') {
-    if (!value) return fallback;
-    const parsed = momentLib(value);
+    const ms = timestampMs(value);
+    if (ms === null) return fallback;
+    const parsed = momentLib(ms);
     return parsed.isValid() ? parsed.format('MMM D') : fallback;
 }
 
 function formatFromNowOrFallback(momentLib, value, fallback = 'unknown') {
-    if (!value) return fallback;
-    const parsed = momentLib(value);
+    const ms = timestampMs(value);
+    if (ms === null) return fallback;
+    const parsed = momentLib(ms);
     return parsed.isValid() ? parsed.fromNow() : fallback;
 }
 
@@ -1819,17 +1889,38 @@ function scheduleHydrationUIRefresh() {
 
         patchCardData();
 
-        if (isHydrationComplete()) {
-            const activeFile = getActiveFilename();
-            runDeferredBranchDetection(activeFile);
-            patchBranchIndicators();
-
-            if (branchContextActive) {
-                const result = updateBranchContextInjection(activeFile);
-                updateBranchContextStatusUI(result);
-            }
-        }
+        if (isHydrationComplete()) scheduleBranchDetection();
     }, 600);
+}
+
+function cancelBranchDetection() {
+    const task = branchDetectionTask;
+    branchDetectionTask = null;
+    if (!task) return;
+    if (task.idle) globalThis.cancelIdleCallback?.(task.id);
+    else clearTimeout(task.id);
+}
+
+// Coalesce work and read the current chat at execution time, so a delayed
+// callback cannot paint branch badges for a chat that is no longer selected.
+function scheduleBranchDetection() {
+    if (branchDetectionTask) return;
+    const task = {};
+    branchDetectionTask = task;
+    const run = () => {
+        if (branchDetectionTask !== task) return;
+        branchDetectionTask = null;
+        if (!panelOpen || isAnyViewActive()) return;
+        const activeFile = getActiveFilename();
+        runDeferredBranchDetection(activeFile);
+        patchBranchIndicators();
+        if (branchContextActive) {
+            const result = updateBranchContextInjection(activeFile);
+            updateBranchContextStatusUI(result);
+        }
+    };
+    task.idle = typeof globalThis.requestIdleCallback === 'function';
+    task.id = task.idle ? globalThis.requestIdleCallback(run, { timeout: 500 }) : setTimeout(run, 0);
 }
 
 function scheduleSearchRefresh() {
@@ -1936,6 +2027,7 @@ export async function togglePanel() {
 }
 
 export function closePanel() {
+    cancelBranchDetection();
     const mode = getDisplayMode();
     if (mode === 'popup') {
         closePopup();
@@ -1953,7 +2045,7 @@ async function refreshAfterPanelPaint(root, requestId) {
     // before paint. Leave a frame for the visible shell before doing that work.
     await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
     if (!panelOpen || requestId !== panelOpenRequestId || !root.isConnected) return;
-    await refreshPanel();
+    await refreshPanel({ forceRevalidate: true });
 }
 
 async function toggleSidePanel() {
@@ -1971,6 +2063,7 @@ async function toggleSidePanel() {
 }
 
 function closeSidePanel() {
+    resetSearchState();
     panelOpenRequestId++;
     clearThreadListState();
     const panel = document.getElementById('chat-manager-panel');
@@ -2003,6 +2096,7 @@ async function togglePopup() {
 }
 
 function closePopup() {
+    resetSearchState();
     panelOpenRequestId++;
     clearThreadListState();
     const overlay = document.getElementById('chat-manager-shadow-overlay');
@@ -2057,7 +2151,8 @@ function deactivateTimeline() {
 //  Panel Refresh
 // ──────────────────────────────────────────────
 
-export async function refreshPanel() {
+export async function refreshPanel(options = {}) {
+    const buildOptions = { forceRevalidate: options.forceRevalidate === true };
     const context = SillyTavern.getContext();
     ensureHydrationSubscription();
     ensureSearchModeBadge();
@@ -2092,7 +2187,7 @@ export async function refreshPanel() {
         }
         const activeFile = getActiveFilename();
         if (activeFile) prioritizeInQueue(activeFile);
-        await buildIndex(null, null);
+        await buildIndex(null, null, buildOptions);
         return;
     }
 
@@ -2114,7 +2209,7 @@ export async function refreshPanel() {
         // Still run index build in the background
         const activeFile = getActiveFilename();
         if (activeFile) prioritizeInQueue(activeFile);
-        await buildIndex(null, null);
+        await buildIndex(null, null, buildOptions);
         return;
     }
 
@@ -2145,7 +2240,7 @@ export async function refreshPanel() {
 
         const activeFile = getActiveFilename();
         if (activeFile) prioritizeInQueue(activeFile);
-        await buildIndex(null, null);
+        await buildIndex(null, null, buildOptions);
         return;
     }
 
@@ -2176,7 +2271,7 @@ export async function refreshPanel() {
 
         const activeFile = getActiveFilename();
         if (activeFile) prioritizeInQueue(activeFile);
-        await buildIndex(null, null);
+        await buildIndex(null, null, buildOptions);
         return;
     }
 
@@ -2185,11 +2280,7 @@ export async function refreshPanel() {
 
     const renderThreadListWithBranches = () => {
         renderThreadCards();
-        const activeFile = getActiveFilename();
-        setTimeout(() => {
-            runDeferredBranchDetection(activeFile);
-            patchBranchIndicators();
-        }, 0);
+        scheduleBranchDetection();
     };
 
     const renderFromLatestIndex = () => {
@@ -2220,11 +2311,12 @@ export async function refreshPanel() {
             searchState = null;
         }
         renderedFromMetadata = true;
+        prioritizeHydrationFiles([getActiveFilename(), ...getVisibleEntryFileNames().slice(0, 12)]);
         if (!panelOpen || isAnyViewActive()) return;
         if (!hasCache || buildState?.changed) {
             renderFromLatestIndex();
         }
-    });
+    }, buildOptions);
 
     // Invalidate search state since the index may have changed
     if (changed && !renderedFromMetadata) {
@@ -2331,7 +2423,7 @@ function patchCardData() {
         }
 
         // Remove "Indexing..." span and enable AI buttons when loaded
-        if (entry.isLoaded) {
+        if (entry.isLoaded && !entry.needsHydration) {
             const indexingSpan = Array.from(meta.querySelectorAll('span'))
                 .find(s => s.textContent === 'Indexing...');
             if (indexingSpan) indexingSpan.remove();
@@ -2549,6 +2641,7 @@ function buildThreadCardsHtml(entries, previousEntry = null) {
             hasRenderedClusterGroup = true;
         }
 
+        const isReady = entry.isLoaded && !entry.needsHydration;
         const displayName = getDisplayName(entry.fileName) || entry.fileName;
         const summaryDisplay = getSummaryDisplay(entry);
         const isActive = entry.fileName === activeChatFile;
@@ -2575,7 +2668,7 @@ function buildThreadCardsHtml(entries, previousEntry = null) {
         const driftInfo = driftSummary
             ? `<button type="button" class="chat-manager-drift-jump" data-filename="${escapeAttr(entry.fileName)}" data-msg-index="${driftSummary.firstMsgIndex}" title="Topic shifts near messages: ${escapeAttr(driftSummary.positions.join(', '))}">${driftSummary.count} topic shift${driftSummary.count !== 1 ? 's' : ''}</button>`
             : '';
-        const indexingInfo = entry.isLoaded ? '' : '<span>Indexing...</span>';
+        const indexingInfo = isReady ? '' : '<span>Indexing...</span>';
         const embStatus = getEmbeddingStatus(entry);
         const embBadge = (embStatus === 'full' || embStatus === 'partial' || embStatus === 'none')
             ? `<span class="chat-manager-emb-status chat-manager-emb-status-${embStatus}" title="${escapeAttr(embStatusTitle(embStatus))}"><i class="fa-solid fa-vector-square"></i></span>`
@@ -2583,16 +2676,16 @@ function buildThreadCardsHtml(entries, previousEntry = null) {
         const embedCardBtn = (embStatus !== 'disabled' && embStatus !== 'full' && embStatus !== 'unknown' && entry.isLoaded)
             ? `<i class="chat-manager-icon-btn chat-manager-embed-card-btn fa-fw fa-solid fa-bolt" data-filename="${escapeAttr(entry.fileName)}" title="Generate embeddings for this thread" tabindex="0"></i>`
             : '';
-        const aiSummaryTitleClasses = `chat-manager-icon-btn chat-manager-ai-summarize-title-btn fa-fw fa-solid fa-wand-magic-sparkles${entry.isLoaded ? '' : ' disabled'}`;
-        const aiTitleClasses = `chat-manager-icon-btn chat-manager-ai-title-btn fa-fw fa-solid fa-robot${entry.isLoaded ? '' : ' disabled'}`;
-        const regenSummaryClasses = `chat-manager-icon-btn chat-manager-regen-summary-btn fa-fw fa-solid fa-rotate${entry.isLoaded ? '' : ' disabled'}`;
-        const aiSummaryTitle = entry.isLoaded
+        const aiSummaryTitleClasses = `chat-manager-icon-btn chat-manager-ai-summarize-title-btn fa-fw fa-solid fa-wand-magic-sparkles${isReady ? '' : ' disabled'}`;
+        const aiTitleClasses = `chat-manager-icon-btn chat-manager-ai-title-btn fa-fw fa-solid fa-robot${isReady ? '' : ' disabled'}`;
+        const regenSummaryClasses = `chat-manager-icon-btn chat-manager-regen-summary-btn fa-fw fa-solid fa-rotate${isReady ? '' : ' disabled'}`;
+        const aiSummaryTitle = isReady
             ? 'Generate summary and set AI title'
             : 'AI summary/title will be available once indexing finishes';
-        const aiTitle = entry.isLoaded
+        const aiTitle = isReady
             ? 'Generate AI title'
             : 'AI title will be available once indexing finishes';
-        const summaryTitle = entry.isLoaded
+        const summaryTitle = isReady
             ? 'Generate/regenerate summary'
             : 'AI summary will be available once indexing finishes';
 
@@ -3216,6 +3309,11 @@ export async function getSemanticQueryEmbedding(query) {
             }
         }
         return vector;
+    } catch (error) {
+        if (isStaleEmbeddingOperationError(error) && error.reason === 'dimensions') {
+            clearInMemoryEmbeddings({ rerender: false });
+        }
+        throw error;
     } finally {
         if (queryEmbeddingInFlight.get(key) === inFlight) queryEmbeddingInFlight.delete(key);
     }
@@ -3297,6 +3395,7 @@ async function performSemanticSearch(trimmed, requestId) {
             const combinedScore = (0.7 * semanticScore) + (0.3 * keywordScore);
             const result = {
                 item: msg,
+                matchedText: variant.text,
                 matchIndex: variantTextLower.indexOf(lowerQuery),
                 combinedScore,
                 semanticScore,
@@ -3355,17 +3454,18 @@ function performKeywordSearch(trimmed) {
 }
 
 export async function performSearch(query) {
+    const requestId = ++latestSearchRequestId;
     const container = document.getElementById('chat-manager-content');
     if (!container) return;
 
     if (!query || query.trim().length < 2) {
+        searchState = null;
         setSearchModeBadge('keyword');
         renderThreadCards();
         return;
     }
 
     const trimmed = query.trim();
-    const requestId = ++latestSearchRequestId;
 
     if (shouldUseSemanticSearch(trimmed)) {
         try {
@@ -3473,7 +3573,7 @@ function renderSearchPage(container, fromIndex) {
         const dateStr = formatDateOrFallback(moment, item.timestamp, '');
 
         // Build highlighted excerpt
-        const excerpt = buildHighlightedExcerpt(item.text, searchState.query);
+        const excerpt = buildHighlightedExcerpt(result.matchedText ?? item.text, searchState.query);
 
         let similarityPct = '';
         let scoreAttr = '';
@@ -3705,17 +3805,18 @@ async function handleSwitchThread(e) {
     const activeChatFile = getActiveFilename();
     if (filename === activeChatFile) return;
 
-    const context = SillyTavern.getContext();
-    await context.openCharacterChat(filename.replace(/\.jsonl$/i, ''));
-
-    if (getDisplayMode() === 'popup') {
-        closePanel();
-    }
+    await navigateToChat(filename, null, {
+        ...chatNavigationOptions(filename),
+        beforeOpen: () => { if (getDisplayMode() === 'popup') closePanel(); },
+    });
 }
 
 function handleEditDisplayName(e) {
     e.stopPropagation();
     const filename = e.currentTarget.dataset.filename;
+    const context = SillyTavern.getContext();
+    const avatar = context.characters?.[context.characterId]?.avatar;
+    if (!avatar) return;
     const card = e.currentTarget.closest('.chat-manager-card');
     if (!card) return;
 
@@ -3737,7 +3838,6 @@ function handleEditDisplayName(e) {
         span.className = 'chat-manager-display-name';
         span.dataset.filename = filename;
         span.title = 'Click to switch thread';
-        span.addEventListener('click', handleSwitchThread);
 
         if (cancelled) {
             span.textContent = currentName;
@@ -3746,9 +3846,7 @@ function handleEditDisplayName(e) {
         }
 
         const newName = input.value.trim();
-        if (newName && newName !== filename) {
-            setDisplayName(filename, newName);
-        }
+        setChatMeta(filename, { displayName: newName === filename ? '' : newName, titleEditedByUser: true }, avatar);
         span.textContent = newName || filename;
         input.replaceWith(span);
     };
@@ -3765,6 +3863,27 @@ function handleEditDisplayName(e) {
     });
 }
 
+function captureChatAction(filename, entry) {
+    const context = SillyTavern.getContext();
+    const avatar = context.characters?.[context.characterId]?.avatar;
+    if (!avatar) throw new Error('No character selected');
+    const messages = filename === getActiveFilename() && Array.isArray(context.chat)
+        ? context.chat.filter(msg => typeof msg?.mes === 'string').map(msg => ({
+            role: msg.is_user ? 'user' : 'assistant', text: msg.mes,
+        }))
+        : entry.messages.map(msg => ({ role: msg.role, text: msg.text }));
+    return {
+        avatar, filename, messages, characterName: context.name2 || 'Character',
+        branchPoint: entry.branchPoint,
+        siblingContext: getSummarySiblingContextText(filename, context.name2),
+    };
+}
+
+function isCurrentActionCharacter(action) {
+    const context = SillyTavern.getContext();
+    return context.characters?.[context.characterId]?.avatar === action.avatar;
+}
+
 async function handleAITitle(e) {
     e.stopPropagation();
     const btn = e.currentTarget;
@@ -3773,7 +3892,7 @@ async function handleAITitle(e) {
 
     const index = getIndex();
     const entry = index[filename];
-    if (!entry || !entry.isLoaded) {
+    if (!entry || !entry.isLoaded || (entry.needsHydration && filename !== getActiveFilename())) {
         toastr.info('This thread is still indexing. Try again in a moment.');
         return;
     }
@@ -3783,26 +3902,14 @@ async function handleAITitle(e) {
     btn.classList.add('fa-gear');
 
     try {
-        const activeChatFile = getActiveFilename();
-        let title;
-
-        if (filename === activeChatFile) {
-            title = await generateTitleForActiveChat();
-        } else {
-            const chatData = index[filename];
-            if (!chatData || !chatData.messages.length) {
-                toastr.warning('No messages in this chat.');
-                return;
-            }
-            const context = SillyTavern.getContext();
-            title = await generateTitleForChat(chatData.messages, context.name2);
-        }
+        const action = captureChatAction(filename, entry);
+        const title = await generateTitleForChat(action.messages, action.characterName);
 
         if (title) {
-            setDisplayName(filename, title);
+            setChatMeta(filename, { displayName: title, titleEditedByUser: false }, action.avatar);
             // Update the UI
             const card = document.querySelector(`.chat-manager-card[data-filename="${CSS.escape(filename)}"]`);
-            if (card) {
+            if (card && isCurrentActionCharacter(action)) {
                 const nameEl = card.querySelector('.chat-manager-display-name');
                 if (nameEl) nameEl.textContent = title;
             }
@@ -3825,7 +3932,7 @@ async function handleAISummaryAndTitle(e) {
 
     const index = getIndex();
     const entry = index[filename];
-    if (!entry || !entry.isLoaded) {
+    if (!entry || !entry.isLoaded || (entry.needsHydration && filename !== getActiveFilename())) {
         toastr.info('This thread is still indexing. Try again in a moment.');
         return;
     }
@@ -3835,41 +3942,20 @@ async function handleAISummaryAndTitle(e) {
     btn.classList.add('fa-gear');
 
     try {
-        const activeChatFile = getActiveFilename();
-        let summary;
-        let title;
-
-        if (filename === activeChatFile) {
-            // Keep branch-context prompt in sync for active-thread AI actions.
-            if (branchContextActive && activeChatFile) {
-                const result = updateBranchContextInjection(activeChatFile);
-                updateBranchContextStatusUI(result);
-            }
-
-            summary = await generateSummaryForActiveChat();
-            title = await generateTitleForActiveChat();
-        } else {
-            const chatData = index[filename];
-            if (!chatData || !chatData.messages.length) {
-                toastr.warning('No messages in this chat.');
-                return;
-            }
-            const context = SillyTavern.getContext();
-            const siblingContext = getSummarySiblingContextText(filename, context.name2);
-            summary = await generateSummaryForChat(chatData.messages, context.name2, chatData.branchPoint, siblingContext);
-            title = await generateTitleForChat(chatData.messages, context.name2);
-        }
+        const action = captureChatAction(filename, entry);
+        const summary = await generateSummaryForChat(action.messages, action.characterName, action.branchPoint, action.siblingContext);
+        const title = await generateTitleForChat(action.messages, action.characterName);
 
         if (summary) {
-            setSummary(filename, summary, false);
+            setChatMeta(filename, { summary, summaryEditedByUser: false }, action.avatar);
         }
         if (title) {
-            setDisplayName(filename, title);
+            setChatMeta(filename, { displayName: title, titleEditedByUser: false }, action.avatar);
         }
 
         if (summary || title) {
             const card = document.querySelector(`.chat-manager-card[data-filename="${CSS.escape(filename)}"]`);
-            if (card) {
+            if (card && isCurrentActionCharacter(action)) {
                 if (title) {
                     const nameEl = card.querySelector('.chat-manager-display-name');
                     if (nameEl) nameEl.textContent = title;
@@ -3907,7 +3993,9 @@ async function handleRenameFile(e) {
     const context = SillyTavern.getContext();
 
     // Use ST's Popup for confirmation
-    const { Popup, POPUP_TYPE, POPUP_RESULT } = context;
+    const { Popup, POPUP_TYPE } = context;
+    const avatar = context.characters?.[context.characterId]?.avatar;
+    if (!avatar) return;
 
     const baseName = filename.replace(/\.jsonl$/, '');
 
@@ -3915,13 +4003,11 @@ async function handleRenameFile(e) {
         `<div class="chat-manager-rename-dialog">
             <p><strong>Warning:</strong> This will rename the actual chat file on disk. Checkpoints or bookmarks referencing the old filename may break.</p>
             <p>Current filename: <code>${escapeHtml(filename)}</code></p>
-            <label>New filename:<br>
-                <input type="text" id="chat-manager-rename-input" value="${escapeAttr(baseName)}" style="width:100%">
-            </label>
+            <label>New filename:</label>
             <p class="chat-manager-rename-suffix">.jsonl will be added automatically</p>
         </div>`,
-        POPUP_TYPE.CONFIRM,
-        '',
+        POPUP_TYPE.INPUT,
+        baseName,
         {
             okButton: 'Rename',
             cancelButton: 'Cancel',
@@ -3930,12 +4016,10 @@ async function handleRenameFile(e) {
 
     const result = await popup.show();
 
-    if (result !== POPUP_RESULT.AFFIRMATIVE) return;
-
-    const inputEl = document.getElementById('chat-manager-rename-input');
-    if (!inputEl) return;
-
-    let newBase = inputEl.value.trim();
+    if (typeof result !== 'string') return;
+    const current = SillyTavern.getContext();
+    if (current.characters?.[current.characterId]?.avatar !== avatar) return;
+    let newBase = result.trim();
 
     // Sanitize: allow a-z, 0-9, -, _ only
     newBase = newBase.replace(/[^a-zA-Z0-9\-_]/g, '_');
@@ -3958,11 +4042,25 @@ async function handleRenameFile(e) {
         return;
     }
 
+    const eventSource = context.eventSource;
+    const renamedEvent = (context.eventTypes || context.event_types)?.CHAT_RENAMED;
+    if (!eventSource?.on || !eventSource?.removeListener || !renamedEvent) {
+        toastr.error('Cannot verify chat renames in this SillyTavern version.');
+        return;
+    }
+    let confirmedName = null;
+    const onRenamed = (event) => {
+        if (event?.avatarId === avatar && event.oldFileName === filename && !event.groupId) {
+            confirmedName = event.newFileName;
+        }
+    };
+    eventSource.on(renamedEvent, onRenamed);
     try {
         await context.renameChat(baseName, newBase);
-        migrateFileKey(filename, newFilename);
-        toastr.success(`Renamed to ${newFilename}`);
-        await refreshPanel();
+        if (!confirmedName) throw new Error('The host did not confirm the rename');
+        migrateFileKey(filename, confirmedName, avatar);
+        toastr.success(`Renamed to ${confirmedName}`);
+        if (isCurrentActionCharacter({ avatar })) await refreshPanel();
     } catch (err) {
         console.error(`[${MODULE_NAME}] Rename failed:`, err);
         // Server returns 400 when destination file already exists (race condition)
@@ -3971,12 +4069,17 @@ async function handleRenameFile(e) {
         } else {
             toastr.error('Failed to rename chat file.');
         }
+    } finally {
+        eventSource.removeListener(renamedEvent, onRenamed);
     }
 }
 
 function handleEditSummary(e) {
     e.stopPropagation();
     const filename = e.currentTarget.dataset.filename;
+    const context = SillyTavern.getContext();
+    const avatar = context.characters?.[context.characterId]?.avatar;
+    if (!avatar) return;
     const summaryBlock = e.currentTarget.closest('.chat-manager-card-summary');
     if (!summaryBlock) return;
 
@@ -3992,7 +4095,7 @@ function handleEditSummary(e) {
 
     const save = () => {
         const newSummary = textarea.value.trim();
-        setSummary(filename, newSummary, true);
+        setChatMeta(filename, { summary: newSummary, summaryEditedByUser: true }, avatar);
 
         const p = document.createElement('p');
         const entry = getIndex()[filename] || { fileName: filename, isLoaded: false, messages: [] };
@@ -4020,7 +4123,7 @@ async function handleRegenSummary(e) {
 
     const index = getIndex();
     const entry = index[filename];
-    if (!entry || !entry.isLoaded) {
+    if (!entry || !entry.isLoaded || (entry.needsHydration && filename !== getActiveFilename())) {
         toastr.info('This thread is still indexing. Try again in a moment.');
         return;
     }
@@ -4028,26 +4131,13 @@ async function handleRegenSummary(e) {
     btn.classList.add('disabled', 'fa-spin');
 
     try {
-        const activeChatFile = getActiveFilename();
-        let summary;
-
-        if (filename === activeChatFile) {
-            summary = await generateSummaryForActiveChat();
-        } else {
-            const chatData = index[filename];
-            if (!chatData || !chatData.messages.length) {
-                toastr.warning('No messages in this chat.');
-                return;
-            }
-            const context = SillyTavern.getContext();
-            const siblingContext = getSummarySiblingContextText(filename, context.name2);
-            summary = await generateSummaryForChat(chatData.messages, context.name2, chatData.branchPoint, siblingContext);
-        }
+        const action = captureChatAction(filename, entry);
+        const summary = await generateSummaryForChat(action.messages, action.characterName, action.branchPoint, action.siblingContext);
 
         if (summary) {
-            setSummary(filename, summary, false);
+            setChatMeta(filename, { summary, summaryEditedByUser: false }, action.avatar);
             const card = document.querySelector(`.chat-manager-card[data-filename="${CSS.escape(filename)}"]`);
-            if (card) {
+            if (card && isCurrentActionCharacter(action)) {
                 const textEl = card.querySelector('.chat-manager-summary-text');
                 if (textEl) {
                     patchSummaryTextElement(textEl, entry || { fileName: filename, isLoaded: false, messages: [] });
@@ -4081,6 +4171,7 @@ async function handleJumpToMessage(e) {
 
     const activeChatFile = getActiveFilename();
     const context = SillyTavern.getContext();
+    const avatar = context.characters?.[context.characterId]?.avatar;
 
     if (filename !== activeChatFile) {
         const displayName = getDisplayName(filename) || filename;
@@ -4095,16 +4186,10 @@ async function handleJumpToMessage(e) {
 
         const result = await popup.show();
         if (result !== POPUP_RESULT.AFFIRMATIVE) return;
-
-        const switched = await safeSwitchChatFromJump(filename, displayName);
-        if (!switched) return;
+        if (!isCurrentActionCharacter({ avatar })) return;
     }
 
-    if (getDisplayMode() === 'popup') {
-        closePanel();
-    }
-
-    await scrollToMessageInChat(msgIndex);
+    await navigateToChat(filename, msgIndex, chatNavigationOptions(filename));
 }
 
 async function handleJumpToGraphMessage(e) {
@@ -4200,51 +4285,18 @@ function handleDedupBadgeClick(e) {
 // ──────────────────────────────────────────────
 
 /**
- * Scroll to a message in the active chat, loading earlier messages if needed.
- * Uses SillyTavern's built-in /chat-jump which handles message truncation.
+ * UI hooks for the shared serialized navigation operation.
  */
-async function scrollToMessageInChat(msgIndex) {
-    const context = SillyTavern.getContext();
-    try {
-        await context.executeSlashCommandsWithOptions(`/chat-jump ${msgIndex}`);
-    } catch (err) {
-        console.warn(`[${MODULE_NAME}] /chat-jump failed for index ${msgIndex}:`, err);
-        // Fallback: direct scroll if element happens to exist
-        const messageEl = document.querySelector(`#chat .mes[mesid="${msgIndex}"]`);
-        if (messageEl) {
-            messageEl.scrollIntoView({ behavior: 'smooth', block: 'center' });
-        }
-    }
+function chatNavigationOptions(filename, displayName = getDisplayName(filename) || filename) {
+    return {
+        beforeScroll: () => { if (getDisplayMode() === 'popup') closePanel(); },
+        onError: (error) => {
+            console.warn(`[${MODULE_NAME}] Navigation failed for "${filename}".`, error);
+            toastr.warning(`Could not safely switch to "${displayName}". Please switch manually, then jump again.`);
+        },
+    };
 }
 
-/**
- * Perform a guarded chat switch for jump actions:
- * - pre-save current chat when possible
- * - then switch chat only if precheck passes
- */
-async function safeSwitchChatFromJump(filename, displayName = filename) {
-    const context = SillyTavern.getContext();
-    const target = filename.replace(/\.jsonl$/i, '');
-
-    try {
-        if (typeof context.saveChat === 'function') {
-            await context.saveChat();
-            // Allow any trailing async save state to settle before switching.
-            await new Promise(r => setTimeout(r, 200));
-        } else {
-            console.warn(`[${MODULE_NAME}] context.saveChat is unavailable; switching without precheck.`);
-        }
-
-        await context.openCharacterChat(target);
-        // Wait for chat to render after switching.
-        await new Promise(r => setTimeout(r, 500));
-        return true;
-    } catch (err) {
-        console.warn(`[${MODULE_NAME}] Safe jump switch failed for "${filename}".`, err);
-        toastr.warning(`Could not safely switch to "${displayName}". Please switch manually, then jump again.`);
-        return false;
-    }
-}
 
 /**
  * Parse an advanced message-count input value into a safe persisted filter value.
@@ -4289,7 +4341,7 @@ export function onSearchInput(query) {
     const toolbar = _getFilterToolbar();
     if (!query || query.trim().length < 2) {
         if (toolbar) toolbar.style.display = '';
-        renderThreadCards();
+        performSearch(query);
     } else {
         if (toolbar) toolbar.style.display = 'none';
         dismissDropdown();

@@ -9,11 +9,12 @@
  *   expandToFullScreen() / closeFullScreen()
  */
 
-import { buildIcicleData, reLayoutSubtree } from './icicle-data.js';
+import { timestampMs } from './timestamps.js';
+import { buildIcicleData, reLayoutSubtree, sharesActiveThread } from './icicle-data.js';
 import { getIndex, getMessageEmbedding } from './chat-reader.js';
 import { getDisplayName, getEmbeddingSettings, setEmbeddingSettings } from './metadata-store.js';
 import { clusterColor, gradientColor, topicShiftScores, cosineSimilarity } from './semantic-engine.js';
-import { embedText, isEmbeddingConfigured } from './embedding-service.js';
+import { embedText, isEmbeddingConfigured, captureEmbeddingOperation, isEmbeddingOperationCurrent } from './embedding-service.js';
 
 const MODULE_NAME = 'chat_manager';
 const EXTENSION_PATH = '/scripts/extensions/third-party/chat_manager';
@@ -43,6 +44,7 @@ let mounted = false;
 let lifecycleGeneration = 0;
 let dataUpdateInFlight = false;
 let dataUpdatePending = false;
+let resetViewPending = false;
 let dataUpdateToken = null;
 let threadFocusActive = true;
 
@@ -107,6 +109,7 @@ let lastTouchTime = 0;
 // Interaction state
 let hoveredNode = null;
 let toolbarEl = null;
+let emptyStateEl = null;
 let resetBtnEl = null;
 let focusBtnEl = null;
 let jumpToCurrentBtnEl = null;
@@ -128,9 +131,9 @@ let cachedActiveChatFile = null;
 
 // rAF coalescing for drag/wheel rendering
 let renderPending = false;
-
-// Debounce for explore-exit rebuild
-let rebuildTimer = null;
+let navigationRevision = 0;
+let searchRevision = 0;
+let embeddingRevision = 0;
 
 // Debounce for window resize
 let resizeTimer = null;
@@ -155,7 +158,8 @@ let semanticSearchScores = new Map(); // node → similarity score
 let semanticSearchActive = false;
 let semanticSearchMin = 0;
 let semanticSearchMax = 0;
-let semanticQueryCache = new Map(); // query string → vector
+let semanticQueryCache = new Map(); // query string → { vector, operation }
+let semanticSearchNavigationRevision = -1;
 
 // Callbacks
 let onJumpToChat = null;
@@ -178,6 +182,41 @@ export function setIcicleCallbacks(callbacks) {
 
 export function setThreadFocus(active) {
     threadFocusActive = active;
+}
+
+/** Retire held vectors immediately, including while the next data rebuild is pending. */
+export function invalidateIcicleEmbeddings() {
+    embeddingRevision++;
+    searchRevision++;
+    semanticQueryCache.clear();
+    if (viewAnimId && semanticSearchNavigationRevision === navigationRevision) cancelViewportAnim();
+    semanticSearchNavigationRevision = -1;
+    clearSemanticSearchState();
+    if (searchModeSemantic) {
+        searchMatches = [];
+        searchMatchSet = new Set();
+        searchMatchIndex = -1;
+    }
+    stripSemanticFields(icicleRoot);
+    pcaRanges = null;
+    topicDriftCache.clear();
+    activeTopicDrift = null;
+    updateSearchUI();
+    updateColorModeControl();
+    updateColorLegend();
+    render();
+}
+
+function stripSemanticFields(root) {
+    if (!root) return;
+    const stack = [root];
+    while (stack.length) {
+        const node = stack.pop();
+        node.chatEmbedding = null;
+        node.clusterLabel = null;
+        node.pca3d = null;
+        for (const child of node.children.values()) stack.push(child);
+    }
 }
 
 export function isIcicleMounted() {
@@ -223,7 +262,12 @@ export async function mountIcicle(containerEl, mode) {
 
     const activeChatFile = getActiveChatFile ? getActiveChatFile() : null;
     const chatIndex = getIndex();
+    const buildEmbeddingRevision = embeddingRevision;
     const data = await buildIcicleData(chatIndex, activeChatFile, { threadFocus: threadFocusActive });
+    if (buildEmbeddingRevision !== embeddingRevision) {
+        stripSemanticFields(data.root);
+        data.pcaRanges = null;
+    }
     if (generation !== lifecycleGeneration || container !== containerEl) return;
     refreshActiveTopicDrift(activeChatFile, chatIndex);
 
@@ -242,11 +286,6 @@ export async function mountIcicle(containerEl, mode) {
     exploreDepthOffset = 0;
     isDragging = false;
     wasDragging = false;
-
-    if (!icicleRoot || flatNodes.length === 0) {
-        container.innerHTML = '<div class="chat-manager-empty">No loaded chats to visualize.</div>';
-        return;
-    }
 
     // NOW clear container and build DOM (data is ready)
     container.innerHTML = '';
@@ -282,7 +321,7 @@ export async function mountIcicle(containerEl, mode) {
         focusBtnEl.classList.toggle('active', threadFocusActive);
         focusBtnEl.title = threadFocusActive ? 'Showing current thread — click for all chats' : 'Showing all chats — click for current thread';
         if (onThreadFocusChanged) onThreadFocusChanged(threadFocusActive);
-        updateIcicleData();
+        updateIcicleData({ resetView: true });
     });
     toolbarEl.appendChild(focusBtnEl);
 
@@ -343,23 +382,25 @@ export async function mountIcicle(containerEl, mode) {
     }
 
     mounted = true;
+    updateEmptyState();
     tryApplyPendingFocus();
 }
 
 export function unmountIcicle() {
     lifecycleGeneration++;
     dataUpdatePending = false;
+    resetViewPending = false;
     dataUpdateInFlight = false;
     dataUpdateToken = null;
     cancelViewportAnim();
     cancelInertia();
-    clearTimeout(rebuildTimer);
-    rebuildTimer = null;
     renderPending = false;
     unbindEvents();
     removeTooltip();
     removePopup();
     removeSearchBar();
+    emptyStateEl?.remove();
+    emptyStateEl = null;
 
     if (canvas) {
         canvas.remove();
@@ -411,8 +452,9 @@ export function unmountIcicle() {
     mounted = false;
 }
 
-export async function updateIcicleData() {
+export async function updateIcicleData({ resetView = false } = {}) {
     if (!mounted || !canvas) return;
+    resetViewPending ||= resetView;
     if (dataUpdateInFlight) {
         dataUpdatePending = true;
         return;
@@ -422,13 +464,21 @@ export async function updateIcicleData() {
     dataUpdateToken = updateToken;
     const generation = lifecycleGeneration;
     const mountedCanvas = canvas;
+    const shouldResetView = resetViewPending;
+    resetViewPending = false;
+    const buildThreadFocus = threadFocusActive;
+    const buildEmbeddingRevision = embeddingRevision;
 
     const activeChatFile = getActiveChatFile ? getActiveChatFile() : null;
     const chatIndex = getIndex();
     let data;
     try {
-        data = await buildIcicleData(chatIndex, activeChatFile, { threadFocus: threadFocusActive });
+        data = await buildIcicleData(chatIndex, activeChatFile, {
+            threadFocus: buildThreadFocus,
+            previousRoot: shouldResetView ? null : icicleRoot,
+        });
     } catch (err) {
+        if (generation !== lifecycleGeneration || canvas !== mountedCanvas || !mounted) return;
         if (dataUpdateToken === updateToken) {
             dataUpdateInFlight = false;
             dataUpdateToken = null;
@@ -442,40 +492,61 @@ export async function updateIcicleData() {
         dataUpdateToken = null;
     }
     if (generation !== lifecycleGeneration || canvas !== mountedCanvas || !mounted) {
+        return;
+    }
+    if (buildThreadFocus !== threadFocusActive || activeChatFile !== (getActiveChatFile ? getActiveChatFile() : null)) {
+        resetViewPending ||= shouldResetView;
+        dataUpdatePending = true;
         queuePendingIcicleUpdate();
         return;
     }
+    if (buildEmbeddingRevision !== embeddingRevision) {
+        stripSemanticFields(data.root);
+        data.pcaRanges = null;
+    }
     refreshActiveTopicDrift(activeChatFile, chatIndex);
 
+    // Capture immediately before publishing: the user may have panned while
+    // the asynchronous build was running.
+    const previousView = captureView();
+    const previousExploreRoot = exploreRoot;
     icicleRoot = data.root;
     flatNodes = data.flatNodes;
     maxDepth = data.maxDepth;
     loadedCount = data.loadedCount;
     pcaRanges = data.pcaRanges || null;
-    rebuildDepthIndex();
-    zoomStack = [];
-    zoomRoot = null;
-    exploreRoot = null;
-    exploreDepthOffset = 0;
-    legendSelectedCluster = null;
-    viewX = 0;
-    viewY0 = 0;
-    viewY1 = 1;
-    isDragging = false;
-    wasDragging = false;
     cancelViewportAnim();
 
-    if (!icicleRoot || flatNodes.length === 0) {
-        queuePendingIcicleUpdate();
-        return;
+    exploreRoot = shouldResetView ? null : findReplacementNode(previousExploreRoot);
+    exploreDepthOffset = 0;
+    if (exploreRoot) {
+        const subtree = reLayoutSubtree(exploreRoot, activeChatFile, { preserveOrder: true });
+        flatNodes = subtree.flatNodes;
+        maxDepth = subtree.maxDepth;
+        exploreDepthOffset = subtree.depthOffset;
+    }
+    rebuildDepthIndex();
+    zoomStack = shouldResetView ? [] : zoomStack.map(findReplacementNode).filter(Boolean);
+    zoomRoot = shouldResetView ? null : findReplacementNode(zoomRoot);
+    hoveredNode = null;
+    hideTooltip();
+
+    if (shouldResetView) {
+        cancelInertia();
+        viewX = 0;
+        viewY0 = 0;
+        viewY1 = 1;
+        scrollToActiveLeaf(activeChatFile);
+    } else {
+        restoreView(previousView);
     }
 
-    // Re-run search against new data if query is active
+    // Refresh highlights without navigating back to the first search result.
     if (searchQuery.length >= 2) {
-        executeSearch(searchQuery);
+        executeSearch(searchQuery, { navigate: false });
     }
 
-    scrollToActiveLeaf(activeChatFile);
+    updateEmptyState();
     updateColorModeControl();
     updateColorLegend();
     render();
@@ -483,6 +554,51 @@ export async function updateIcicleData() {
     updateResetButton();
     tryApplyPendingFocus();
     queuePendingIcicleUpdate();
+}
+
+function findReplacementNode(previous) {
+    if (!previous) return null;
+    const files = new Set(previous.chatFiles);
+    return flatNodes.find(node => node.depth === previous.depth
+        && node.role === previous.role && node.normalizedText === previous.normalizedText
+        && node.chatFiles.some(file => files.has(file))) || null;
+}
+
+function captureView() {
+    const midY = (viewY0 + viewY1) / 2;
+    const depth = Math.floor((viewX + canvasWidth / 2) / COL_WIDTH) + exploreDepthOffset;
+    let anchor = null;
+    for (const node of flatNodes) {
+        if (node.y0 > midY || node.y1 <= midY) continue;
+        if (!anchor || Math.abs(node.depth - depth) < Math.abs(anchor.depth - depth)) anchor = node;
+    }
+    return { x: viewX, y0: viewY0, y1: viewY1, depthOffset: exploreDepthOffset,
+        anchor, anchorY0: anchor?.y0, anchorY1: anchor?.y1 };
+}
+
+function restoreView(previous) {
+    viewX = previous.x + (previous.depthOffset - exploreDepthOffset) * COL_WIDTH;
+    viewY0 = previous.y0;
+    viewY1 = previous.y1;
+    const anchor = findReplacementNode(previous.anchor);
+    const oldSpan = previous.anchorY1 - previous.anchorY0;
+    let scale = 1;
+    if (anchor && oldSpan > 0) {
+        scale = (anchor.y1 - anchor.y0) / oldSpan;
+        // Keep the same part of a visible message in the same screen position
+        // when newly indexed branches change its share of the chart.
+        const span = Math.max(MIN_VIEW_SPAN, Math.min(MAX_VIEW_SPAN, (previous.y1 - previous.y0) * scale));
+        const mid = anchor.y0 + (((previous.y0 + previous.y1) / 2) - previous.anchorY0) * scale;
+        viewY0 = mid - span / 2;
+        viewY1 = mid + span / 2;
+    }
+    clampViewport();
+    // An in-progress drag/pinch must continue from the refreshed coordinates.
+    dragStartViewX += viewX - previous.x;
+    dragStartViewY0 = viewY0 + (dragStartViewY0 - previous.y0) * scale;
+    dragStartViewY1 = viewY1 + (dragStartViewY1 - previous.y1) * scale;
+    pinchStartSpan *= scale;
+    inertiaVy *= scale;
 }
 
 function queuePendingIcicleUpdate() {
@@ -635,7 +751,9 @@ function updateSearchModeBtn() {
     searchModeBtnEl.classList.toggle('active', searchModeSemantic);
 }
 
-function executeSearch(raw) {
+function executeSearch(raw, { navigate = true } = {}) {
+    const revision = ++searchRevision;
+    const previousMatch = searchMatches[searchMatchIndex];
     const query = raw.toLowerCase().trim();
     searchQuery = query;
 
@@ -650,7 +768,7 @@ function executeSearch(raw) {
     }
 
     if (searchModeSemantic && query.length >= 3) {
-        executeSemanticSearch(query);
+        void executeSemanticSearch(query, { navigate, revision, previousMatch });
         return;
     }
 
@@ -662,16 +780,14 @@ function executeSearch(raw) {
     searchMatches.sort((a, b) => {
         const aRaw = a.representative && a.representative.timestamp;
         const bRaw = b.representative && b.representative.timestamp;
-        const aTime = aRaw ? new Date(aRaw).getTime() : 0;
-        const bTime = bRaw ? new Date(bRaw).getTime() : 0;
-        return (Number.isFinite(bTime) ? bTime : 0) - (Number.isFinite(aTime) ? aTime : 0);
+        return (timestampMs(bRaw) ?? 0) - (timestampMs(aRaw) ?? 0);
     });
 
     searchMatchSet = new Set(searchMatches);
 
     if (searchMatches.length > 0) {
-        searchMatchIndex = 0;
-        panToMatch();
+        searchMatchIndex = navigate ? 0 : Math.max(0, searchMatches.indexOf(findReplacementNode(previousMatch)));
+        if (navigate) panToMatch();
     } else {
         searchMatchIndex = -1;
     }
@@ -689,21 +805,29 @@ function clearSemanticSearchState() {
     if (wasActive) updateColorLegend();
 }
 
-async function executeSemanticSearch(query) {
+async function executeSemanticSearch(query, { navigate, revision, previousMatch }) {
+    const generation = lifecycleGeneration;
+    const navigationAtStart = navigationRevision;
     // Show loading indicator
     if (searchCounterEl) searchCounterEl.textContent = 'Embedding\u2026';
 
-    let queryVector = semanticQueryCache.get(query);
+    const operation = captureEmbeddingOperation();
+    const cached = semanticQueryCache.get(query);
+    let queryVector = cached && isEmbeddingOperationCurrent(cached.operation) ? cached.vector : null;
     if (!queryVector) {
         try {
             queryVector = await embedText(query, { level: 'query' });
         } catch (err) {
+            if (revision !== searchRevision || generation !== lifecycleGeneration
+                || !isEmbeddingOperationCurrent(operation)) return;
             console.warn('[chat_manager] Semantic graph search embedding failed:', err);
             if (searchCounterEl) searchCounterEl.textContent = 'Error';
             clearSemanticSearchState();
             return;
         }
-        semanticQueryCache.set(query, queryVector);
+        if (revision !== searchRevision || generation !== lifecycleGeneration
+            || !isEmbeddingOperationCurrent(operation)) return;
+        semanticQueryCache.set(query, { vector: queryVector, operation });
         if (semanticQueryCache.size > 32) {
             const firstKey = semanticQueryCache.keys().next().value;
             semanticQueryCache.delete(firstKey);
@@ -711,7 +835,8 @@ async function executeSemanticSearch(query) {
     }
 
     // If query changed while we were awaiting, bail
-    if (searchQuery !== query) return;
+    if (searchQuery !== query || revision !== searchRevision || generation !== lifecycleGeneration
+        || !isEmbeddingOperationCurrent(operation)) return;
 
     const index = getIndex();
     const scores = new Map();
@@ -760,8 +885,11 @@ async function executeSemanticSearch(query) {
     searchMatchSet = new Set(searchMatches);
 
     if (searchMatches.length > 0) {
-        searchMatchIndex = 0;
-        panToMatch();
+        searchMatchIndex = navigate ? 0 : Math.max(0, searchMatches.indexOf(findReplacementNode(previousMatch)));
+        if (navigate && navigationAtStart === navigationRevision) {
+            panToMatch();
+            semanticSearchNavigationRevision = navigationRevision;
+        }
     } else {
         searchMatchIndex = -1;
     }
@@ -822,6 +950,7 @@ function updateSearchUI() {
 }
 
 function removeSearchBar() {
+    searchRevision++;
     clearTimeout(searchDebounceTimer);
     if (searchBarEl) {
         searchBarEl.remove();
@@ -1347,6 +1476,8 @@ function render() {
 // ── Viewport Animation ──
 
 function animateViewportTo(targetX, targetY0, targetY1, onComplete = null) {
+    navigationRevision++;
+    cancelInertia();
     cancelViewportAnim();
     viewAnimFrom = { x: viewX, y0: viewY0, y1: viewY1 };
     viewAnimTo = { x: targetX, y0: targetY0, y1: targetY1 };
@@ -1510,6 +1641,8 @@ function unbindEvents() {
 
 function onMouseDown(e) {
     if (e.button !== 0) return; // left button only
+    navigationRevision++;
+    cancelInertia();
     dragStartX = e.clientX;
     dragStartY = e.clientY;
     dragStartViewX = viewX;
@@ -1621,6 +1754,8 @@ function onClick(e) {
 
 function onWheel(e) {
     e.preventDefault();
+    navigationRevision++;
+    cancelInertia();
     cancelViewportAnim();
 
     if (e.ctrlKey || e.metaKey) {
@@ -1643,27 +1778,10 @@ function onWheel(e) {
         viewY0 = cursorY - ratio * newSpan;
         viewY1 = cursorY + (1 - ratio) * newSpan;
 
-        // Free zoom clears zoom context and explore mode
+        // Free zoom clears the zoom bookmark, but keeps the explored subtree.
+        // Only the explicit Exit control should change the chart's coordinate system.
         zoomStack = [];
         zoomRoot = null;
-        if (exploreRoot) {
-            exploreRoot = null;
-            exploreDepthOffset = 0;
-            // Debounced rebuild so rapid wheel events don't each trigger a full trie rebuild
-            clearTimeout(rebuildTimer);
-            rebuildTimer = setTimeout(async () => {
-                const activeChatFile = getActiveChatFile ? getActiveChatFile() : null;
-                const chatIndex = getIndex();
-                const data = await buildIcicleData(chatIndex, activeChatFile, { threadFocus: threadFocusActive });
-                icicleRoot = data.root;
-                flatNodes = data.flatNodes;
-                maxDepth = data.maxDepth;
-                loadedCount = data.loadedCount;
-                rebuildDepthIndex();
-                if (searchQuery.length >= 2) executeSearch(searchQuery);
-                render();
-            }, 120);
-        }
         updateBreadcrumbs();
 
         clampViewport();
@@ -1704,6 +1822,8 @@ function getTouchDistance(t1, t2) {
 
 function onTouchStart(e) {
     e.preventDefault();
+    navigationRevision++;
+    cancelInertia();
 
     for (const touch of e.changedTouches) {
         activeTouches.set(touch.identifier, { x: touch.clientX, y: touch.clientY });
@@ -2061,10 +2181,15 @@ function onResize() {
 // ──────────────────────────────────────────────
 
 function exploreThread(node) {
+    // A popup can remain open across a background refresh.
+    node = findReplacementNode(node);
+    if (!node) return;
     removePopup();
+    navigationRevision++;
+    cancelInertia();
 
     const activeChatFile = getActiveChatFile ? getActiveChatFile() : null;
-    const result = reLayoutSubtree(node, activeChatFile);
+    const result = reLayoutSubtree(node, activeChatFile, { preserveOrder: true });
 
     exploreRoot = node;
     exploreDepthOffset = result.depthOffset;
@@ -2082,7 +2207,7 @@ function exploreThread(node) {
 
     // Re-run search if active
     if (searchQuery.length >= 2) {
-        executeSearch(searchQuery);
+        executeSearch(searchQuery, { navigate: false });
     }
 
     updateBreadcrumbs();
@@ -2092,7 +2217,7 @@ function exploreThread(node) {
 function exitExplore() {
     exploreRoot = null;
     exploreDepthOffset = 0;
-    updateIcicleData();
+    updateIcicleData({ resetView: true });
 }
 
 function zoomTo(node) {
@@ -2224,8 +2349,9 @@ function showTooltip(clientX, clientY, node) {
     const { moment } = SillyTavern.libs;
     const activeChatFile = getActiveChatFile ? getActiveChatFile() : null;
     const role = node.role === 'user' ? 'User' : 'Character';
-    const time = node.representative.timestamp && moment
-        ? moment(node.representative.timestamp).format('MMM D, h:mm A')
+    const timestamp = timestampMs(node.representative.timestamp);
+    const time = timestamp !== null && moment
+        ? moment(timestamp).format('MMM D, h:mm A')
         : '';
     const rawText = node.representative.text || node.normalizedText || '';
     const preview = rawText.replace(/\s+/g, ' ').trim();
@@ -2320,13 +2446,33 @@ function focusNode(node, openPopup) {
 
 function tryApplyPendingFocus() {
     if (!pendingFocusRequest) return false;
-    if (!mounted || !canvas || flatNodes.length === 0) return false;
+    if (!mounted || !canvas) return false;
 
-    const node = findNodeForTarget(pendingFocusRequest.filename, pendingFocusRequest.msgIndex);
+    const { filename, msgIndex } = pendingFocusRequest;
+    const node = findNodeForTarget(filename, msgIndex);
     if (!node) {
-        if (!pendingFocusRequest.persistIfMissing) {
-            pendingFocusRequest = null;
+        const entry = getIndex()[filename];
+        const loadedTarget = entry?.isLoaded && Array.isArray(entry.messages)
+            && msgIndex < entry.messages.length;
+        if (loadedTarget) {
+            // An explicit result jump must be able to reveal a loaded target
+            // outside the current thread or explored subtree. Keep the request
+            // until the replacement data is published, even for nonpersistent
+            // requests: the message exists, its current graph scope hides it.
+            const activeFile = getActiveChatFile ? getActiveChatFile() : null;
+            if (threadFocusActive && activeFile && filename !== activeFile
+                && !sharesActiveThread(entry, getIndex()[activeFile])) {
+                threadFocusActive = false;
+                if (focusBtnEl) {
+                    focusBtnEl.classList.remove('active');
+                    focusBtnEl.title = 'Showing all chats — click for current thread';
+                }
+                if (onThreadFocusChanged) onThreadFocusChanged(false);
+            }
+            void updateIcicleData({ resetView: true });
+            return false;
         }
+        if (!pendingFocusRequest.persistIfMissing) pendingFocusRequest = null;
         return false;
     }
 
@@ -2334,6 +2480,23 @@ function tryApplyPendingFocus() {
     pendingFocusRequest = null;
     focusNode(node, openPopup);
     return true;
+}
+
+function updateEmptyState() {
+    if (!container) return;
+    if (flatNodes.length > 0) {
+        emptyStateEl?.remove();
+        emptyStateEl = null;
+        return;
+    }
+    if (emptyStateEl) return;
+    emptyStateEl = document.createElement('div');
+    emptyStateEl.className = 'chat-manager-empty';
+    emptyStateEl.textContent = 'No loaded chats to visualize.';
+    Object.assign(emptyStateEl.style, {
+        position: 'absolute', top: '50%', left: '0', right: '0', pointerEvents: 'none',
+    });
+    container.appendChild(emptyStateEl);
 }
 
 function showNodePopup(clientX, clientY, node) {

@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<title>Branch chart navigation regression checks</title>
+<link rel="stylesheet" href="../style.css">
+<style>
+body { background:#18212b; color:#e4e9ee; font:15px system-ui; margin:24px; }
+#fixture { width:900px; height:520px; position:relative; }
+pre { white-space:pre-wrap; }
+</style>
+<h1>Branch chart navigation checks</h1>
+<button id="run">Run checks</button>
+<pre id="results">Ready. Uses synthetic messages only.</pre>
+<div id="fixture"></div>
+<script type="module">
+import { getIndex, clearIndex } from '../src/chat-reader.js';
+import { mountIcicle, updateIcicleData, unmountIcicle, setIcicleCallbacks,
+    focusMessageInIcicle, setThreadFocus, isIcicleMounted } from '../src/icicle-view.js';
+
+const context = { characterId:0, characters:[{avatar:'fixture.png'}],
+    extensionSettings:{chat_manager:{embeddings:{}}}, saveSettingsDebounced() {} };
+window.SillyTavern = { getContext:() => context, libs:{
+    DOMPurify:{sanitize:x => x}, moment:() => ({format:() => '', fromNow:() => ''}) } };
+const fixture = document.getElementById('fixture');
+const results = document.getElementById('results');
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+const paint = () => new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
+const assert = (condition, label) => {
+    if (!condition) throw Error(label);
+    results.textContent += `PASS ${label}\n`;
+};
+const canvas = () => fixture.querySelector('canvas');
+const pixels = () => canvas().toDataURL();
+function wheel(deltaY, options = {}) {
+    const rect = canvas().getBoundingClientRect();
+    canvas().dispatchEvent(new WheelEvent('wheel', { bubbles:true, cancelable:true,
+        clientX:rect.left + 400, clientY:rect.top + 200, deltaY, ...options }));
+}
+function seed() {
+    clearIndex();
+    for (const branch of ['left', 'right']) {
+        getIndex()[branch] = { isLoaded:true, messages:Array.from({length:100}, (_, i) => ({
+            index:i, text:i < 2 ? `shared ${i}` : `${branch} message ${i}`,
+            role:i % 2 ? 'assistant' : 'user', timestamp:null,
+        })) };
+    }
+}
+
+document.getElementById('run').onclick = async () => {
+    results.textContent = '';
+    try {
+        clearIndex();
+        setThreadFocus(true);
+        setIcicleCallbacks({ getActive:() => 'left', onJump:() => {} });
+        await mountIcicle(fixture, 'mini');
+        assert(isIcicleMounted() && !!canvas(), 'empty cold mount keeps a canvas ready for hydration');
+        seed();
+        await updateIcicleData();
+        assert(!fixture.querySelector('.chat-manager-empty'), 'hydration clears the empty state');
+        focusMessageInIcicle('right', 30, {openPopup:false});
+        await sleep(350);
+        wheel(85, {shiftKey:true});
+        wheel(-1, {ctrlKey:true});
+        wheel(30);
+        await paint();
+        const before = pixels();
+        await updateIcicleData();
+        await paint();
+        assert(pixels() === before, 'refresh preserves every rendered pixel after scrolling and zooming');
+
+        const input = fixture.querySelector('input[type="text"]');
+        input.value = 'right message';
+        input.dispatchEvent(new Event('input', {bubbles:true}));
+        await sleep(550);
+        wheel(85, {shiftKey:true});
+        await paint();
+        const searched = pixels();
+        await updateIcicleData();
+        await sleep(350);
+        assert(pixels() === searched, 'active search refresh does not animate back to its first match');
+
+        input.value = '';
+        input.dispatchEvent(new Event('input', {bubbles:true}));
+        await sleep(180);
+        focusMessageInIcicle('right', 30, {openPopup:true});
+        await sleep(350);
+        const explore = document.querySelector('.chat-manager-timeline-explore-btn');
+        assert(!!explore, 'focused message opens its navigation popup');
+        await updateIcicleData();
+        assert(explore.isConnected, 'background refresh keeps the open popup usable');
+        explore.click();
+        wheel(-1, {ctrlKey:true});
+        await paint();
+        const explored = pixels();
+        assert(fixture.textContent.includes('Exploring:'), 'wheel zoom stays inside the explored thread');
+        await updateIcicleData();
+        await paint();
+        assert(pixels() === explored, 'explored thread keeps its layout during refresh');
+        focusMessageInIcicle('right', 20, {openPopup:false, persistIfMissing:false});
+        await sleep(350);
+        assert(!fixture.textContent.includes('Exploring:'), 'explicit focus outside Explore reveals the target');
+
+        getIndex().separate = {isLoaded:true, messages:Array.from({length:40}, (_, i) => ({
+            index:i, text:`separate ${i}`, role:i % 2 ? 'assistant' : 'user', timestamp:null,
+        }))};
+        focusMessageInIcicle('separate', 20, {openPopup:true, persistIfMissing:false});
+        await sleep(400);
+        assert(!fixture.querySelector('.chat-manager-icicle-focus-btn').classList.contains('active'),
+            'explicit focus widens a current-thread filter hiding the loaded target');
+        assert(document.querySelector('.chat-manager-timeline-popup')?.textContent.includes('separate'),
+            'loaded target hidden by the old filter receives its focus popup');
+        unmountIcicle();
+        results.textContent += 'ALL BROWSER CHECKS PASSED';
+    } catch (error) {
+        results.textContent += `FAIL ${error.stack}`;
+    }
+};
+</script>
+</html>
