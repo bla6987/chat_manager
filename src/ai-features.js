@@ -179,6 +179,25 @@ async function withAIProfile(fn) {
     }
 }
 
+// The Connection Manager's name for "no profile selected".
+const NO_CONNECTION_PROFILE = '<None>';
+
+/**
+ * Select a connection profile by name through the /profile command's handler.
+ * Calling the handler directly keeps the name out of the STscript parser,
+ * where `|` would start another command and `{{...}}` would run macros.
+ * @param {Object} context - SillyTavern context
+ * @param {string} name - Profile name, or NO_CONNECTION_PROFILE
+ * @returns {Promise<string>} Name of the selected profile, or '' if not found
+ */
+async function selectConnectionProfile(context, name) {
+    const command = context.SlashCommandParser?.commands?.profile;
+    if (typeof command?.callback !== 'function') {
+        throw new Error('The /profile command is unavailable');
+    }
+    return command.callback({}, name);
+}
+
 /**
  * @param {Object} targetProfile
  * @param {string|undefined} originalProfileId
@@ -192,7 +211,7 @@ async function switchAndRun(targetProfile, originalProfileId, cmProfiles, fn) {
 
     // Switch to the AI profile
     try {
-        await context.executeSlashCommandsWithOptions(`/profile ${targetProfile.name}`);
+        await selectConnectionProfile(context, targetProfile.name);
     } catch (err) {
         console.warn(`[${MODULE_NAME}] Failed to switch to AI profile "${targetProfile.name}", using current connection:`, err);
         return fn();
@@ -206,8 +225,8 @@ async function switchAndRun(targetProfile, originalProfileId, cmProfiles, fn) {
             const originalProfile = originalProfileId
                 ? cmProfiles.find(p => p.id === originalProfileId)
                 : null;
-            const restoreName = originalProfile ? originalProfile.name : 'None';
-            await context.executeSlashCommandsWithOptions(`/profile ${restoreName}`);
+            const restoreName = originalProfile ? originalProfile.name : NO_CONNECTION_PROFILE;
+            await selectConnectionProfile(context, restoreName);
         } catch (err) {
             console.warn(`[${MODULE_NAME}] Failed to restore original profile:`, err);
         }

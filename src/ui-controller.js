@@ -14,7 +14,7 @@ import {
     migrateFileKey, getDisplayMode, getChatMeta,
     getThreadFocus, setThreadFocus as persistThreadFocus,
     getBranchContextEnabled, setBranchContextEnabled,
-    getTagDefinitions, createTagDefinition, updateTagDefinition, deleteTagDefinition,
+    getTagDefinitions, createTagDefinition, updateTagDefinition, deleteTagDefinition, safeTagColor,
     getChatTags, addChatTag, removeChatTag,
     getFilterState, setFilterState, clearFilterState, hasActiveFilter,
     getSortState, setSortState, getEmbeddingSettings,
@@ -2604,7 +2604,7 @@ function buildThreadCardsHtml(entries, previousEntry = null) {
             for (const tagId of chatTags) {
                 const def = tagDefs[tagId];
                 if (!def) continue;
-                tagChipsHtml += `<span class="chat-manager-tag-chip" style="background:${escapeAttr(def.color)};color:${escapeAttr(def.textColor)}">${escapeHtml(def.name)}</span>`;
+                tagChipsHtml += `<span class="chat-manager-tag-chip" style="background:${escapeAttr(safeTagColor(def.color, '#607D8B'))};color:${escapeAttr(safeTagColor(def.textColor, '#FFFFFF'))}">${escapeHtml(def.name)}</span>`;
             }
             tagChipsHtml += '</div>';
         }
@@ -2913,9 +2913,9 @@ function showAdvancedFilterDropdown(anchorEl) {
             <button type="button" class="chat-manager-btn cm-af-preset" data-days="year">This year</button>
         </div>
         <label>Date from</label>
-        <input type="date" class="cm-af-date-from" value="${f.dateFrom || ''}">
+        <input type="date" class="cm-af-date-from" value="${escapeAttr(f.dateFrom || '')}">
         <label>Date to</label>
-        <input type="date" class="cm-af-date-to" value="${f.dateTo || ''}">
+        <input type="date" class="cm-af-date-to" value="${escapeAttr(f.dateTo || '')}">
         <label>Min messages</label>
         <input type="number" class="cm-af-count-min" min="0" value="${f.messageCountMin ?? ''}">
         <label>Max messages</label>

@@ -59,6 +59,11 @@ function normalizeMessageCountFilterValue(value) {
     return Math.floor(parsed);
 }
 
+/** Filter dates come from <input type="date">, which only yields YYYY-MM-DD. */
+function isFilterDate(value) {
+    return typeof value === 'string' && /^\d{4}-\d{2}-\d{2}$/.test(value);
+}
+
 function normalizeFilterState(filterState) {
     if (!filterState || typeof filterState !== 'object') {
         return { ...DEFAULT_FILTER_STATE };
@@ -66,8 +71,8 @@ function normalizeFilterState(filterState) {
 
     const normalized = {
         tags: Array.isArray(filterState.tags) ? filterState.tags.filter(tag => typeof tag === 'string' && tag.length > 0) : [],
-        dateFrom: typeof filterState.dateFrom === 'string' && filterState.dateFrom.length > 0 ? filterState.dateFrom : null,
-        dateTo: typeof filterState.dateTo === 'string' && filterState.dateTo.length > 0 ? filterState.dateTo : null,
+        dateFrom: isFilterDate(filterState.dateFrom) ? filterState.dateFrom : null,
+        dateTo: isFilterDate(filterState.dateTo) ? filterState.dateTo : null,
         dateBasis: filterState.dateBasis === 'created' ? 'created' : 'lastActivity',
         messageCountMin: normalizeMessageCountFilterValue(filterState.messageCountMin),
         messageCountMax: normalizeMessageCountFilterValue(filterState.messageCountMax),
@@ -488,6 +493,17 @@ export function getTagDefinitions() {
 }
 
 /**
+ * Tag colors are written into inline styles, so only accept hex colors
+ * like the ones <input type="color"> produces.
+ * @param {unknown} color
+ * @param {string} fallback
+ * @returns {string}
+ */
+export function safeTagColor(color, fallback) {
+    return typeof color === 'string' && /^#[0-9a-f]{3,8}$/i.test(color) ? color : fallback;
+}
+
+/**
  * Create a new tag definition.
  * @param {string} name
  * @param {string} [color='#607D8B']
@@ -498,7 +514,12 @@ export function createTagDefinition(name, color = '#607D8B', textColor = '#FFFFF
     const settings = getSettings();
     const id = makeTagId(name);
     if (settings.tagDefinitions[id]) return null;
-    settings.tagDefinitions[id] = { id, name, color, textColor };
+    settings.tagDefinitions[id] = {
+        id,
+        name,
+        color: safeTagColor(color, '#607D8B'),
+        textColor: safeTagColor(textColor, '#FFFFFF'),
+    };
     save();
     return settings.tagDefinitions[id];
 }
@@ -510,8 +531,11 @@ export function createTagDefinition(name, color = '#607D8B', textColor = '#FFFFF
  */
 export function updateTagDefinition(tagId, updates) {
     const settings = getSettings();
-    if (!settings.tagDefinitions[tagId]) return;
-    Object.assign(settings.tagDefinitions[tagId], updates);
+    const definition = settings.tagDefinitions[tagId];
+    if (!definition) return;
+    Object.assign(definition, updates);
+    definition.color = safeTagColor(definition.color, '#607D8B');
+    definition.textColor = safeTagColor(definition.textColor, '#FFFFFF');
     save();
 }
 
