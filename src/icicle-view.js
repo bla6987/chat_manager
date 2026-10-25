@@ -10,8 +10,10 @@
  */
 
 import { timestampMs } from './timestamps.js';
-import { buildIcicleData, reLayoutSubtree, sharesActiveThread } from './icicle-data.js';
-import { getIndex, getMessageEmbedding } from './chat-reader.js';
+import { buildIcicleData, reLayoutSubtree, sharesActiveThread, clearIcicleSemanticCache } from './icicle-data.js';
+import { getIndex, getMessageEmbedding, iterateChatBodies } from './chat-reader.js';
+import { isVector } from './vector-utils.js';
+import { iterateCachedMessageVectors, iterateCachedChatVectors } from './archive-data.js';
 import { getDisplayName, getEmbeddingSettings, setEmbeddingSettings } from './metadata-store.js';
 import { clusterColor, gradientColor, topicShiftScores, cosineSimilarity } from './semantic-engine.js';
 import { embedText, isEmbeddingConfigured, captureEmbeddingOperation, isEmbeddingOperationCurrent } from './embedding-service.js';
@@ -46,6 +48,23 @@ let dataUpdateInFlight = false;
 let dataUpdatePending = false;
 let resetViewPending = false;
 let dataUpdateToken = null;
+let buildAbortController = null;
+let keywordSearchController = null;
+const pendingFrameIds = new Set();
+
+function scheduleFrame(callback) {
+    const id = requestAnimationFrame(time => {
+        pendingFrameIds.delete(id);
+        callback(time);
+    });
+    pendingFrameIds.add(id);
+    return id;
+}
+
+function cancelFrame(id) {
+    cancelAnimationFrame(id);
+    pendingFrameIds.delete(id);
+}
 let threadFocusActive = true;
 
 // Data
@@ -125,6 +144,7 @@ let legendSelectedCluster = null;
 let activeTopicDrift = null;
 let activeTopicDriftChatFile = null;
 const topicDriftCache = new Map();
+let topicDriftRequest = null;
 
 // Cached active chat file for hitTest() (updated each render)
 let cachedActiveChatFile = null;
@@ -188,6 +208,11 @@ export function setThreadFocus(active) {
 export function invalidateIcicleEmbeddings() {
     embeddingRevision++;
     searchRevision++;
+    clearIcicleSemanticCache();
+    buildAbortController?.abort();
+    keywordSearchController?.abort();
+    topicDriftRequest?.controller.abort();
+    topicDriftRequest = null;
     semanticQueryCache.clear();
     if (viewAnimId && semanticSearchNavigationRevision === navigationRevision) cancelViewportAnim();
     semanticSearchNavigationRevision = -1;
@@ -263,7 +288,23 @@ export async function mountIcicle(containerEl, mode) {
     const activeChatFile = getActiveChatFile ? getActiveChatFile() : null;
     const chatIndex = getIndex();
     const buildEmbeddingRevision = embeddingRevision;
-    const data = await buildIcicleData(chatIndex, activeChatFile, { threadFocus: threadFocusActive });
+    const controller = new AbortController();
+    buildAbortController = controller;
+    let data;
+    try {
+        data = await buildIcicleData(chatIndex, activeChatFile, {
+            threadFocus: threadFocusActive, colorMode, embeddingRevision, signal: controller.signal,
+            iterateChatVectors: typeof iterateCachedChatVectors === 'function' ? iterateCachedChatVectors : null,
+        });
+    } catch (error) {
+        if (generation !== lifecycleGeneration || container !== containerEl) return;
+        // Settings/cache invalidation may happen while the first gradient basis
+        // is pending. Finish the initial mount with the current archive recipe.
+        if (controller.signal.aborted) return mountIcicle(containerEl, mode);
+        throw error;
+    } finally {
+        if (buildAbortController === controller) buildAbortController = null;
+    }
     if (buildEmbeddingRevision !== embeddingRevision) {
         stripSemanticFields(data.root);
         data.pcaRanges = null;
@@ -387,7 +428,21 @@ export async function mountIcicle(containerEl, mode) {
 }
 
 export function unmountIcicle() {
+    mounted = false;
     lifecycleGeneration++;
+    buildAbortController?.abort();
+    buildAbortController = null;
+    keywordSearchController?.abort();
+    keywordSearchController = null;
+    topicDriftRequest?.controller.abort();
+    topicDriftRequest = null;
+    clearIcicleSemanticCache();
+    for (const id of pendingFrameIds) cancelAnimationFrame(id);
+    pendingFrameIds.clear();
+    clearTimeout(resizeTimer);
+    resizeTimer = null;
+    semanticQueryCache.clear();
+    topicDriftCache.clear();
     dataUpdatePending = false;
     resetViewPending = false;
     dataUpdateInFlight = false;
@@ -403,6 +458,8 @@ export function unmountIcicle() {
     emptyStateEl = null;
 
     if (canvas) {
+        canvas.width = 0;
+        canvas.height = 0;
         canvas.remove();
         canvas = null;
         ctx = null;
@@ -449,6 +506,14 @@ export function unmountIcicle() {
     activeTopicDrift = null;
     activeTopicDriftChatFile = null;
     cachedActiveChatFile = null;
+    maxDepth = 0;
+    loadedCount = 0;
+    canvasWidth = 0;
+    canvasHeight = 0;
+    pendingFocusRequest = null;
+    viewAnimFrom = null;
+    viewAnimTo = null;
+    viewAnimOnComplete = null;
     mounted = false;
 }
 
@@ -472,21 +537,27 @@ export async function updateIcicleData({ resetView = false } = {}) {
     const activeChatFile = getActiveChatFile ? getActiveChatFile() : null;
     const chatIndex = getIndex();
     let data;
+    const controller = new AbortController();
+    buildAbortController = controller;
     try {
         data = await buildIcicleData(chatIndex, activeChatFile, {
             threadFocus: buildThreadFocus,
+            colorMode, embeddingRevision, signal: controller.signal,
+            iterateChatVectors: typeof iterateCachedChatVectors === 'function' ? iterateCachedChatVectors : null,
             previousRoot: shouldResetView ? null : icicleRoot,
         });
     } catch (err) {
+        if (buildAbortController === controller) buildAbortController = null;
         if (generation !== lifecycleGeneration || canvas !== mountedCanvas || !mounted) return;
         if (dataUpdateToken === updateToken) {
             dataUpdateInFlight = false;
             dataUpdateToken = null;
         }
-        console.warn('[chat_manager] Failed to refresh icicle data:', err);
+        if (!controller.signal.aborted) console.warn('[chat_manager] Failed to refresh icicle data:', err);
         queuePendingIcicleUpdate();
         return;
     }
+    if (buildAbortController === controller) buildAbortController = null;
     if (dataUpdateToken === updateToken) {
         dataUpdateInFlight = false;
         dataUpdateToken = null;
@@ -560,7 +631,7 @@ function findReplacementNode(previous) {
     if (!previous) return null;
     const files = new Set(previous.chatFiles);
     return flatNodes.find(node => node.depth === previous.depth
-        && node.role === previous.role && node.normalizedText === previous.normalizedText
+        && node.role === previous.role && node.key === previous.key
         && node.chatFiles.some(file => files.has(file))) || null;
 }
 
@@ -635,7 +706,7 @@ export async function expandToFullScreen() {
     };
     document.addEventListener('keydown', modal._escHandler);
 
-    requestAnimationFrame(() => {
+    scheduleFrame(() => {
         if (!modal.classList.contains('visible')) return;
         mountIcicle(modalContainer, 'full');
     });
@@ -752,6 +823,8 @@ function updateSearchModeBtn() {
 }
 
 function executeSearch(raw, { navigate = true } = {}) {
+    keywordSearchController?.abort();
+    keywordSearchController = null;
     const revision = ++searchRevision;
     const previousMatch = searchMatches[searchMatchIndex];
     const query = raw.toLowerCase().trim();
@@ -774,26 +847,62 @@ function executeSearch(raw, { navigate = true } = {}) {
 
     clearSemanticSearchState();
 
-    searchMatches = flatNodes.filter(n => n.normalizedText && n.normalizedText.toLowerCase().includes(query));
-
-    // Sort by recency (newest messages first)
-    searchMatches.sort((a, b) => {
-        const aRaw = a.representative && a.representative.timestamp;
-        const bRaw = b.representative && b.representative.timestamp;
-        return (timestampMs(bRaw) ?? 0) - (timestampMs(aRaw) ?? 0);
-    });
-
-    searchMatchSet = new Set(searchMatches);
-
-    if (searchMatches.length > 0) {
-        searchMatchIndex = navigate ? 0 : Math.max(0, searchMatches.indexOf(findReplacementNode(previousMatch)));
-        if (navigate) panToMatch();
-    } else {
-        searchMatchIndex = -1;
+    const matches = new Set();
+    const pendingFiles = new Set();
+    const index = getIndex();
+    for (const node of flatNodes) {
+        let inspected = false;
+        for (const fileName of node.chatFiles) {
+            const entry = index[fileName];
+            const message = entry?.messages?.[node.depth];
+            if (!message || message.isDescriptor || entry.bodyResident === false) continue;
+            inspected = true;
+            if (String(message.text || '').trim().replace(/\s+/g, ' ').toLowerCase().includes(query)) matches.add(node);
+            break; // All members of this node have the same normalized text.
+        }
+        if (!inspected && node.chatFiles[0]) pendingFiles.add(node.chatFiles[0]);
     }
+    publishKeywordMatches(matches, { navigate: navigate && pendingFiles.size === 0, previousMatch });
+    if (pendingFiles.size && typeof iterateChatBodies === 'function') {
+        const controller = new AbortController();
+        keywordSearchController = controller;
+        return searchArchivedBodies(query, pendingFiles, matches, { navigate, revision, previousMatch, controller });
+    }
+}
 
+function publishKeywordMatches(matches, { navigate, previousMatch }) {
+    searchMatches = [...matches].sort((a, b) =>
+        (timestampMs(b.representative?.timestamp) ?? 0) - (timestampMs(a.representative?.timestamp) ?? 0));
+    searchMatchSet = new Set(searchMatches);
+    searchMatchIndex = searchMatches.length
+        ? (navigate ? 0 : Math.max(0, searchMatches.indexOf(findReplacementNode(previousMatch)))) : -1;
+    if (navigate && searchMatches.length) panToMatch();
     updateSearchUI();
     render();
+}
+
+async function searchArchivedBodies(query, fileNames, matches, { navigate, revision, previousMatch, controller }) {
+    const generation = lifecycleGeneration;
+    const navigationAtStart = navigationRevision;
+    if (searchCounterEl) searchCounterEl.textContent = 'Searching archive…';
+    try {
+        for await (const { entry, messages } of iterateChatBodies({ fileNames: [...fileNames], signal: controller.signal })) {
+            if (controller.signal.aborted || revision !== searchRevision || generation !== lifecycleGeneration) return;
+            for (const message of messages) {
+                if (!String(message.text || '').trim().replace(/\s+/g, ' ').toLowerCase().includes(query)) continue;
+                const node = findNodeForTarget(entry.fileName, message.index);
+                if (node) matches.add(node);
+            }
+        }
+        if (controller.signal.aborted || revision !== searchRevision || generation !== lifecycleGeneration) return;
+        publishKeywordMatches(matches, { navigate: navigate && navigationAtStart === navigationRevision, previousMatch });
+    } catch (error) {
+        if (controller.signal.aborted || revision !== searchRevision || generation !== lifecycleGeneration) return;
+        console.warn('[chat_manager] Archived branch search failed:', error);
+        if (searchCounterEl) searchCounterEl.textContent = 'Archive search incomplete';
+    } finally {
+        if (keywordSearchController === controller) keywordSearchController = null;
+    }
 }
 
 function clearSemanticSearchState() {
@@ -843,6 +952,29 @@ async function executeSemanticSearch(query, { navigate, revision, previousMatch 
     let min = 1, max = 0;
     let scored = [];
 
+    if (typeof iterateCachedMessageVectors === 'function') {
+        const controller = new AbortController();
+        keywordSearchController = controller;
+        try {
+            const fileNames = icicleRoot?.chatFiles || [];
+            for await (const record of iterateCachedMessageVectors({ fileNames, signal: controller.signal, mode: 'active' })) {
+                if (controller.signal.aborted || revision !== searchRevision || generation !== lifecycleGeneration
+                    || !isEmbeddingOperationCurrent(operation)) return;
+                const node = findNodeForTarget(record.fileName, record.msgIndex);
+                if (!node || scores.has(node) || !isVector(record.vector) || record.vector.length !== queryVector.length) continue;
+                const sim = cosineSimilarity(queryVector, record.vector);
+                if (!Number.isFinite(sim)) continue;
+                scores.set(node, sim); min = Math.min(min, sim); max = Math.max(max, sim);
+                scored.push({ node, sim });
+            }
+        } catch (error) {
+            if (controller.signal.aborted || revision !== searchRevision || generation !== lifecycleGeneration) return;
+            if (searchCounterEl) searchCounterEl.textContent = 'Archive scoring incomplete';
+            return;
+        } finally {
+            if (keywordSearchController === controller) keywordSearchController = null;
+        }
+    } else {
     for (const node of flatNodes) {
         // Try to find an embedding for this node via any of its chat files
         let nodeVector = null;
@@ -853,7 +985,7 @@ async function executeSemanticSearch(query, { navigate, revision, previousMatch 
             // this depth's source message rather than array position directly.
             const msgObj = Array.isArray(entry.messages) ? entry.messages[node.depth] : null;
             const vec = msgObj ? getMessageEmbedding(entry, msgObj) : null;
-            if (Array.isArray(vec) && vec.length > 0) {
+            if (isVector(vec) && vec.length > 0) {
                 nodeVector = vec;
                 break;
             }
@@ -872,6 +1004,8 @@ async function executeSemanticSearch(query, { navigate, revision, previousMatch 
         if (sim < min) min = sim;
         if (sim > max) max = sim;
         scored.push({ node, sim });
+    }
+
     }
 
     semanticSearchScores = scores;
@@ -951,7 +1085,10 @@ function updateSearchUI() {
 
 function removeSearchBar() {
     searchRevision++;
+    keywordSearchController?.abort();
+    keywordSearchController = null;
     clearTimeout(searchDebounceTimer);
+    searchDebounceTimer = null;
     if (searchBarEl) {
         searchBarEl.remove();
         searchBarEl = null;
@@ -981,13 +1118,13 @@ function getTopicDriftForChat(chatFile, chatIndex) {
 
     const entry = chatIndex[chatFile];
     if (!entry?.isLoaded || !Array.isArray(entry.messages) || entry.messages.length < 2) return null;
-    if (!(entry.messageEmbeddings instanceof Map) || entry.messageEmbeddings.size < 2) return null;
 
     const embeddingSettings = getEmbeddingSettings();
     const cacheSignature = [
         entry.messages.length,
         entry.lastMessageTimestamp || '',
-        entry.messageEmbeddings.size,
+        entry.messageEmbeddings?.size || 0,
+        entry.messageEmbeddingVersion || 0,
         embeddingSettings.provider || '',
         embeddingSettings.model || '',
         embeddingSettings.dimensions ?? 'na',
@@ -998,11 +1135,23 @@ function getTopicDriftForChat(chatFile, chatIndex) {
         return cached.data;
     }
 
+    if (typeof iterateCachedMessageVectors === 'function') {
+        if (topicDriftRequest?.chatFile !== chatFile || topicDriftRequest?.signature !== cacheSignature) {
+            topicDriftRequest?.controller.abort();
+            const request = { chatFile, signature: cacheSignature, controller: new AbortController(),
+                generation: lifecycleGeneration, operation: captureEmbeddingOperation() };
+            topicDriftRequest = request;
+            void readArchivedTopicDrift(request);
+        }
+        return null;
+    }
+    if (!(entry.messageEmbeddings instanceof Map) || entry.messageEmbeddings.size < 2) return null;
+
     const ordered = [];
     for (let depth = 0; depth < entry.messages.length; depth++) {
         const msg = entry.messages[depth];
         const vector = getMessageEmbedding(entry, msg);
-        if (!Array.isArray(vector) || vector.length === 0) continue;
+        if (!isVector(vector) || vector.length === 0) continue;
         ordered.push({ depth, vector });
     }
 
@@ -1051,7 +1200,46 @@ function getTopicDriftForChat(chatFile, chatIndex) {
     return data;
 }
 
+async function readArchivedTopicDrift(request) {
+    const { chatFile, controller, generation, operation, signature } = request;
+    const stillCurrent = () => !controller.signal.aborted && generation === lifecycleGeneration
+        && activeTopicDriftChatFile === chatFile && isEmbeddingOperationCurrent(operation);
+    const scoresByDepth = new Map();
+    let previousVector = null, mediumCount = 0, highCount = 0;
+    try {
+        for await (const record of iterateCachedMessageVectors({ fileNames: [chatFile], signal: controller.signal, mode: 'active' })) {
+            if (!stillCurrent()) return;
+            const vector = record.vector;
+            if (!isVector(vector) || !vector.length) continue;
+            if (previousVector?.length === vector.length) {
+                const score = Math.max(0, Math.min(2, 1 - cosineSimilarity(previousVector, vector)));
+                if (Number.isFinite(score)) {
+                    scoresByDepth.set(record.msgIndex, score);
+                    if (score > DRIFT_HIGH_THRESHOLD) highCount++;
+                    else if (score >= DRIFT_MEDIUM_THRESHOLD) mediumCount++;
+                }
+            }
+            previousVector = vector;
+        }
+        if (!stillCurrent()) return;
+        const data = { scoresByDepth, mediumCount, highCount, totalShifts: mediumCount + highCount };
+        topicDriftCache.set(chatFile, { signature, data });
+        if (topicDriftCache.size > 64) topicDriftCache.delete(topicDriftCache.keys().next().value);
+        activeTopicDrift = data;
+        render();
+    } catch (error) {
+        if (stillCurrent()) console.warn('[chat_manager] Archived topic drift unavailable:', error);
+    } finally {
+        previousVector = null;
+        if (topicDriftRequest === request) topicDriftRequest = null;
+    }
+}
+
 function refreshActiveTopicDrift(chatFile, chatIndex = getIndex()) {
+    if (topicDriftRequest?.chatFile !== chatFile) {
+        topicDriftRequest?.controller.abort();
+        topicDriftRequest = null;
+    }
     activeTopicDriftChatFile = chatFile || null;
     activeTopicDrift = getTopicDriftForChat(activeTopicDriftChatFile, chatIndex);
 }
@@ -1061,6 +1249,8 @@ function hasSemanticData() {
         if (Number.isFinite(node.clusterLabel)) return true;
         if (Array.isArray(node.pca3d) && node.pca3d.length >= 3) return true;
     }
+    // A cold archive can have persisted vectors even when none is resident.
+    if (flatNodes.length && typeof iterateCachedChatVectors === 'function' && isEmbeddingConfigured()) return true;
     return false;
 }
 
@@ -1084,6 +1274,9 @@ function cycleColorMode() {
 
     legendSelectedCluster = null;
     setEmbeddingSettings({ colorMode });
+    // Compute a shared basis only when gradient colors are actually requested.
+    // Rebuilding out of gradient mode also releases per-node projected values.
+    void updateIcicleData();
     updateColorModeControl();
     updateColorLegend();
     render();
@@ -1213,7 +1406,7 @@ function resizeCanvas() {
 
     if (canvasWidth === 0 || canvasHeight === 0) {
         // Container not yet laid out — retry next frame
-        requestAnimationFrame(() => { resizeCanvas(); render(); });
+        scheduleFrame(() => { resizeCanvas(); render(); });
         return;
     }
 
@@ -1483,7 +1676,7 @@ function animateViewportTo(targetX, targetY0, targetY1, onComplete = null) {
     viewAnimTo = { x: targetX, y0: targetY0, y1: targetY1 };
     viewAnimStart = performance.now();
     viewAnimOnComplete = onComplete;
-    viewAnimId = requestAnimationFrame(viewAnimFrame);
+    viewAnimId = scheduleFrame(viewAnimFrame);
 }
 
 function viewAnimFrame(timestamp) {
@@ -1515,13 +1708,13 @@ function viewAnimFrame(timestamp) {
     render();
 
     if (t < 1) {
-        viewAnimId = requestAnimationFrame(viewAnimFrame);
+        viewAnimId = scheduleFrame(viewAnimFrame);
     }
 }
 
 function cancelViewportAnim() {
     if (viewAnimId) {
-        cancelAnimationFrame(viewAnimId);
+        cancelFrame(viewAnimId);
         viewAnimId = null;
     }
     viewAnimFrom = null;
@@ -1688,7 +1881,7 @@ function onMouseMove(e) {
             clampViewport();
             if (!renderPending) {
                 renderPending = true;
-                requestAnimationFrame(() => { renderPending = false; render(); });
+                scheduleFrame(() => { renderPending = false; render(); });
             }
             canvas.style.cursor = 'grabbing';
         }
@@ -1787,7 +1980,7 @@ function onWheel(e) {
         clampViewport();
         if (!renderPending) {
             renderPending = true;
-            requestAnimationFrame(() => { renderPending = false; render(); });
+            scheduleFrame(() => { renderPending = false; render(); });
         }
     } else if (e.shiftKey || Math.abs(e.deltaX) > Math.abs(e.deltaY)) {
         // ── Shift+wheel or horizontal trackpad: horizontal pan ──
@@ -1796,7 +1989,7 @@ function onWheel(e) {
         clampViewport();
         if (!renderPending) {
             renderPending = true;
-            requestAnimationFrame(() => { renderPending = false; render(); });
+            scheduleFrame(() => { renderPending = false; render(); });
         }
     } else {
         // ── Plain wheel: vertical pan ──
@@ -1807,7 +2000,7 @@ function onWheel(e) {
         clampViewport();
         if (!renderPending) {
             renderPending = true;
-            requestAnimationFrame(() => { renderPending = false; render(); });
+            scheduleFrame(() => { renderPending = false; render(); });
         }
     }
 }
@@ -1911,7 +2104,7 @@ function onTouchMove(e) {
             clampViewport();
             if (!renderPending) {
                 renderPending = true;
-                requestAnimationFrame(() => { renderPending = false; render(); });
+                scheduleFrame(() => { renderPending = false; render(); });
             }
         }
         return;
@@ -1940,7 +2133,7 @@ function onTouchMove(e) {
             clampViewport();
             if (!renderPending) {
                 renderPending = true;
-                requestAnimationFrame(() => { renderPending = false; render(); });
+                scheduleFrame(() => { renderPending = false; render(); });
             }
 
             // Track velocity for momentum (use instantaneous movement)
@@ -2033,7 +2226,7 @@ function findTouch(touchList, id) {
 
 function startInertia() {
     cancelInertia();
-    inertiaAnimId = requestAnimationFrame(inertiaFrame);
+    inertiaAnimId = scheduleFrame(inertiaFrame);
 }
 
 function inertiaFrame() {
@@ -2055,12 +2248,12 @@ function inertiaFrame() {
     clampViewport();
     render();
 
-    inertiaAnimId = requestAnimationFrame(inertiaFrame);
+    inertiaAnimId = scheduleFrame(inertiaFrame);
 }
 
 function cancelInertia() {
     if (inertiaAnimId) {
-        cancelAnimationFrame(inertiaAnimId);
+        cancelFrame(inertiaAnimId);
         inertiaAnimId = null;
     }
     inertiaVx = 0;
@@ -2382,7 +2575,7 @@ function showTooltip(clientX, clientY, node) {
     tooltipEl.style.top = (clientY - 10) + 'px';
 
     // Keep on screen
-    requestAnimationFrame(() => {
+    scheduleFrame(() => {
         if (!tooltipEl) return;
         const tipRect = tooltipEl.getBoundingClientRect();
         if (tipRect.right > window.innerWidth) {
@@ -2410,8 +2603,7 @@ function removeTooltip() {
 // ──────────────────────────────────────────────
 
 function findNodeForTarget(filename, msgIndex) {
-    for (const node of flatNodes) {
-        if (node.depth !== msgIndex) continue;
+    for (const node of nodesByDepth.get(msgIndex) || []) {
         if (!node.chatFiles.includes(filename)) continue;
         return node;
     }
@@ -2555,7 +2747,7 @@ function showNodePopup(clientX, clientY, node) {
     document.body.appendChild(popupEl);
 
     // Adjust if off-screen
-    requestAnimationFrame(() => {
+    scheduleFrame(() => {
         if (!popupEl) return;
         const popRect = popupEl.getBoundingClientRect();
         if (popRect.right > window.innerWidth - 10) {
@@ -2576,7 +2768,7 @@ function showNodePopup(clientX, clientY, node) {
     }
 
     // Click-outside dismiss (delayed to avoid immediate self-dismissal)
-    requestAnimationFrame(() => {
+    scheduleFrame(() => {
         if (!popupEl) return;
         popupEl._outsideHandler = (e) => {
             if (popupEl && !popupEl.contains(e.target)) {

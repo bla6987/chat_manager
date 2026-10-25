@@ -2,6 +2,8 @@
  * Semantic Engine — pure vector math for clustering, dimensionality reduction, and coloring.
  */
 
+import { isVector } from './vector-utils.js';
+
 const EPSILON = 1e-12;
 const CONVERGENCE_THRESHOLD = 1e-6;
 const POWER_ITER_MAX = 200;
@@ -21,11 +23,11 @@ function validateVectors(vectors) {
         throw new Error('Expected vectors to be an array.');
     }
     if (vectors.length === 0) return 0;
-    const dims = Array.isArray(vectors[0]) ? vectors[0].length : 0;
+    const dims = isVector(vectors[0]) ? vectors[0].length : 0;
     if (dims === 0) throw new Error('Vectors must contain at least one dimension.');
     for (let i = 0; i < vectors.length; i++) {
         const v = vectors[i];
-        if (!Array.isArray(v) || v.length !== dims) {
+        if (!isVector(v) || v.length !== dims) {
             throw new Error(`Vector dimension mismatch at index ${i}.`);
         }
     }
@@ -155,7 +157,7 @@ function initializeKMeansPlusPlus(vectors, k) {
  * @returns {number}
  */
 export function cosineSimilarity(a, b) {
-    if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length || a.length === 0) {
+    if (!isVector(a) || !isVector(b) || a.length !== b.length) {
         throw new Error('cosineSimilarity requires two vectors with equal non-zero dimensions.');
     }
 
@@ -313,177 +315,170 @@ export function findOptimalK(vectors, maxK = 8) {
     return ks[bestIdx];
 }
 
-/**
- * @param {number[][]} matrix
- * @param {number[]} vector
- * @returns {number[]}
- */
-function matrixVectorMultiply(matrix, vector) {
-    const out = new Array(matrix.length).fill(0);
-    for (let i = 0; i < matrix.length; i++) {
-        let sum = 0;
-        const row = matrix[i];
-        for (let j = 0; j < row.length; j++) {
-            sum += row[j] * vector[j];
-        }
-        out[i] = sum;
-    }
-    return out;
+/** Throw cancellation consistently in both synchronous and async PCA. */
+function assertPcaActive(signal) {
+    if (!signal?.aborted) return;
+    if (typeof signal.throwIfAborted === 'function') signal.throwIfAborted();
+    const error = new Error('PCA operation aborted.');
+    error.name = 'AbortError';
+    throw error;
 }
 
 /**
- * @param {number[]} vector
- * @returns {number}
+ * Calculate a PCA basis without a centered copy or a D-by-D covariance matrix.
+ * Covariance multiplication is C*v = Xc' * (Xc*v) / (N-1), evaluated one row
+ * at a time. Only the mean, output components and a few D-length work buffers
+ * are retained, independently of the number of input vectors.
+ *
+ * The generator shares the exact same numerical path between sync and async
+ * callers; row checkpoints allow the async driver to yield and cancel promptly.
  */
-function vectorNorm(vector) {
-    return Math.sqrt(dot(vector, vector));
-}
-
-/** Choose a non-null covariance direction after removing existing components. */
-function pcaSeed(centered, dims, components) {
-    const variances = new Float64Array(dims);
-    for (const row of centered) {
-        const projections = components.map(component => dot(row, component));
-        for (let d = 0; d < dims; d++) {
-            let residual = row[d];
-            for (let c = 0; c < components.length; c++) residual -= projections[c] * components[c][d];
-            variances[d] += residual * residual;
-        }
-    }
-    let seed = 0;
-    for (let d = 1; d < dims; d++) {
-        if (variances[d] > variances[seed]) seed = d;
-    }
-    if (variances[seed] / Math.max(1, centered.length - 1) <= EPSILON) return null;
-    const vector = new Array(dims).fill(0);
-    vector[seed] = 1;
-    for (const component of components) {
-        const projection = dot(vector, component);
-        for (let d = 0; d < dims; d++) vector[d] -= projection * component[d];
-    }
-    const length = vectorNorm(vector);
-    if (!Number.isFinite(length) || length <= EPSILON) return null;
-    return vector.map(value => value / length);
-}
-
-/**
- * PCA projection to 3 dimensions using covariance + power iteration.
- * @param {number[][]} vectors
- * @returns {{ projected: number[][], mean: number[], components: number[][] }}
- */
-export function pca3D(vectors) {
+function* pcaBasisSteps(vectors, { components: requested = 3, signal } = {}) {
+    assertPcaActive(signal);
     const dims = validateVectors(vectors);
     const n = vectors.length;
-    if (n === 0) {
-        return { projected: [], mean: [], components: [] };
-    }
+    if (!n) return { mean: new Float64Array(0), components: [] };
+    const outputCount = Math.max(1, Math.min(3, Math.floor(Number(requested) || 3)));
+    const componentCount = Math.min(dims, outputCount);
+    const rowsPerCheckpoint = Math.max(1, Math.floor(32768 / dims));
+    const mean = new Float64Array(dims);
+    const components = [];
+    const variances = new Float64Array(dims);
+    const projections = new Float64Array(componentCount);
+    let v = new Float64Array(dims);
+    let w = new Float64Array(dims);
+    const scale = 1 / Math.max(1, n - 1);
 
-    // Center data.
-    const mean = new Array(dims).fill(0);
     for (let i = 0; i < n; i++) {
         const row = vectors[i];
         for (let d = 0; d < dims; d++) {
+            if (!Number.isFinite(row[d])) throw new TypeError('PCA coordinates must be finite numbers.');
             mean[d] += row[d];
         }
-    }
-    for (let d = 0; d < dims; d++) {
-        mean[d] /= n;
-    }
-
-    const centered = new Array(n);
-    for (let i = 0; i < n; i++) {
-        const row = new Array(dims);
-        for (let d = 0; d < dims; d++) {
-            row[d] = vectors[i][d] - mean[d];
+        if ((i + 1) % rowsPerCheckpoint === 0) {
+            assertPcaActive(signal);
+            yield;
         }
-        centered[i] = row;
     }
+    for (let d = 0; d < dims; d++) mean[d] /= n;
 
-    // Covariance matrix.
-    const cov = new Array(dims);
-    for (let i = 0; i < dims; i++) {
-        cov[i] = new Array(dims).fill(0);
-    }
-
-    for (let r = 0; r < n; r++) {
-        const row = centered[r];
-        for (let i = 0; i < dims; i++) {
-            const vi = row[i];
-            for (let j = i; j < dims; j++) {
-                cov[i][j] += vi * row[j];
+    function* covarianceMultiply(input, output) {
+        output.fill(0);
+        for (let i = 0; i < n; i++) {
+            const row = vectors[i];
+            let projection = 0;
+            for (let d = 0; d < dims; d++) projection += (row[d] - mean[d]) * input[d];
+            for (let d = 0; d < dims; d++) output[d] += (row[d] - mean[d]) * projection;
+            if ((i + 1) % rowsPerCheckpoint === 0) {
+                assertPcaActive(signal);
+                yield;
             }
         }
+        for (let d = 0; d < dims; d++) output[d] *= scale;
     }
-
-    const scale = 1 / Math.max(1, n - 1);
-    for (let i = 0; i < dims; i++) {
-        for (let j = i; j < dims; j++) {
-            const value = cov[i][j] * scale;
-            cov[i][j] = value;
-            cov[j][i] = value;
-        }
-    }
-
-    // Power iteration for top 3 principal components.
-    const componentCount = Math.min(3, dims);
-    const components = [];
 
     for (let c = 0; c < componentCount; c++) {
-        let v = pcaSeed(centered, dims, components);
-        if (!v) break;
+        assertPcaActive(signal);
+        // Pick a coordinate with residual variance, including when leading
+        // coordinates are constant or earlier components exhausted the rank.
+        variances.fill(0);
+        for (let i = 0; i < n; i++) {
+            const row = vectors[i];
+            for (let p = 0; p < components.length; p++) {
+                let projection = 0;
+                for (let d = 0; d < dims; d++) projection += (row[d] - mean[d]) * components[p][d];
+                projections[p] = projection;
+            }
+            for (let d = 0; d < dims; d++) {
+                let residual = row[d] - mean[d];
+                for (let p = 0; p < components.length; p++) residual -= projections[p] * components[p][d];
+                variances[d] += residual * residual;
+            }
+            if ((i + 1) % rowsPerCheckpoint === 0) {
+                assertPcaActive(signal);
+                yield;
+            }
+        }
+        let seed = 0;
+        for (let d = 1; d < dims; d++) if (variances[d] > variances[seed]) seed = d;
+        if (variances[seed] * scale <= EPSILON) break;
+        v.fill(0);
+        v[seed] = 1;
+        for (const component of components) {
+            const projection = dot(v, component);
+            for (let d = 0; d < dims; d++) v[d] -= projection * component[d];
+        }
+        const seedNorm = norm(v);
+        if (!Number.isFinite(seedNorm) || seedNorm <= EPSILON) break;
+        for (let d = 0; d < dims; d++) v[d] /= seedNorm;
 
         for (let iter = 0; iter < POWER_ITER_MAX; iter++) {
-            let w = matrixVectorMultiply(cov, v);
-
-            // Orthogonalize against already found eigenvectors.
-            for (let p = 0; p < components.length; p++) {
-                const u = components[p];
-                const projection = dot(w, u);
-                for (let d = 0; d < dims; d++) {
-                    w[d] -= projection * u[d];
-                }
+            yield* covarianceMultiply(v, w);
+            for (const component of components) {
+                const projection = dot(w, component);
+                for (let d = 0; d < dims; d++) w[d] -= projection * component[d];
             }
-
-            const wNorm = vectorNorm(w);
-            if (wNorm <= EPSILON) break;
-
-            for (let d = 0; d < dims; d++) {
-                w[d] /= wNorm;
-            }
-
+            const wNorm = norm(w);
+            if (!Number.isFinite(wNorm) || wNorm <= EPSILON) break;
             let diff = 0;
             for (let d = 0; d < dims; d++) {
+                w[d] /= wNorm;
                 const delta = w[d] - v[d];
                 diff += delta * delta;
             }
-            v = w;
-            if (Math.sqrt(diff) <= POWER_ITER_TOL) {
-                break;
-            }
+            [v, w] = [w, v];
+            if (diff <= POWER_ITER_TOL * POWER_ITER_TOL) break;
         }
-
-        // Reject near-zero eigenvalue components.
-        const Av = matrixVectorMultiply(cov, v);
-        const eigenvalue = dot(v, Av);
-        if (eigenvalue <= EPSILON) {
-            break;
-        }
+        yield* covarianceMultiply(v, w);
+        if (dot(v, w) <= EPSILON) break;
         components.push(v.slice());
     }
+    while (components.length < outputCount) components.push(new Float64Array(dims));
+    assertPcaActive(signal);
+    return { mean, components };
+}
 
-    while (components.length < 3) {
-        components.push(new Array(dims).fill(0));
-    }
+/** Reusable PCA basis; working memory is O(D * componentCount). */
+export function computePcaBasis(vectors, options = {}) {
+    const steps = pcaBasisSteps(vectors, options);
+    let step = steps.next();
+    while (!step.done) step = steps.next();
+    return step.value;
+}
 
-    const projected = centered.map(row => {
-        const out = [0, 0, 0];
-        for (let c = 0; c < 3; c++) {
-            out[c] = dot(row, components[c]);
+/** Async basis calculation with an ~8 ms work slice and cancellation support. */
+export async function computePcaBasisAsync(vectors, options = {}) {
+    const steps = pcaBasisSteps(vectors, options);
+    let deadline = Date.now() + 8;
+    let step = steps.next();
+    while (!step.done) {
+        if (Date.now() >= deadline) {
+            await yieldToEventLoop();
+            assertPcaActive(options.signal);
+            deadline = Date.now() + 8;
         }
-        return out;
-    });
+        step = steps.next();
+    }
+    return step.value;
+}
 
-    return { projected, mean, components };
+/** Project one vector without allocating a centered high-dimensional copy. */
+export function projectVectorToPca(vector, basis) {
+    if (!isVector(vector) || vector.length !== basis.mean.length) {
+        throw new Error('PCA projection requires a vector matching the basis dimensions.');
+    }
+    const projected = new Array(basis.components.length).fill(0);
+    for (let c = 0; c < basis.components.length; c++) {
+        const component = basis.components[c];
+        for (let d = 0; d < vector.length; d++) projected[c] += (vector[d] - basis.mean[d]) * component[d];
+    }
+    return projected;
+}
+
+/** PCA projection to three dimensions, without allocating a covariance matrix. */
+export function pca3D(vectors, options = {}) {
+    const basis = computePcaBasis(vectors, { ...options, components: 3 });
+    return { projected: vectors.map(vector => projectVectorToPca(vector, basis)), ...basis };
 }
 
 /**
@@ -682,138 +677,33 @@ export async function findOptimalKAsync(vectors, maxK = 8) {
     return ks[bestIdx];
 }
 
-/**
- * Async PCA projection to 3 dimensions — yields during power iteration.
- * @param {number[][]} vectors
- * @returns {Promise<{ projected: number[][], mean: number[], components: number[][] }>}
- */
-export async function pca3DAsync(vectors) {
-    const dims = validateVectors(vectors);
-    const n = vectors.length;
-    if (n === 0) {
-        return { projected: [], mean: [], components: [] };
-    }
-
-    const mean = new Array(dims).fill(0);
-    for (let i = 0; i < n; i++) {
-        const row = vectors[i];
-        for (let d = 0; d < dims; d++) {
-            mean[d] += row[d];
+/** Project all points while keeping browser tasks responsive. */
+async function projectPcaAsync(vectors, basis, signal) {
+    const projected = new Array(vectors.length);
+    let deadline = Date.now() + 8;
+    const rowsPerCheckpoint = Math.max(1, Math.floor(32768 / Math.max(1, basis.mean.length)));
+    for (let i = 0; i < vectors.length; i++) {
+        projected[i] = projectVectorToPca(vectors[i], basis);
+        if ((i + 1) % rowsPerCheckpoint === 0 && Date.now() >= deadline) {
+            await yieldToEventLoop();
+            assertPcaActive(signal);
+            deadline = Date.now() + 8;
         }
     }
-    for (let d = 0; d < dims; d++) {
-        mean[d] /= n;
-    }
-
-    const centered = new Array(n);
-    for (let i = 0; i < n; i++) {
-        const row = new Array(dims);
-        for (let d = 0; d < dims; d++) {
-            row[d] = vectors[i][d] - mean[d];
-        }
-        centered[i] = row;
-    }
-
-    const cov = new Array(dims);
-    for (let i = 0; i < dims; i++) {
-        cov[i] = new Array(dims).fill(0);
-    }
-
-    for (let r = 0; r < n; r++) {
-        const row = centered[r];
-        for (let i = 0; i < dims; i++) {
-            const vi = row[i];
-            for (let j = i; j < dims; j++) {
-                cov[i][j] += vi * row[j];
-            }
-        }
-    }
-
-    const scale = 1 / Math.max(1, n - 1);
-    for (let i = 0; i < dims; i++) {
-        for (let j = i; j < dims; j++) {
-            const value = cov[i][j] * scale;
-            cov[i][j] = value;
-            cov[j][i] = value;
-        }
-    }
-
-    await yieldToEventLoop();
-
-    const componentCount = Math.min(3, dims);
-    const components = [];
-
-    for (let c = 0; c < componentCount; c++) {
-        let v = pcaSeed(centered, dims, components);
-        if (!v) break;
-
-        for (let iter = 0; iter < POWER_ITER_MAX; iter++) {
-            if (iter > 0 && iter % YIELD_INTERVAL === 0) {
-                await yieldToEventLoop();
-            }
-
-            let w = matrixVectorMultiply(cov, v);
-
-            for (let p = 0; p < components.length; p++) {
-                const u = components[p];
-                const projection = dot(w, u);
-                for (let d = 0; d < dims; d++) {
-                    w[d] -= projection * u[d];
-                }
-            }
-
-            const wNorm = vectorNorm(w);
-            if (wNorm <= EPSILON) break;
-
-            for (let d = 0; d < dims; d++) {
-                w[d] /= wNorm;
-            }
-
-            let diff = 0;
-            for (let d = 0; d < dims; d++) {
-                const delta = w[d] - v[d];
-                diff += delta * delta;
-            }
-            v = w;
-            if (Math.sqrt(diff) <= POWER_ITER_TOL) {
-                break;
-            }
-        }
-
-        const Av = matrixVectorMultiply(cov, v);
-        const eigenvalue = dot(v, Av);
-        if (eigenvalue <= EPSILON) {
-            break;
-        }
-        components.push(v.slice());
-    }
-
-    while (components.length < 3) {
-        components.push(new Array(dims).fill(0));
-    }
-
-    const projected = centered.map(row => {
-        const out = [0, 0, 0];
-        for (let c = 0; c < 3; c++) {
-            out[c] = dot(row, components[c]);
-        }
-        return out;
-    });
-
-    return { projected, mean, components };
+    assertPcaActive(signal);
+    return projected;
 }
 
-/**
- * Async PCA projection to 2 dimensions.
- * Reuses pca3DAsync and truncates to XY for deterministic behavior.
- * @param {number[][]} vectors
- * @returns {Promise<{ projected: number[][], mean: number[], components: number[][] }>}
- */
-export async function pca2DAsync(vectors) {
-    const { projected, mean, components } = await pca3DAsync(vectors);
-    const projected2d = projected.map(row => [row[0] ?? 0, row[1] ?? 0]);
-    const components2d = [components[0] || [], components[1] || []];
-    return { projected: projected2d, mean, components: components2d };
+/** Async matrix-free PCA projection to three dimensions. */
+export async function pca3DAsync(vectors, options = {}) {
+    const basis = await computePcaBasisAsync(vectors, { ...options, components: 3 });
+    return { projected: await projectPcaAsync(vectors, basis, options.signal), ...basis };
+}
+
+/** Async matrix-free PCA projection to two dimensions. */
+export async function pca2DAsync(vectors, options = {}) {
+    const basis = await computePcaBasisAsync(vectors, { ...options, components: 2 });
+    return { projected: await projectPcaAsync(vectors, basis, options.signal), ...basis };
 }
 
 /**

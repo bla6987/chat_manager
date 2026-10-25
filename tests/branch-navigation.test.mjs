@@ -1,8 +1,9 @@
+import { isVector } from '../src/vector-utils.js';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { timestampMs } from '../src/timestamps.js';
-import { buildIcicleData, reLayoutSubtree, sharesActiveThread } from '../src/icicle-data.js';
+import { buildIcicleData, reLayoutSubtree, sharesActiveThread, clearIcicleSemanticCache } from '../src/icicle-data.js';
 
 const viewSource = await readFile(new URL('../src/icicle-view.js', import.meta.url), 'utf8');
 const indexSource = await readFile(new URL('../index.js', import.meta.url), 'utf8');
@@ -42,7 +43,7 @@ async function viewHarness() {
             if (gate) await gate.promise;
             return result;
         },
-        reLayoutSubtree, sharesActiveThread, timestampMs,
+        reLayoutSubtree, sharesActiveThread, clearIcicleSemanticCache, isVector, timestampMs,
         getIndex: () => index,
         getMessageEmbedding: () => [1, 0],
         getDisplayName: file => file,

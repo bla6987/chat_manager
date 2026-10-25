@@ -4,6 +4,9 @@
 
 import { getIndex, getMessageEmbedding, getMessageActiveSwipeIndex } from './chat-reader.js';
 import { embedText, isEmbeddingConfigured, getEmbeddingRecipeKey } from './embedding-service.js';
+import { isVector } from './vector-utils.js';
+import { iterateCachedMessageVectors } from './archive-data.js';
+import { messagePreview } from './message-descriptors.js';
 import { clusterColor } from './semantic-engine.js';
 import { getDisplayName, getEmbeddingSettings, setEmbeddingSettings } from './metadata-store.js';
 
@@ -50,6 +53,10 @@ let workerScoreJobId = 0;
 let workerBuildInFlight = false;
 let workerBuildPending = false;
 let pendingBuildSnapshot = null;
+let archiveBuildController = null;
+let archiveScoreController = null;
+let nextRpcId = 0;
+const workerRequests = new Map();
 
 let messageRefs = [];
 let messageLookup = new Map();
@@ -163,6 +170,10 @@ export async function mountSemanticMap(containerEl, mode = 'mini') {
         return;
     }
 
+    if (typeof iterateCachedMessageVectors === 'function') {
+        void buildStreamedMap();
+        return;
+    }
     const data = collectMessageVectors();
     if (data.count === 0) {
         hideLoading();
@@ -181,7 +192,12 @@ export async function mountSemanticMap(containerEl, mode = 'mini') {
 }
 
 export function unmountSemanticMap() {
+    mounted = false;
+    cancelArchiveMapWork();
     workerScoreJobId += 1;
+    workerBuildJobId += 1;
+    clearTimeout(resizeTimer);
+    resizeTimer = null;
     if (rafId) {
         cancelAnimationFrame(rafId);
         rafId = null;
@@ -191,6 +207,8 @@ export function unmountSemanticMap() {
     unbindEvents();
 
     if (worker) {
+        worker.onmessage = null;
+        worker.onerror = null;
         worker.terminate();
         worker = null;
     }
@@ -199,12 +217,15 @@ export function unmountSemanticMap() {
     pendingBuildSnapshot = null;
 
     destroyGLResources();
+    gl?.getExtension?.('WEBGL_lose_context')?.loseContext();
 
     if (overlayEl) {
         overlayEl.remove();
         overlayEl = null;
     }
     if (canvas) {
+        canvas.width = 0;
+        canvas.height = 0;
         canvas.remove();
         canvas = null;
     }
@@ -243,6 +264,18 @@ export function unmountSemanticMap() {
     activePointIndex = -1;
     hoveredPointIndex = -1;
     pendingFocus = null;
+    fullRenderColors = new Float32Array(0);
+    fullRenderSizes = new Float32Array(0);
+    sampledPositions = new Float32Array(0);
+    sampledColors = new Float32Array(0);
+    sampledSizes = new Float32Array(0);
+    sampledIndices = new Uint32Array(0);
+    gridIndex.buckets = [];
+    canvasWidth = 0;
+    canvasHeight = 0;
+    interaction.mode = null;
+    interaction.moved = false;
+    embeddingRecipeKey = null;
 
     mounted = false;
 }
@@ -262,6 +295,10 @@ export async function updateSemanticMapData() {
         showLoading('Refreshing semantic map…');
         setInfo('Refresh queued…');
         return;
+    }
+
+    if (typeof iterateCachedMessageVectors === 'function') {
+        return buildStreamedMap();
     }
 
     const prevRefs = messageRefs;
@@ -308,6 +345,7 @@ export function focusMessageInSemanticMap(filename, msgIndex, options = {}) {
 
 /** Discard vectors and pending work even when the caller suppresses rerendering. */
 export function invalidateSemanticMapEmbeddings() {
+    cancelArchiveMapWork();
     embeddingRecipeKey = getEmbeddingRecipeKey(getEmbeddingSettings());
     workerBuildJobId += 1;
     worker?.terminate();
@@ -345,6 +383,13 @@ function ensureWorker() {
         synchronizeEmbeddingRecipe();
         if (worker !== currentWorker) return;
         const msg = event.data || {};
+        if (msg.rpcId && workerRequests.has(msg.rpcId)) {
+            const request = workerRequests.get(msg.rpcId);
+            workerRequests.delete(msg.rpcId);
+            if (msg.type === 'error') request.reject(new Error(msg.message));
+            else request.resolve(msg);
+            return;
+        }
         if (msg.type === 'mapDataReady') {
             if (msg.jobId !== workerBuildJobId) return;
             try {
@@ -383,6 +428,7 @@ function ensureWorker() {
 
     worker.onerror = (err) => {
         if (!mounted || worker !== currentWorker) return;
+        cancelArchiveMapWork();
         console.warn(`[${MODULE_NAME}] Semantic worker crashed:`, err);
         setInfo('Semantic map worker crashed.');
         worker?.terminate();
@@ -398,6 +444,161 @@ function ensureWorker() {
     };
 
     return true;
+}
+
+function cancelArchiveMapWork() {
+    archiveBuildController?.abort();
+    archiveScoreController?.abort();
+    archiveBuildController = null;
+    archiveScoreController = null;
+    for (const request of workerRequests.values()) request.reject(new Error('Map operation cancelled'));
+    workerRequests.clear();
+}
+
+function callMapWorker(type, payload, transfers = []) {
+    if (!worker) return Promise.reject(new Error('Map worker unavailable'));
+    const rpcId = ++nextRpcId;
+    return new Promise((resolve, reject) => {
+        workerRequests.set(rpcId, { resolve, reject });
+        try { worker.postMessage({ type, rpcId, ...payload }, transfers); }
+        catch (error) { workerRequests.delete(rpcId); reject(error); }
+    });
+}
+
+function archiveVectorOptions(signal) {
+    const settings = getEmbeddingSettings();
+    return { signal, settings, mode: settings.includeAlternateSwipes === true && settings.showAlternateSwipesInResults === true ? 'all' : 'active' };
+}
+
+function compactArchiveRef(record) {
+    return { fileName: record.fileName, displayName: getDisplayName(record.fileName) || record.fileName,
+        msgIndex: record.msgIndex, swipeIndex: record.swipeIndex, isActiveSwipe: record.isActive !== false,
+        role: record.role, timestamp: record.timestamp || '', text: messagePreview(record.preview ?? record.text ?? '', 160) };
+}
+
+/** Fit a bounded sample, then project the entire archive without holding its vector matrix. */
+async function buildStreamedMap() {
+    if (!mounted || !worker) return;
+    workerBuildInFlight = true;
+    const controller = new AbortController();
+    archiveBuildController?.abort();
+    archiveBuildController = controller;
+    const jobId = ++workerBuildJobId;
+    const currentWorker = worker;
+    const stillCurrent = () => mounted && !controller.signal.aborted && worker === currentWorker && jobId === workerBuildJobId;
+    const options = archiveVectorOptions(controller.signal);
+    let sample = [];
+    let detectedDims = 0, total = 0, sampleLimit = 0, randomState = 0x1234abcd;
+    try {
+        showLoading('Reading archive for semantic map…');
+        for await (const record of iterateCachedMessageVectors(options)) {
+            if (!stillCurrent()) return;
+            const vector = record.vector;
+            if (!isVector(vector) || !vector.length) continue;
+            if (!detectedDims) {
+                detectedDims = vector.length;
+                sampleLimit = Math.max(1, Math.min(1024, Math.floor((8 * 1024 * 1024) / (detectedDims * 4))));
+            }
+            if (vector.length !== detectedDims) continue;
+            total++;
+            if (sample.length < sampleLimit) sample.push(Float32Array.from(vector));
+            else {
+                randomState ^= randomState << 13; randomState ^= randomState >>> 17; randomState ^= randomState << 5;
+                const slot = Math.floor((randomState >>> 0) / 4294967296 * total);
+                if (slot < sampleLimit) sample[slot] = Float32Array.from(vector);
+            }
+        }
+        if (!stillCurrent()) return;
+        if (!total) {
+            clearMapDataState(); hideLoading(); showEmpty('No message embeddings found. Generate message embeddings to use Semantic Map.');
+            return;
+        }
+        const sampleFlat = new Float32Array(sample.length * detectedDims);
+        for (let i = 0; i < sample.length; i++) sampleFlat.set(sample[i], i * detectedDims);
+        sample = [];
+        await callMapWorker('fitProjection', { dims: detectedDims, vectorsFlatBuffer: sampleFlat.buffer }, [sampleFlat.buffer]);
+        if (!stillCurrent()) return;
+        let projected = new Float32Array(total * 2);
+        const refs = [];
+        let batch = [];
+        const flush = async () => {
+            if (!batch.length) return;
+            const flat = new Float32Array(batch.length * detectedDims);
+            for (let i = 0; i < batch.length; i++) flat.set(batch[i].vector, i * detectedDims);
+            const batchRefs = batch.map(compactArchiveRef);
+            batch = [];
+            const response = await callMapWorker('projectMapChunk', { dims: detectedDims, vectorsFlatBuffer: flat.buffer }, [flat.buffer]);
+            if (!stillCurrent()) return;
+            const coords = new Float32Array(response.pointsBuffer);
+            if ((refs.length * 2) + coords.length > projected.length) {
+                const grown = new Float32Array(Math.max(projected.length * 2, refs.length * 2 + coords.length));
+                grown.set(projected); projected = grown;
+            }
+            projected.set(coords, refs.length * 2);
+            for (const ref of batchRefs) refs.push(ref);
+        };
+        for await (const record of iterateCachedMessageVectors(options)) {
+            if (!stillCurrent()) return;
+            if (!isVector(record.vector) || record.vector.length !== detectedDims) continue;
+            batch.push(record);
+            if (batch.length >= 50) await flush();
+        }
+        await flush();
+        if (!stillCurrent()) return;
+        if (projected.length !== refs.length * 2) projected = projected.slice(0, refs.length * 2);
+        const settings = getEmbeddingSettings();
+        const response = await callMapWorker('buildProjectedMap', { pointsBuffer: projected.buffer, fixedK: settings.mapFixedK, maxK: 8 }, [projected.buffer]);
+        if (!stillCurrent()) return;
+        const lookup = new Map();
+        refs.forEach((ref, i) => {
+            const key = makePointKey(ref.fileName, ref.msgIndex);
+            if (ref.isActiveSwipe || !lookup.has(key)) lookup.set(key, i);
+        });
+        pendingBuildSnapshot = { jobId, refs, lookup, dims: detectedDims };
+        handleMapDataReady({ ...response, jobId });
+    } catch (error) {
+        if (!stillCurrent()) return;
+        console.warn(`[${MODULE_NAME}] Streamed map build failed:`, error);
+        hideLoading();
+        setInfo('Map refresh failed; previous map retained.');
+    } finally {
+        sample = [];
+        if (archiveBuildController === controller) {
+            archiveBuildController = null;
+            finishWorkerBuild();
+        }
+    }
+}
+
+async function scoreStreamedMap(queryVector, jobId) {
+    archiveScoreController?.abort();
+    const controller = new AbortController();
+    archiveScoreController = controller;
+    const refs = messageRefs;
+    const lookup = new Map(refs.map((ref, index) => [JSON.stringify([ref.fileName, ref.msgIndex, ref.swipeIndex]), index]));
+    const scores = new Float32Array(refs.length);
+    let min = Infinity, max = -Infinity;
+    let norm = 0;
+    for (const value of queryVector) norm += value * value;
+    norm = Math.sqrt(norm);
+    try {
+        for await (const record of iterateCachedMessageVectors(archiveVectorOptions(controller.signal))) {
+            if (!mounted || controller.signal.aborted || jobId !== workerScoreJobId || refs !== messageRefs) return;
+            const index = lookup.get(JSON.stringify([record.fileName, record.msgIndex, record.swipeIndex]));
+            const vector = record.vector;
+            if (index === undefined || !isVector(vector) || vector.length !== queryVector.length) continue;
+            let dot = 0, vNorm = 0;
+            for (let d = 0; d < vector.length; d++) { dot += vector[d] * queryVector[d]; vNorm += vector[d] * vector[d]; }
+            const score = norm && vNorm ? Math.max(-1, Math.min(1, dot / (norm * Math.sqrt(vNorm)))) : 0;
+            scores[index] = score; min = Math.min(min, score); max = Math.max(max, score);
+        }
+        if (!mounted || controller.signal.aborted || jobId !== workerScoreJobId || refs !== messageRefs) return;
+        handleQueryScoresReady({ scoresBuffer: scores.buffer, min: Number.isFinite(min) ? min : 0, max: Number.isFinite(max) ? max : 0 });
+    } catch (error) {
+        if (!controller.signal.aborted && mounted && jobId === workerScoreJobId) setInfo('Archive scoring incomplete.');
+    } finally {
+        if (archiveScoreController === controller) archiveScoreController = null;
+    }
 }
 
 function collectMessageVectors() {
@@ -417,19 +618,20 @@ function collectMessageVectors() {
         }
 
         const displayName = getDisplayName(fileName) || fileName;
-        for (const msg of entry.messages || []) {
+        for (const msg of entry.messageDescriptors || entry.messages || []) {
             const activeSwipeIndex = getMessageActiveSwipeIndex(msg);
             const variants = [{
                 swipeIndex: activeSwipeIndex,
-                text: typeof msg.text === 'string' ? msg.text : '',
+                text: messagePreview(msg.preview ?? msg.text ?? '', 160),
                 isActiveSwipe: true,
             }];
 
-            if (showAlternateSwipes && Array.isArray(msg.swipes) && msg.swipes.length > 0) {
-                const limit = Math.min(msg.swipes.length, maxSwipesPerMessage);
+            const swipeCount = msg.swipeCount ?? msg.swipes?.length ?? 0;
+            if (showAlternateSwipes && swipeCount > 0) {
+                const limit = Math.min(swipeCount, maxSwipesPerMessage);
                 for (let swipeIndex = 0; swipeIndex < limit; swipeIndex++) {
                     if (swipeIndex === activeSwipeIndex) continue;
-                    const swipeText = typeof msg.swipes[swipeIndex] === 'string' ? msg.swipes[swipeIndex] : '';
+                    const swipeText = messagePreview(msg.swipePreviews?.[swipeIndex] ?? msg.swipes?.[swipeIndex] ?? '', 160);
                     if (!swipeText.trim()) continue;
                     variants.push({
                         swipeIndex,
@@ -441,7 +643,7 @@ function collectMessageVectors() {
 
             for (const variant of variants) {
                 const vec = getMessageEmbedding(entry, msg, variant.swipeIndex);
-                if (!Array.isArray(vec) || vec.length === 0) continue;
+                if (!isVector(vec) || vec.length === 0) continue;
 
                 if (!detectedDims) {
                     detectedDims = vec.length;
@@ -528,6 +730,15 @@ function finishWorkerBuild() {
 
 function handleMapDataReady(msg) {
     if (pendingBuildSnapshot?.jobId !== msg.jobId) return;
+    archiveScoreController?.abort();
+    archiveScoreController = null;
+    workerScoreJobId++;
+    scoreValues = null;
+    scoreMin = 0;
+    scoreMax = 0;
+    selectedPointIndices.clear();
+    hoveredPointIndex = -1;
+    activePointIndex = -1;
     const nextPoints2d = new Float32Array(msg.points2dBuffer || new ArrayBuffer(0));
     const nextLabels = new Uint16Array(msg.labelsBuffer || new ArrayBuffer(0));
     const nextCentroids2d = new Float32Array(msg.centroids2dBuffer || new ArrayBuffer(0));
@@ -550,6 +761,12 @@ function handleMapDataReady(msg) {
     hideEmpty();
 
     const count = getPointCount();
+    if (!count) {
+        clearMapDataState();
+        showEmpty('No message embeddings found. Generate message embeddings to use Semantic Map.');
+        setInfo('0 points');
+        return;
+    }
     setInfo(`${count.toLocaleString()} points · ${Math.max(1, clusterSizes.length)} clusters`);
 
     if (queryText.length >= MIN_QUERY_CHARS) {
@@ -589,6 +806,7 @@ function clearMapDataState() {
     selectedPointIndices = new Set();
     activePointIndex = -1;
     hoveredPointIndex = -1;
+    gridIndex.buckets = [];
 
     rebuildRenderBuffers();
     updateJumpButtonState();
@@ -826,6 +1044,7 @@ function bindOverlayEvents() {
     });
 
     clearBtnEl?.addEventListener('click', () => {
+        archiveScoreController?.abort();
         workerScoreJobId += 1;
         queryText = '';
         if (queryInputEl) queryInputEl.value = '';
@@ -873,6 +1092,7 @@ async function runSemanticQuery(query) {
     const recipeKey = synchronizeEmbeddingRecipe();
     const requestedQuery = (query || '').trim();
     const jobId = ++workerScoreJobId;
+    archiveScoreController?.abort();
     queryText = requestedQuery;
 
     if (requestedQuery.length < MIN_QUERY_CHARS) {
@@ -933,6 +1153,20 @@ async function runSemanticQuery(query) {
 
     if (!mounted || jobId !== workerScoreJobId) {
         return;
+    }
+
+    if (typeof iterateCachedMessageVectors === 'function') {
+        if (!isVector(queryVector) || (dims > 0 && queryVector.length !== dims)) {
+            scoreValues = null;
+            scoreMin = 0;
+            scoreMax = 0;
+            rebuildRenderBuffers();
+            queueRender();
+            setInfo(`Query embedding is ${queryVector?.length || 0}D but map vectors are ${dims}D. Rebuild message embeddings for the active model.`);
+            return;
+        }
+        setInfo(`Scoring "${requestedQuery}" across archive…`);
+        return scoreStreamedMap(queryVector, jobId);
     }
 
     if (!worker) {
@@ -1541,6 +1775,8 @@ void main() {
     const vert = compileShader(gl.VERTEX_SHADER, vertSrc);
     const frag = compileShader(gl.FRAGMENT_SHADER, fragSrc);
     if (!vert || !frag) {
+        if (vert) gl.deleteShader(vert);
+        if (frag) gl.deleteShader(frag);
         fallbackCtx = canvas.getContext('2d');
         return;
     }
@@ -1549,6 +1785,10 @@ void main() {
     gl.attachShader(glProgram, vert);
     gl.attachShader(glProgram, frag);
     gl.linkProgram(glProgram);
+    gl.detachShader(glProgram, vert);
+    gl.detachShader(glProgram, frag);
+    gl.deleteShader(vert);
+    gl.deleteShader(frag);
 
     if (!gl.getProgramParameter(glProgram, gl.LINK_STATUS)) {
         console.warn(`[${MODULE_NAME}] Semantic map shader link failed:`, gl.getProgramInfoLog(glProgram));
@@ -1577,8 +1817,6 @@ void main() {
 }
 
 function destroyGLResources() {
-    if (!gl) return;
-
     const buffers = [
         glState.posBuffer,
         glState.colorBuffer,
@@ -1589,7 +1827,7 @@ function destroyGLResources() {
     ];
 
     for (const buffer of buffers) {
-        if (buffer) gl.deleteBuffer(buffer);
+        if (buffer && gl) gl.deleteBuffer(buffer);
     }
 
     glState.posBuffer = null;
@@ -1600,7 +1838,7 @@ function destroyGLResources() {
     glState.sampledSizeBuffer = null;
 
     if (glProgram) {
-        gl.deleteProgram(glProgram);
+        gl?.deleteProgram(glProgram);
         glProgram = null;
     }
 }

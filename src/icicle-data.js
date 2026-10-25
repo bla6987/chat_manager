@@ -24,7 +24,29 @@
  * @property {number} y1 - bottom of vertical span [0,1]
  */
 
-import { pca3D, pca3DAsync } from './semantic-engine.js';
+import { computePcaBasisAsync, projectVectorToPca } from './semantic-engine.js';
+import { isVector } from './vector-utils.js';
+import { normalizedMessageFingerprint, messagePreview as truncateMessagePreview } from './message-descriptors.js';
+
+const PREVIEW_CHARS = 160;
+const vectorIds = new WeakMap();
+let nextVectorId = 1;
+let semanticBasisCache = null;
+let semanticCacheGeneration = 0;
+
+/** Release the small shared PCA basis when its owning view is closed/invalidated. */
+export function clearIcicleSemanticCache() {
+    semanticCacheGeneration++;
+    semanticBasisCache = null;
+}
+
+function messagePreview(message) {
+    return truncateMessagePreview(message.preview ?? message.text ?? '', PREVIEW_CHARS);
+}
+
+function messageKey(message) {
+    return `${message.role}:${normalizedMessageFingerprint(message)}`;
+}
 
 /**
  * Normalize message text for trie keying: trim + collapse whitespace.
@@ -55,7 +77,7 @@ export function sharesActiveThread(entry, activeEntry) {
     for (let i = 0; i < 2; i++) {
         const message = entry.messages[i];
         const active = activeEntry.messages[i];
-        if (message.role !== active.role || normalizeText(message.text) !== normalizeText(active.text)) return false;
+        if (messageKey(message) !== messageKey(active)) return false;
     }
     return true;
 }
@@ -65,7 +87,7 @@ export function sharesActiveThread(entry, activeEntry) {
  *
  * @param {Object} chatIndex - keyed by fileName
  * @param {string|null} activeChatFile
- * @param {{ threadFocus?: boolean, previousRoot?: TrieNode|null }} [options]
+ * @param {{ threadFocus?: boolean, previousRoot?: TrieNode|null, colorMode?: string, embeddingRevision?: number, signal?: AbortSignal, iterateChatVectors?: Function }} [options]
  * @returns {{ root: TrieNode, flatNodes: Array, maxDepth: number, loadedCount: number, pcaRanges: { x: [number, number], y: [number, number], z: [number, number] }|null }}
  */
 export async function buildIcicleData(chatIndex, activeChatFile, options = {}) {
@@ -96,14 +118,17 @@ export async function buildIcicleData(chatIndex, activeChatFile, options = {}) {
 
         for (let i = 0; i < entry.messages.length; i++) {
             const msg = entry.messages[i];
-            const key = normalizeText(msg.text);
-            // Composite key includes role so user/assistant messages at same depth don't merge
-            const compositeKey = `${msg.role}:${key}`;
+            // Full-text fingerprints preserve topology after bodies are evicted;
+            // previews are only display text and never decide branch identity.
+            const compositeKey = messageKey(msg);
+            const preview = messagePreview(msg);
+            const key = normalizeText(preview);
 
             let child = current.children.get(compositeKey);
             if (!child) {
                 child = makeNode(key, msg.role, i);
-                child.representative = { text: msg.text, timestamp: msg.timestamp || null };
+                child.key = compositeKey;
+                child.representative = { text: preview, timestamp: msg.timestamp || null };
                 current.children.set(compositeKey, child);
             }
             child.chatFiles.push(fileName);
@@ -114,7 +139,10 @@ export async function buildIcicleData(chatIndex, activeChatFile, options = {}) {
     }
 
     compactSharedMembership(root, null);
-    const semanticContext = await buildSemanticContext(entries);
+    const semanticContext = options.colorMode === 'gradient'
+        ? await buildSemanticContext(entries, options)
+        : null;
+    if (options.signal?.aborted) throw options.signal.reason || new Error('Icicle build cancelled');
     annotateSemanticFields(root, chatIndex, semanticContext, new WeakMap());
 
     // ── Phase 2: Layout computation ──
@@ -135,6 +163,7 @@ export async function buildIcicleData(chatIndex, activeChatFile, options = {}) {
 function makeNode(normalizedText, role, depth) {
     return {
         normalizedText,
+        key: '',
         role,
         depth,
         chatFiles: [],
@@ -165,24 +194,81 @@ function compactSharedMembership(root, parentChatFiles) {
  * @param {Array<{fileName: string, entry: Object}>} entries
  * @returns {{ mean: number[]|null, components: number[][]|null }}
  */
-async function buildSemanticContext(entries) {
+async function buildSemanticContext(entries, options) {
+    if (typeof options.iterateChatVectors === 'function') return buildArchivedSemanticContext(entries, options);
     const vectors = [];
-    for (const { entry } of entries) {
-        if (Array.isArray(entry.chatEmbedding) && entry.chatEmbedding.length > 0) {
-            vectors.push(entry.chatEmbedding);
+    const signatureParts = ['resident', options.embeddingRevision || 0];
+    for (const { fileName, entry } of entries) {
+        const vector = entry.chatEmbedding;
+        if (!isVector(vector) || vector.length === 0) continue;
+        if (!vectorIds.has(vector)) vectorIds.set(vector, nextVectorId++);
+        // Vectors are immutable. Replacing one or changing its recipe invalidates
+        // the basis without a second O(N*D) content scan on every view refresh.
+        signatureParts.push(fileName, vectorIds.get(vector), entry.chatEmbeddingHash || '');
+        vectors.push(vector);
+    }
+    if (vectors.length === 0) return null;
+    const signature = JSON.stringify(signatureParts);
+    if (semanticBasisCache?.signature === signature) return semanticBasisCache.basis;
+    const generation = semanticCacheGeneration;
+    const basis = await computePcaBasisAsync(vectors, { components: 3, signal: options.signal });
+    if (options.signal?.aborted) throw options.signal.reason || new Error('Icicle build cancelled');
+    if (generation === semanticCacheGeneration) semanticBasisCache = { signature, basis };
+    return basis;
+}
+
+/** Persist only a bounded basis and three coordinates per chat, including evicted representatives. */
+async function buildArchivedSemanticContext(entries, options) {
+    const generation = semanticCacheGeneration;
+    const byFile = new Map(entries.map(item => [item.fileName, item.entry]));
+    const sourceOptions = { fileNames: [...byFile.keys()], signal: options.signal };
+    const signatureParts = ['archive', options.embeddingRevision || 0];
+    let sample = [];
+    let dims = 0, count = 0, sampleLimit = 0, randomState = 0x517cc1b7;
+    for await (const record of options.iterateChatVectors(sourceOptions)) {
+        if (options.signal?.aborted) throw options.signal.reason || new Error('Icicle build cancelled');
+        const vector = record.vector;
+        if (!byFile.has(record.fileName) || !isVector(vector) || !vector.length) continue;
+        if (!dims) {
+            dims = vector.length;
+            sampleLimit = Math.max(1, Math.min(1024, Math.floor((8 * 1024 * 1024) / (dims * 4))));
+            signatureParts.push(dims);
+        }
+        if (vector.length !== dims) continue;
+        const entry = byFile.get(record.fileName);
+        let identity = record.hash || entry.cachedChatEmbeddingHash || entry.chatEmbeddingHash;
+        if (!identity) {
+            if (!vectorIds.has(vector)) vectorIds.set(vector, nextVectorId++);
+            identity = vectorIds.get(vector);
+        }
+        signatureParts.push(record.fileName, record.epoch ?? '', record.recipeKey || '', identity);
+        count++;
+        if (sample.length < sampleLimit) sample.push(Float32Array.from(vector));
+        else {
+            randomState ^= randomState << 13; randomState ^= randomState >>> 17; randomState ^= randomState << 5;
+            const slot = Math.floor((randomState >>> 0) / 4294967296 * count);
+            if (slot < sampleLimit) sample[slot] = Float32Array.from(vector);
         }
     }
-
-    if (vectors.length === 0) {
-        return { mean: null, components: null };
+    if (options.signal?.aborted) throw options.signal.reason || new Error('Icicle build cancelled');
+    if (!count) {
+        if (generation === semanticCacheGeneration) semanticBasisCache = null;
+        return null;
     }
-
-    const { mean, components } = await pca3DAsync(vectors);
-    if (!Array.isArray(mean) || !Array.isArray(components) || components.length === 0) {
-        return { mean: null, components: null };
+    const signature = JSON.stringify(signatureParts);
+    if (semanticBasisCache?.signature === signature) return { projections: semanticBasisCache.projections };
+    const basis = await computePcaBasisAsync(sample, { components: 3, signal: options.signal });
+    sample = [];
+    const projections = new Map();
+    for await (const record of options.iterateChatVectors(sourceOptions)) {
+        if (options.signal?.aborted) throw options.signal.reason || new Error('Icicle build cancelled');
+        if (byFile.has(record.fileName) && isVector(record.vector) && record.vector.length === dims) {
+            projections.set(record.fileName, projectVectorToPca(record.vector, basis));
+        }
     }
-
-    return { mean, components };
+    if (options.signal?.aborted) throw options.signal.reason || new Error('Icicle build cancelled');
+    if (generation === semanticCacheGeneration) semanticBasisCache = { signature, basis, projections };
+    return { projections };
 }
 
 /**
@@ -211,59 +297,18 @@ function majorityCluster(chatFiles, chatIndex) {
     return bestLabel;
 }
 
-/**
- * @param {string[]} chatFiles
- * @param {Object} chatIndex
- * @returns {number[]|null}
- */
-function meanPoolEmbeddings(chatFiles, chatIndex) {
-    let sum = null;
+/** PCA is linear: average three projected coordinates, never retain a D-vector per group. */
+function meanProjectedCoordinates(chatFiles, projections) {
+    if (!projections) return null;
+    const sum = [0, 0, 0];
     let count = 0;
     for (const file of chatFiles) {
-        const vector = chatIndex[file]?.chatEmbedding;
-        if (!Array.isArray(vector) || vector.length === 0) continue;
-        if (!sum) sum = new Array(vector.length).fill(0);
-        if (vector.length !== sum.length) continue;
-        for (let i = 0; i < vector.length; i++) sum[i] += vector[i];
+        const point = projections.get(file);
+        if (!point) continue;
+        for (let axis = 0; axis < 3; axis++) sum[axis] += point[axis] || 0;
         count++;
     }
-    if (!sum || count === 0) return null;
-    for (let i = 0; i < sum.length; i++) sum[i] /= count;
-    return sum;
-}
-
-/**
- * Project a pooled embedding into the shared PCA basis.
- * @param {number[]} vector
- * @param {number[]} mean
- * @param {number[][]} components
- * @returns {number[]|null}
- */
-function projectToPca3(vector, mean, components) {
-    if (!Array.isArray(vector) || !Array.isArray(mean) || !Array.isArray(components)) return null;
-    if (vector.length !== mean.length) return null;
-
-    const centered = new Array(vector.length);
-    for (let i = 0; i < vector.length; i++) {
-        centered[i] = vector[i] - mean[i];
-    }
-
-    const out = [0, 0, 0];
-    for (let c = 0; c < 3; c++) {
-        const component = components[c];
-        if (!Array.isArray(component) || component.length !== centered.length) {
-            out[c] = 0;
-            continue;
-        }
-
-        let dot = 0;
-        for (let i = 0; i < centered.length; i++) {
-            dot += centered[i] * component[i];
-        }
-        out[c] = dot;
-    }
-
-    return out;
+    return count ? sum.map(value => value / count) : null;
 }
 
 /**
@@ -272,6 +317,15 @@ function projectToPca3(vector, mean, components) {
  * @param {{ mean: number[]|null, components: number[][]|null }} semanticContext
  */
 function annotateSemanticFields(root, chatIndex, semanticContext, aggregateCache) {
+    const projections = semanticContext?.projections || (semanticContext ? new Map() : null);
+    if (projections && !semanticContext.projections) {
+        for (const file of root.chatFiles) {
+            const vector = chatIndex[file]?.chatEmbedding;
+            if (isVector(vector) && vector.length === semanticContext.mean.length) {
+                projections.set(file, projectVectorToPca(vector, semanticContext));
+            }
+        }
+    }
     const stack = [root];
     while (stack.length) {
         const node = stack.pop();
@@ -279,16 +333,12 @@ function annotateSemanticFields(root, chatIndex, semanticContext, aggregateCache
         if (!aggregate) {
             aggregate = {
                 clusterLabel: majorityCluster(node.chatFiles, chatIndex),
-                chatEmbedding: meanPoolEmbeddings(node.chatFiles, chatIndex),
-                pca3d: null,
+                pca3d: meanProjectedCoordinates(node.chatFiles, projections),
             };
-            if (aggregate.chatEmbedding && semanticContext.mean && semanticContext.components) {
-                aggregate.pca3d = projectToPca3(aggregate.chatEmbedding, semanticContext.mean, semanticContext.components);
-            }
             aggregateCache.set(node.chatFiles, aggregate);
         }
         node.clusterLabel = aggregate.clusterLabel;
-        node.chatEmbedding = aggregate.chatEmbedding;
+        node.chatEmbedding = null;
         node.pca3d = aggregate.pca3d;
         for (const child of node.children.values()) stack.push(child);
     }
@@ -342,14 +392,14 @@ function computeLayout(root, y0, y1, activeChatFile, previousNode = null) {
         const previousOrder = new Map();
         if (previousNode) {
             const ordered = [...previousNode.children.values()].sort((a, b) => a.y0 - b.y0);
-            ordered.forEach((child, i) => previousOrder.set(`${child.role}:${child.normalizedText}`, i));
+            ordered.forEach((child, i) => previousOrder.set(child.key, i));
         }
 
         // Keep existing branches in place during refreshes and chat switches. New
         // branches follow them; the initial layout still prioritizes the active chat.
         children.sort((a, b) => {
-            const aOrder = previousOrder.get(`${a.role}:${a.normalizedText}`) ?? Infinity;
-            const bOrder = previousOrder.get(`${b.role}:${b.normalizedText}`) ?? Infinity;
+            const aOrder = previousOrder.get(a.key) ?? Infinity;
+            const bOrder = previousOrder.get(b.key) ?? Infinity;
             if (aOrder !== bOrder) return aOrder - bOrder;
             const aActive = activeChatFile && a.chatFiles.includes(activeChatFile) ? 1 : 0;
             const bActive = activeChatFile && b.chatFiles.includes(activeChatFile) ? 1 : 0;
@@ -365,7 +415,7 @@ function computeLayout(root, y0, y1, activeChatFile, previousNode = null) {
         for (const child of children) {
             const proportion = child.chatFiles.length / totalChats;
             const childSpan = span * proportion;
-            const previousChild = previousNode?.children.get(`${child.role}:${child.normalizedText}`);
+            const previousChild = previousNode?.children.get(child.key);
             stack.push({ node: child, y0: cursor, y1: cursor + childSpan, previousNode: previousChild });
             cursor += childSpan;
         }

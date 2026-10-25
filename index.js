@@ -36,6 +36,62 @@ let currentInjectedMode = null;
 let pendingUIInjection = null;
 let slashCommandsRegistered = false;
 let cleanupMomentumScroll = null;
+let hostGenerationActive = false;
+let branchPromptPreparations = 0;
+
+function syncEmbeddingGenerationActive(active) {
+    hostGenerationActive = active === true;
+    setEmbeddingGenerationActive(hostGenerationActive || branchPromptPreparations > 0);
+}
+
+async function refreshBranchContextInjection(activeFile) {
+    const initialContext = SillyTavern.getContext();
+    const avatar = initialContext.characters?.[initialContext.characterId]?.avatar;
+    try {
+        return await updateBranchContextInjection(activeFile);
+    } catch (error) {
+        console.warn(`[${MODULE_NAME}] Branch context refresh failed:`, error);
+        const context = SillyTavern.getContext();
+        if (getActiveChatFile(context) === activeFile
+            && context.characters?.[context.characterId]?.avatar === avatar) {
+            clearBranchContextInjection();
+        }
+        return { branchCount: 0, injected: false };
+    }
+}
+
+/** The host awaits this listener before assembling a real generation prompt. */
+async function onGenerationPreparing(_type, _options, dryRun = false) {
+    if (dryRun || !getBranchContextEnabled()) return;
+    const initialContext = SillyTavern.getContext();
+    const activeFile = getActiveChatFile(initialContext);
+    const avatar = initialContext.characters?.[initialContext.characterId]?.avatar;
+    const characterId = initialContext.characterId;
+    const groupId = initialContext.groupId ?? null;
+    const isCurrentTarget = () => {
+        const context = SillyTavern.getContext();
+        return getActiveChatFile(context) === activeFile
+            && context.characters?.[context.characterId]?.avatar === avatar
+            && context.characterId === characterId && (context.groupId ?? null) === groupId;
+    };
+    if (!activeFile) {
+        clearBranchContextInjection();
+        return;
+    }
+    branchPromptPreparations++;
+    setEmbeddingGenerationActive(true);
+    try {
+        // A debounced edit refresh can supersede our first read. Prompt
+        // assembly must wait for a current result, not that aborted snapshot.
+        while (getBranchContextEnabled() && isCurrentTarget()) {
+            const result = await refreshBranchContextInjection(activeFile);
+            if (!result?.stale) break;
+        }
+    } finally {
+        branchPromptPreparations--;
+        setEmbeddingGenerationActive(hostGenerationActive || branchPromptPreparations > 0);
+    }
+}
 
 function isEmbeddingGenerationEnabled() {
     const settings = getEmbeddingSettings();
@@ -84,7 +140,7 @@ const onMessageUpdate = (() => {
             // Branch context injection works even when panel is closed
             if (isBranchContextActive()) {
                 if (activeChatFile) {
-                    updateBranchContextInjection(activeChatFile);
+                    await refreshBranchContextInjection(activeChatFile);
                 } else {
                     clearBranchContextInjection();
                 }
@@ -135,7 +191,9 @@ const onMessageUpdate = (() => {
                 if (eventAvatar && eventAvatar === getIndexCharacterAvatar()) removeChatFromIndex(fileName);
             });
         }
-        initEmbeddingGenerationLifecycle({ eventSource, eventTypes, setActive: setEmbeddingGenerationActive, getContext: () => SillyTavern.getContext() });
+        initEmbeddingGenerationLifecycle({ eventSource, eventTypes, setActive: syncEmbeddingGenerationActive, getContext: () => SillyTavern.getContext() });
+        const prepareEvent = eventTypes.GENERATION_AFTER_COMMANDS || eventTypes.GENERATION_STARTED;
+        if (prepareEvent) eventSource.on(prepareEvent, onGenerationPreparing);
 
         // Ensure the top bar toggle button exists once all extensions are ready
         if (eventTypes.APP_READY) {
@@ -166,11 +224,12 @@ const onMessageUpdate = (() => {
 
     // Restore branch context injection if it was enabled
     if (getBranchContextEnabled()) {
-        setTimeout(() => {
+        setTimeout(async () => {
+            if (!getBranchContextEnabled()) return;
             const ctx = SillyTavern.getContext();
             const activeFile = getActiveChatFile(ctx);
             if (activeFile) {
-                updateBranchContextInjection(activeFile);
+                await refreshBranchContextInjection(activeFile);
             } else {
                 clearBranchContextInjection();
             }
@@ -1367,12 +1426,12 @@ async function onChatChanged() {
     if (getBranchContextEnabled()) {
         // Clear immediately, then defer re-injection to let index stabilize
         clearBranchContextInjection();
-        setTimeout(() => {
+        setTimeout(async () => {
             if (!isBranchContextActive()) return;
             const ctx = SillyTavern.getContext();
             const activeFile = getActiveChatFile(ctx);
             if (activeFile) {
-                updateBranchContextInjection(activeFile);
+                await refreshBranchContextInjection(activeFile);
             }
         }, 1000);
     }

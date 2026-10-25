@@ -1,9 +1,29 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { getIndex, clearIndex, updateActiveChat, ensureMessageEmbeddingMap, setMessageEmbedding, getMessageEmbedding } from '../src/chat-reader.js';
+import { getIndex, clearIndex, updateActiveChat, ensureMessageEmbeddingMap, setMessageEmbedding, getMessageEmbedding, setVectorCacheBudget, getVectorCacheStats, DEFAULT_VECTOR_CACHE_BYTES, clearResidentVectors } from '../src/chat-reader.js';
 import { getEmbeddingSettings, setEmbeddingSettings, getFilterState, setFilterState, getDisplayName, getSummary, getChatTags, getSelectedEmbeddingChats, setSelectedEmbeddingChats, isEmbeddingChatSelected, setEmbeddingChatSelected } from '../src/metadata-store.js';
 
 globalThis.fetch = async () => { throw new Error('Unexpected provider request in cache-only performance test.'); };
+
+let embeddingDisk = new Map();
+let embeddingReads = [];
+let embeddingWrites = [];
+let embeddingActiveReads = 0;
+let embeddingPeakReads = 0;
+let embeddingReadDelay = false;
+const embeddingTestStore = {
+    async getItem(key) {
+        embeddingReads.push(key);
+        embeddingPeakReads = Math.max(embeddingPeakReads, ++embeddingActiveReads);
+        if (embeddingReadDelay) await Promise.resolve();
+        embeddingActiveReads--;
+        return embeddingDisk.get(key) || null;
+    },
+    async setItem(key, value) { embeddingWrites.push(key); embeddingDisk.set(key, structuredClone(value)); return value; },
+    async clear() { embeddingDisk.clear(); },
+    async removeItem(key) { embeddingDisk.delete(key); },
+    async iterate(callback) { for (const [key, value] of embeddingDisk) callback(value, key); },
+};
 
 function setup() {
     clearIndex();
@@ -19,7 +39,7 @@ function setup() {
 }
 
 function entry(messages) {
-    return { fileName: 'synthetic.jsonl', isLoaded: true, messages, messageEmbeddings: new Map(), chatEmbedding: [1, 0], chatEmbeddingHash: 'existing', clusterLabel: 1 };
+    return { fileName: 'synthetic.jsonl', isLoaded: true, messages, messageEmbeddings: new Map(), chatEmbedding: new Float32Array([1, 0]), chatEmbeddingHash: 'existing', clusterLabel: 1 };
 }
 function raw(text, swipes, swipe_id = 0) {
     return { mes: text, is_user: false, send_date: '2026-01-01T00:00:00Z', swipes, swipe_id };
@@ -81,14 +101,14 @@ test('edits, swipe changes, deletions, and JSONL metadata offsets retain only ma
     context.chat = [raw('edited', ['alternate', 'edited'], 1), raw('tail')];
     await updateActiveChat(chat.fileName);
     let updated = getIndex()[chat.fileName];
-    assert.deepEqual(getMessageEmbedding(updated, updated.messages[0], 0), [0, 1]);
+    assert.deepEqual(getMessageEmbedding(updated, updated.messages[0], 0), new Float32Array([0, 1]));
     assert.equal(getMessageEmbedding(updated, updated.messages[0], 1), null);
-    assert.deepEqual(getMessageEmbedding(updated, updated.messages[1]), [1, 1]);
+    assert.deepEqual(getMessageEmbedding(updated, updated.messages[1]), new Float32Array([1, 1]));
     context.chat = [raw('alternate', ['alternate', 'edited'], 0)];
     await updateActiveChat(chat.fileName);
     updated = getIndex()[chat.fileName];
     assert.equal(updated.messageEmbeddings.size, 1, 'deleted message and edited swipe vectors are absent');
-    assert.deepEqual(getMessageEmbedding(updated, updated.messages[0]), [0, 1]);
+    assert.deepEqual(getMessageEmbedding(updated, updated.messages[0]), new Float32Array([0, 1]));
 });
 
 test('a stable summary preserves the chat vector when new messages arrive', async () => {
@@ -154,12 +174,8 @@ test('incremental generation reads only the new message from persistent cache', 
     const recipeKey = getEmbeddingRecipeKey(getEmbeddingSettings());
     const cacheKey = text => `${hashEmbeddingText(recipeKey)}:${hashEmbeddingText(text)}`;
     const cacheEntries = new Map([[cacheKey('new message'), { text: 'new message', vector: [0, 1], dims: 2, provider: 'ollama', model: 'synthetic', recipeKey }]]);
-    globalThis.SillyTavern.libs = { localforage: { createInstance: () => ({
-        async getItem(key) {
-            reads.push(key);
-            return cacheEntries.get(key) || null;
-        },
-    }) } };
+    embeddingReads = reads; embeddingDisk = cacheEntries;
+    globalThis.SillyTavern.libs = { localforage: { createInstance: () => embeddingTestStore } };
     await generateEmbeddingsForCurrentIndex({ ensureIndex: false, rerender: false, incremental: true });
     assert.equal(reads.length, 1);
     assert.equal(getIndex()[chat.fileName].messageEmbeddings.size, 5001);
@@ -193,6 +209,62 @@ test('incremental generation reads only the new message from persistent cache', 
     await generateEmbeddingsForCurrentIndex({ ...automatic, ensureIndex: false, rerender: false });
     assert.equal(reads.length, 0, 'repeat automatic restore does not walk backward into older messages');
     assert.equal(active.messageEmbeddings.size, 256);
+});
+
+test('full generation processes every message with a tiny resident budget and remains searchable from disk', async () => {
+    const context = setup();
+    const { generateEmbeddingsForCurrentIndex } = await import('../src/ui-controller.js');
+    const { iterateCachedMessageVectors } = await import('../src/archive-data.js');
+    const { searchArchivePage } = await import('../src/archive-search.js');
+    setEmbeddingSettings({ enabled: true, provider: 'ollama', model: 'budget-model', dimensions: 4,
+        embeddingLevels: { chat: false, message: true, query: true }, includeAlternateSwipes: false });
+    embeddingDisk = new Map(); embeddingReads = []; embeddingWrites = [];
+    embeddingPeakReads = 0; embeddingActiveReads = 0; embeddingReadDelay = true;
+    globalThis.SillyTavern.libs = { localforage: { createInstance: () => embeddingTestStore } };
+    const originalFetch = globalThis.fetch;
+    const providerInputs = [];
+    globalThis.fetch = async (url, options) => {
+        assert.ok(url.endsWith('/api/embed'), 'only the batched provider endpoint is needed');
+        const { input } = JSON.parse(options.body);
+        providerInputs.push(input);
+        return { ok: true, text: async () => JSON.stringify({ embeddings: input.map(() => [1, 0, 0, 0]) }) };
+    };
+    const chat = entry(Array.from({ length: 123 }, (_, i) => parsed(i, `budget message ${i} unique`)));
+    chat.messageCount = chat.messages.length;
+    chat.chatEmbedding = null;
+    getIndex()[chat.fileName] = chat;
+    context.chat = chat.messages.map(message => raw(message.text));
+    setVectorCacheBudget(32); // only two four-dimensional Float32 vectors fit
+    try {
+        const result = await generateEmbeddingsForCurrentIndex({ ensureIndex: false, rerender: false,
+            includeAlternateSwipes: false, ignoreScope: true });
+        assert.equal(result.messageVectors, 123);
+        assert.deepEqual(providerInputs.map(input => input.length), [50, 50, 23]);
+        assert.equal(new Set(providerInputs.flat()).size, 123);
+        assert.equal([...embeddingDisk.values()].filter(record => record.vector).length, 123);
+        assert.ok(embeddingPeakReads <= 50, `cache reads peaked at ${embeddingPeakReads}`);
+        assert.ok(getVectorCacheStats().residentBytes <= 32);
+        assert.ok(chat.messageEmbeddings.size <= 2);
+        assert.equal(chat.cachedMessageEmbeddingKeys.size, 123);
+
+        clearResidentVectors();
+        let recovered = 0;
+        for await (const item of iterateCachedMessageVectors({ fileNames: [chat.fileName], mode: 'active' })) {
+            assert.ok(item.vector instanceof Float32Array);
+            recovered++;
+        }
+        assert.equal(recovered, 123, 'all generated vectors remain available after RAM eviction');
+        assert.equal(getVectorCacheStats().residentBytes, 0, 'disk scans do not promote the full corpus');
+        const page = await searchArchivePage({ query: 'budget message 0', mode: 'semantic',
+            queryVector: new Float32Array([1, 0, 0, 0]), settings: getEmbeddingSettings(), limit: 10 });
+        assert.equal(page.results[0].item.index, 0);
+        assert.equal(page.scanned, 123);
+        assert.equal(getVectorCacheStats().residentBytes, 0);
+    } finally {
+        globalThis.fetch = originalFetch;
+        embeddingReadDelay = false;
+        setVectorCacheBudget(DEFAULT_VECTOR_CACHE_BYTES);
+    }
 });
 
 test('deleting the last message uses the empty live chat and drops its vectors', async () => {

@@ -1,8 +1,11 @@
+import { isVector } from '../src/vector-utils.js';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
 import { timestampMs } from '../src/timestamps.js';
-import { buildIcicleData, reLayoutSubtree, sharesActiveThread } from '../src/icicle-data.js';
+import { buildIcicleData, reLayoutSubtree, sharesActiveThread, clearIcicleSemanticCache } from '../src/icicle-data.js';
+import { createMessageDescriptor } from '../src/message-descriptors.js';
+import { gradientColor, clusterColor, topicShiftScores } from '../src/semantic-engine.js';
 
 const raw = (await readFile(new URL('../src/icicle-view.js', import.meta.url), 'utf8'))
     .replace(/^import\s[\s\S]*?from\s+['"][^'"]+['"];\s*/gm, '').replace(/^export /gm, '');
@@ -12,7 +15,7 @@ const entry = (prefix, length = 20) => ({ isLoaded: true,
 
 // DOM and frame boundaries are synthetic; mount, rebuild, render, navigation,
 // semantic annotation and every data traversal execute the production source.
-function harness(index = {}) {
+function harness(index = {}, options = {}) {
     const frames = new Map();
     let frameId = 0;
     const context = new Proxy({ measureText: text => ({ width: text.length * 6 }) }, {
@@ -54,7 +57,7 @@ function harness(index = {}) {
             buildGate = null;
             if (gate) await gate.promise;
             return result;
-        }, reLayoutSubtree, sharesActiveThread, timestampMs,
+        }, reLayoutSubtree, sharesActiveThread, clearIcicleSemanticCache, isVector, timestampMs, gradientColor, clusterColor, topicShiftScores,
         SillyTavern: { libs: { moment: value => {
             momentInputs.push(value);
             return { format: () => new Date(value).toISOString() };
@@ -69,12 +72,15 @@ function harness(index = {}) {
             return recipe.endsWith('model-a') ? [1, 0] : [0, 1];
         },
         getMessageEmbedding: () => [1, 0], cosineSimilarity: (a, b) => a[0] * b[0] + a[1] * b[1],
-        getIndex: () => index, getDisplayName: file => file, getEmbeddingSettings: () => ({}),
+        getIndex: () => index, getDisplayName: file => file, getEmbeddingSettings: () => options.settings || {},
         isEmbeddingConfigured: () => false, document,
         window: { devicePixelRatio: 1, addEventListener() {}, removeEventListener() {} },
         requestAnimationFrame: fn => { const id = ++frameId; frames.set(id, fn); return id; },
         cancelAnimationFrame: id => frames.delete(id), setTimeout, clearTimeout, performance, console,
     };
+    if (options.bodies) deps.iterateChatBodies = options.bodies;
+    if (options.vectors) deps.iterateCachedMessageVectors = options.vectors;
+    if (options.chatVectors) deps.iterateCachedChatVectors = options.chatVectors;
     const api = new Function(...Object.keys(deps), `${raw}; return {
         mountIcicle, unmountIcicle, updateIcicleData, isIcicleMounted,
         focusMessageInIcicle, setIcicleCallbacks, exploreThread, invalidateIcicleEmbeddings,
@@ -83,10 +89,11 @@ function harness(index = {}) {
         snapshot: () => ({canvas, flatNodes, zoomRoot, pendingFocusRequest, exploreRoot,
             exploreDepthOffset, threadFocusActive, emptyStateEl, dataUpdateInFlight,
             x:viewX, y0:viewY0, y1:viewY1, semanticQueryCache, semanticSearchActive, semanticSearchScores,
-            searchMatches, searchMatchIndex, pcaRanges, viewAnimId, tooltipEl}),
+            searchMatches, searchMatchIndex, pcaRanges, viewAnimId, tooltipEl, topicDriftCache,
+            keywordSearchController,buildAbortController,topicDriftRequest,activeTopicDrift,pendingFrames:pendingFrameIds.size}),
     };`)(...Object.values(deps));
     api.setIcicleCallbacks({ getActive: () => active, onThreadFocusChanged: value => scopeChanges.push(value) });
-    return { api, index, scopeChanges, momentInputs, fixture: new Element('div'),
+    return { api, index, scopeChanges, momentInputs, frames, fixture: new Element('div'),
         setActive: value => { active = value; },
         setRecipe: value => { recipe = value; operationEpoch++; },
         get embeddingCalls() { return embeddingCalls; },
@@ -101,6 +108,88 @@ function deferred() {
     const promise = new Promise(r => { resolve = r; });
     return { promise, resolve };
 }
+
+test('icicle keyword search reads evicted bodies beyond previews and cancels stale scans', async () => {
+    const messages = [
+        { index: 0, role: 'user', text: 'shared start' },
+        { index: 1, role: 'assistant', text: 'filler '.repeat(100) + 'hidden archive needle' },
+        { index: 2, role: 'user', text: 'different result' },
+    ];
+    const chat = { fileName: 'a', isLoaded: true, bodyResident: false, messages: messages.map(createMessageDescriptor) };
+    let gate = null;
+    const signals = [];
+    const view = harness({ a: chat }, { bodies: async function* ({ fileNames, signal }) {
+        signals.push(signal);
+        const pending = gate; gate = null;
+        if (pending) await pending.promise;
+        if (fileNames.includes('a')) yield { entry: chat, messages };
+    } });
+    await view.api.mountIcicle(view.fixture, 'mini');
+    await view.api.executeSearch('hidden archive needle', { navigate: false });
+    assert.equal(view.api.snapshot().searchMatches.length, 1);
+    assert.equal(view.api.snapshot().searchMatches[0].depth, 1);
+    assert.ok(chat.messages.every(message => message.isDescriptor && message.text === ''), 'search does not promote all bodies back into residency');
+    assert.ok(view.api.snapshot().flatNodes.every(node => node.representative.text.length <= 160));
+    gate = deferred(); const delayed = gate;
+    const stale = view.api.executeSearch('hidden archive needle', { navigate: false });
+    const oldSignal = signals.at(-1);
+    await view.api.executeSearch('different result', { navigate: false });
+    assert.equal(oldSignal.aborted, true);
+    delayed.resolve(); await stale;
+    assert.equal(view.api.snapshot().searchMatches[0].depth, 2, 'late archived results cannot overwrite the newer search');
+    view.api.unmountIcicle();
+    assert.equal(view.frames.size, 0);
+});
+
+test('icicle semantic search includes nonresident vectors and teardown clears caches and frames', async () => {
+    const messages = [0, 1, 2].map(index => ({ index, role: 'assistant', text: `message ${index}` }));
+    const chat = { fileName: 'a', isLoaded: true, bodyResident: false, messages: messages.map(createMessageDescriptor), messageEmbeddings: new Map() };
+    const view = harness({ a: chat }, { vectors: async function* ({ fileNames, signal, mode }) {
+        assert.deepEqual(fileNames, ['a']); assert.equal(mode, 'active');
+        for (const message of messages) {
+            if (signal.aborted) return;
+            yield { fileName: 'a', msgIndex: message.index, vector: new Float32Array(message.index === 1 ? [1, 0] : [0, 1]) };
+        }
+    } });
+    await view.api.mountIcicle(view.fixture, 'mini');
+    await view.settle();
+    assert.equal(view.api.snapshot().activeTopicDrift.scoresByDepth.size, 2, 'topic drift includes adjacent persisted vectors after eviction');
+    assert.equal(view.api.snapshot().activeTopicDrift.scoresByDepth.get(1), 1);
+    view.api.setSemantic(); view.api.executeSearch('archive query'); await view.settle();
+    let state = view.api.snapshot();
+    assert.equal(state.semanticSearchScores.size, 3);
+    assert.equal(state.searchMatches[0].depth, 1);
+    assert.equal(state.semanticQueryCache.size, 1);
+    const canvas = state.canvas;
+    view.api.unmountIcicle(); state = view.api.snapshot();
+    assert.equal(state.semanticQueryCache.size, 0); assert.equal(state.topicDriftCache.size, 0);
+    assert.equal(state.keywordSearchController, null); assert.equal(state.buildAbortController, null);
+    assert.equal(state.topicDriftRequest, null);
+    assert.equal(state.pendingFrames, 0); assert.equal(view.frames.size, 0);
+    assert.equal(state.flatNodes.length, 0); assert.equal(state.searchMatches.length, 0);
+    assert.equal(canvas.width, 0); assert.equal(canvas.height, 0);
+});
+
+test('icicle completes its first mount if gradient work is invalidated while archive reads are pending', async () => {
+    const gate = deferred();
+    const signals = [];
+    const view = harness({ a: entry('chat', 3) }, { settings: { colorMode: 'gradient' },
+        chatVectors: async function* ({ signal }) {
+            signals.push(signal);
+            if (signals.length === 1) await gate.promise;
+            yield { fileName: 'a', vector: new Float32Array([1, 0]), hash: 'representative', recipeKey: 'current', epoch: 1 };
+        },
+    });
+    const mount = view.api.mountIcicle(view.fixture, 'mini');
+    await view.settle();
+    view.api.invalidateIcicleEmbeddings();
+    assert.equal(signals[0].aborted, true);
+    gate.resolve(); await mount;
+    assert.equal(view.api.isIcicleMounted(), true);
+    assert.equal(view.api.snapshot().flatNodes.length, 3);
+    assert.ok(signals.length >= 3, 'the current recipe rebuilds both sampled basis and coordinates');
+    view.api.unmountIcicle();
+});
 
 test('empty cold mount recovers as hydration arrives and removes its empty overlay', async () => {
     const { api, index, fixture } = harness();
@@ -192,14 +281,14 @@ test('all trie passes and Explore handle 12000 messages with semantic fields and
     const b = { ...entry('deep', 12000), chatEmbedding: [0, 1, 0], clusterLabel: 2 };
     b.messages[11000].text = 'divergent';
     const index = { a, b };
-    const first = await buildIcicleData(index, 'a');
+    const first = await buildIcicleData(index, 'a', { colorMode: 'gradient' });
     assert.equal(first.maxDepth, 11999);
     assert.equal(first.flatNodes.length, 13000);
     assert.equal(first.flatNodes.at(-1).clusterLabel, 2);
     assert.ok(first.flatNodes.every(node => node.y1 > node.y0 && node.pca3d?.every(Number.isFinite)));
     assert.equal(first.flatNodes[200].chatFiles, first.flatNodes[0].chatFiles,
         'shared prefixes retain membership compaction');
-    const next = await buildIcicleData(index, 'b', { previousRoot: first.root });
+    const next = await buildIcicleData(index, 'b', { previousRoot: first.root, colorMode: 'gradient' });
     assert.deepEqual(next.flatNodes.filter(node => node.depth === 11000).map(node => node.normalizedText),
         ['deep11000', 'divergent']);
     const subtree = reLayoutSubtree(next.flatNodes[100], 'b', { preserveOrder: true });

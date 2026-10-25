@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
-    embedText, embedTexts, clearEmbeddingCache, getCachedEmbeddingForText,
+    embedText, embedTexts, iterateEmbeddingBatches, embedTextsBatched, clearEmbeddingCache, getCachedEmbeddingForText,
     captureEmbeddingOperation, isEmbeddingOperationCurrent,
     getEmbeddingRecipeKey, isStaleEmbeddingOperationError, onEmbeddingDimensionsInvalidated,
 } from '../src/embedding-service.js';
@@ -54,14 +54,14 @@ test('persistent cache isolates same model alias on different endpoints and reus
         return response([url.includes('synthetic-a') ? [1, 0] : [0, 1]]);
     };
     const operation = captureEmbeddingOperation();
-    assert.deepEqual(await embedText('identical text', { level: 'message' }), [1, 0]);
+    assert.deepEqual(await embedText('identical text', { level: 'message' }), new Float32Array([1, 0]));
     assert.equal(isEmbeddingOperationCurrent(operation), true, 'learning dimensions does not invalidate a recipe');
     settings.ollamaUrl = 'http://synthetic-b/';
     assert.equal(isEmbeddingOperationCurrent(operation), false);
     assert.equal(await getCachedEmbeddingForText('identical text'), null);
-    assert.deepEqual(await embedText('identical text', { level: 'message' }), [0, 1]);
+    assert.deepEqual(await embedText('identical text', { level: 'message' }), new Float32Array([0, 1]));
     settings.ollamaUrl = 'http://synthetic-a/';
-    assert.deepEqual(await embedText('identical text', { level: 'message' }), [1, 0]);
+    assert.deepEqual(await embedText('identical text', { level: 'message' }), new Float32Array([1, 0]));
     assert.equal(calls.length, 2);
     assert.equal(new Set([...stored.values()].filter(x => x.vector).map(x => x.recipeKey)).size, 2);
     assert.equal(getEmbeddingRecipeKey(settings), getEmbeddingRecipeKey({ ...settings, ollamaUrl: 'http://synthetic-a' }));
@@ -143,7 +143,7 @@ test('unexpected dimension drift clears old vectors and permits a fresh operatio
     assert.equal(isEmbeddingOperationCurrent(oldOperation), false);
     assert.equal(settings.dimensions, null);
     assert.equal(stored.size, 0);
-    assert.deepEqual(await embedText('dimension drift', { level: 'message' }), [1, 0, 0]);
+    assert.deepEqual(await embedText('dimension drift', { level: 'message' }), new Float32Array([1, 0, 0]));
     assert.equal(settings.dimensions, 3);
 });
 
@@ -226,13 +226,100 @@ test('explicit unsupported routes fall back only for that endpoint; a missing mo
     assert.equal(calls.length, 4);
     settings.ollamaUrl = 'http://synthetic-new-ollama';
     globalThis.fetch = async url => { calls.push(url); return response([[0, 1]]); };
-    assert.deepEqual(await embedText('old first', { level: 'message' }), [0, 1]);
+    assert.deepEqual(await embedText('old first', { level: 'message' }), new Float32Array([0, 1]));
     assert.equal(calls.at(-1), 'http://synthetic-new-ollama/api/embed');
     settings.ollamaUrl = 'http://synthetic-missing-model';
     globalThis.fetch = async () => response(null, 404, JSON.stringify({ error: { message: 'model not found' } }));
     await assert.rejects(embedText('model test', { level: 'message' }), /model not found/);
     globalThis.fetch = async url => { assert.ok(url.endsWith('/api/embed')); return response([[1, 0]]); };
     await embedText('model test', { level: 'message' });
+});
+
+test('streamed embeddings yield bounded typed batches before consuming the rest of an input', async () => {
+    await setupEmbedding();
+    let consumed = 0;
+    const requests = [];
+    function* inputs() {
+        for (let i = 0; i < 11; i++) {
+            consumed++;
+            yield `stream-${i}`;
+        }
+    }
+    globalThis.fetch = async (_url, options) => {
+        const texts = JSON.parse(options.body).input;
+        requests.push(texts);
+        return response(texts.map((_, i) => [i + 0.1, 1]));
+    };
+    const batches = iterateEmbeddingBatches(inputs(), { level: 'message', batchSize: 4 });
+    const first = await batches.next();
+    assert.equal(consumed, 4, 'the source pauses at the first full batch');
+    assert.equal(requests.length, 1);
+    assert.equal(first.value.offset, 0);
+    assert.equal(first.value.vectors.length, 4);
+    assert.ok(first.value.vectors.every(vector => vector instanceof Float32Array));
+    assert.ok([...stored.values()].filter(value => value.vector).every(value => value.vector instanceof Float32Array));
+    const offsets = [first.value.offset];
+    for await (const batch of batches) offsets.push(batch.offset);
+    assert.deepEqual(offsets, [0, 4, 8]);
+    assert.deepEqual(requests.map(texts => texts.length), [4, 4, 3]);
+});
+
+test('streaming observes text and known vector budgets without truncating large inputs', async () => {
+    await setupEmbedding({ dimensions: 2 });
+    const requests = [];
+    globalThis.fetch = async (_url, options) => {
+        const texts = JSON.parse(options.body).input;
+        requests.push(texts);
+        return response(texts.map(() => [1, 0]));
+    };
+    const texts = ['aaaa', 'bbbb', 'cccccccccccc', 'dd', 'ee', 'ff'];
+    const delivered = [];
+    const result = await embedTextsBatched(texts, {
+        level: 'message', batchSize: 20, maxBatchChars: 10, maxBatchVectorBytes: 16,
+        onBatch: async batch => { delivered.push(...batch.texts); },
+    });
+    assert.deepEqual(delivered, texts);
+    assert.deepEqual(result, { count: 6, dimensions: 2 });
+    assert.deepEqual(requests.map(batch => batch.length), [2, 1, 2, 1]);
+    assert.equal(requests[1][0], texts[2], 'an oversize item is sent whole and alone');
+});
+
+test('batch callbacks apply backpressure and abort prevents further provider calls', async () => {
+    await setupEmbedding();
+    const controller = new AbortController();
+    let consumed = 0, calls = 0;
+    async function* inputs() {
+        for (let i = 0; i < 10; i++) { consumed++; yield `backpressure-${i}`; }
+    }
+    globalThis.fetch = async (_url, options) => {
+        assert.equal(options.signal, controller.signal);
+        calls++;
+        return response(JSON.parse(options.body).input.map(() => [1, 0]));
+    };
+    await assert.rejects(embedTextsBatched(inputs(), {
+        level: 'message', batchSize: 2, signal: controller.signal,
+        onBatch: async () => {
+            await Promise.resolve();
+            assert.equal(consumed, 2);
+            assert.equal(calls, 1);
+            controller.abort();
+        },
+    }), { name: 'AbortError' });
+    assert.equal(calls, 1);
+});
+
+test('legacy cached arrays become Float32 and invalid coordinates are rejected before persistence', async () => {
+    await setupEmbedding();
+    globalThis.fetch = async () => response([[0.1, 0.2]]);
+    await embedText('legacy vector', { level: 'message' });
+    const record = [...stored.values()].find(value => value.vector);
+    record.vector = Array.from(record.vector);
+    const restored = await getCachedEmbeddingForText('legacy vector');
+    assert.ok(restored instanceof Float32Array);
+    assert.equal(restored[0], Math.fround(0.1));
+    globalThis.fetch = async () => response([[1e100, 0]]);
+    await assert.rejects(embedText('invalid float32', { level: 'message' }), /Float32 range/);
+    assert.equal([...stored.values()].filter(value => value.vector).length, 1);
 });
 
 function setupAI({ target = 'ai', selected = 'original' } = {}) {

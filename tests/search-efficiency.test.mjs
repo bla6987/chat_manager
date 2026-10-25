@@ -105,7 +105,7 @@ test('query embeddings coalesce by provider identity, survive failures, and igno
             getSemanticQueryEmbedding('same query'),
             getSemanticQueryEmbedding('same query'),
         ]);
-        assert.deepEqual(a, [1, 2, 3]);
+        assert.deepEqual(Array.from(a), [1, 2, 3]);
         assert.equal(a, b);
         assert.equal(calls, 1);
         assert.equal((await getSemanticQueryEmbedding('same query')), a, 'learned dimensions do not split the same provider identity');
@@ -134,7 +134,7 @@ test('query embeddings coalesce by provider identity, survive failures, and igno
             calls++;
             return { ok: true, text: async () => JSON.stringify({ embeddings: [[7, 8, 9]] }) };
         };
-        assert.deepEqual(await getSemanticQueryEmbedding('late query'), [7, 8, 9]);
+        assert.deepEqual(Array.from(await getSemanticQueryEmbedding('late query')), [7, 8, 9]);
         assert.equal(calls, 4, 'a completion from before cache clear cannot repopulate the query memory cache');
 
         let failures = 0;

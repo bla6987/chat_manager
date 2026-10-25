@@ -1,3 +1,4 @@
+import { isVector } from '../src/vector-utils.js';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
@@ -5,6 +6,7 @@ import vm from 'node:vm';
 import { selectTopStable } from '../src/view-efficiency-utils.js';
 import { pca3D, pca3DAsync } from '../src/semantic-engine.js';
 import { getEmbeddingRecipeKey } from '../src/embedding-service.js';
+import { messagePreview } from '../src/message-descriptors.js';
 
 // Execute production view handlers with synthetic DOM/provider/RAF boundaries.
 // The appended accessors expose private state without changing production APIs.
@@ -48,12 +50,12 @@ function sourceContext(file, tail, globals = {}) {
         .replace(/^import .*;$/gm, '').replace(/^export /gm, '');
     const context = vm.createContext({
         console: { warn() {} }, Float32Array, Float64Array, Uint16Array, Uint32Array,
-        ArrayBuffer, Map, Set, Math, Number, setTimeout, clearTimeout, ...globals,
+        ArrayBuffer, DataView, AbortController, Map, Set, Math, Number, setTimeout, clearTimeout, ...globals,
     });
     vm.runInContext(`${source}\n${tail}`, context, { filename: file });
     return context;
 }
-function viewContext(kind) {
+function viewContext(kind, options = {}) {
     const fixture = new Element();
     const requests = [];
     const workers = [];
@@ -62,10 +64,26 @@ function viewContext(kind) {
     const data = { index: {}, settings: {}, configured: true };
     let frameId = 0;
     class Worker {
-        constructor() { this.sent = []; workers.push(this); }
-        postMessage(message) { this.sent.push(message); }
+        constructor() {
+            this.sent = [];
+            if (options.archive) this.engine = sourceContext('semantic-map-worker.js', `
+                globalThis.inspect=()=>({vectorsFlat:state.vectorsFlat,norms:state.norms,basis:state.projectionBasis});`, {
+                self: { postMessage: (message, transfers) => {
+                    const reply = structuredClone(message, { transfer: transfers || [] });
+                    queueMicrotask(() => this.deliver(reply));
+                } },
+            });
+            workers.push(this);
+        }
+        postMessage(message, transfers) {
+            if (!this.engine) { this.sent.push(message); return; }
+            this.sent.push({ type: message.type, rpcId: message.rpcId, dims: message.dims,
+                vectorBytes: message.vectorsFlatBuffer?.byteLength || 0, pointBytes: message.pointsBuffer?.byteLength || 0 });
+            const copy = structuredClone(message, { transfer: transfers || [] });
+            queueMicrotask(() => { if (!this.terminated) void this.engine.self.onmessage({ data: copy }); });
+        }
         terminate() { this.terminated = true; }
-        deliver(message) { this.onmessage({ data: message }); }
+        deliver(message) { this.onmessage?.({ data: message }); }
     }
     class ResizeObserver {
         constructor(callback) { this.callback = callback; observers.push(this); }
@@ -86,11 +104,16 @@ function viewContext(kind) {
         getMessageEmbedding: (entry, msg, swipe) => entry.messageEmbeddings.get(`${msg.index}:${swipe}`),
         isEmbeddingConfigured: () => data.configured,
         embedText: query => { const request = { query, ...deferred() }; requests.push(request); return request.promise; },
-        clusterColor: () => '#5294E0', selectTopStable, getEmbeddingRecipeKey,
+        clusterColor: () => '#5294E0', selectTopStable, getEmbeddingRecipeKey, isVector, messagePreview,
     };
+    if (options.archive) globals.iterateCachedMessageVectors = options.archive;
     const tail = kind === 'map' ? `
         globalThis.api = {mount:mountSemanticMap,unmount:unmountSemanticMap,update:updateSemanticMapData,query:runSemanticQuery,invalidate:invalidateSemanticMapEmbeddings,
-            state:()=>({mounted,canvasWidth,canvasHeight,canvas,scoreValues,queryText,messageRefs,info:infoEl?.textContent}),
+            state:()=>({mounted,canvasWidth,canvasHeight,canvas,scoreValues,queryText,messageRefs,info:infoEl?.textContent,
+                points2d,labels,fullRenderColors,fullRenderSizes,sampledPositions,sampledColors,sampledSizes,sampledIndices,
+                gridBuckets:gridIndex.buckets,requests:workerRequests.size,building:workerBuildInFlight,
+                archiveBuildController,archiveScoreController}),
+            installGL:(context)=>{gl=context;glProgram={};for(const key of Object.keys(glState))glState[key]={};},
             clear:()=>clearBtnEl.dispatch('click'),
             setPoints:(points,nextBounds,size,nextCamera)=>{
                 points2d=new Float32Array(points);messageRefs=Array.from({length:points.length/2},()=>({}));
@@ -99,12 +122,14 @@ function viewContext(kind) {
         globalThis.api = {mount:mountGraphView,unmount:unmountGraphView,update:updateGraphViewData,
             addTerm:addSearchTermPin,addMessage:addMessagePin,scope:setGraphScope,invalidate:invalidateGraphEmbeddings,
             clear:()=>clearBtnEl.dispatch('click'),
-            state:()=>({mounted,canvasWidth,canvasHeight,canvas,pins,simNodes,simRunning,messageRefs,pending:pendingTermPins.size}),
+            state:()=>({mounted,canvasWidth,canvasHeight,canvas,pins,simNodes,simRunning,messageRefs,pending:pendingTermPins.size,
+                messageVectors,availableMessageCount,archiveGraphController,contextMenuEl}),
+            contextMenu:(i)=>showNodeContextMenu(i,0,0),
             settle:()=>{simRunning=false;rafId=null;},
             draw:(context,zoom)=>{ctx=context;camera.zoom=zoom;drawEdges();drawNeighborNodes();drawNodeHighlight(1);}
         };`;
     const context = sourceContext(kind === 'map' ? 'semantic-map-view.js' : 'graph-view.js', tail, globals);
-    return { api: context.api, fixture, requests, workers, data, observers, context };
+    return { api: context.api, fixture, requests, workers, data, observers, context, frames };
 }
 function entry(texts, vectors) {
     const messages = texts.map((text, index) => ({ index, text, role: 'assistant', swipeId: 0 }));
@@ -118,6 +143,162 @@ function finishMap(worker) {
         centroids2dBuffer: new Float32Array(2).buffer, clusterSizesBuffer: new Uint32Array([n]).buffer,
         bounds: { minX: -1, maxX: 1, minY: -1, maxY: 1 } });
 }
+
+async function until(predicate, message = 'asynchronous view work did not settle') {
+    for (let tick = 0; tick < 200; tick++) {
+        if (predicate()) return;
+        await new Promise(resolve => setImmediate(resolve));
+    }
+    assert.fail(message);
+}
+
+function archiveFixture(records) {
+    const calls = [];
+    return {
+        records, calls,
+        async *iterate(options = {}) {
+            calls.push(options);
+            for (const record of records) {
+                if (options.signal?.aborted) throw options.signal.reason;
+                if (options.fileNames && !options.fileNames.includes(record.fileName)) continue;
+                if (options.mode === 'active' && record.isActive === false) continue;
+                yield record;
+            }
+        },
+    };
+}
+
+function archiveRows(count) {
+    return Array.from({ length: count }, (_, index) => ({
+        fileName: index < count / 2 ? 'old.jsonl' : 'recent.jsonl', msgIndex: index,
+        swipeIndex: index % 5 ? 0 : 2, isActive: index % 5 !== 0,
+        role: 'assistant', text: `${index} ` + 'long body '.repeat(200),
+        vector: new Float32Array([Math.sin(index * 0.1), Math.cos(index * 0.1), index % 7, 1]),
+    }));
+}
+
+test('streamed map projects every archived swipe, bounds vector work and releases CPU/GPU state', async () => {
+    const archive = archiveFixture(archiveRows(2100));
+    const view = viewContext('map', { archive: archive.iterate.bind(archive) });
+    view.data.settings = { includeAlternateSwipes: true, showAlternateSwipesInResults: true };
+    await view.api.mount(view.fixture);
+    await until(() => !view.api.state().building);
+    const state = view.api.state();
+    const worker = view.workers[0];
+    assert.equal(state.messageRefs.length, 2100, 'an empty resident index does not hide archived messages');
+    assert.equal(state.points2d.length, 4200);
+    assert.ok(state.messageRefs.every(ref => ref.text.length <= 160 && !('vector' in ref)));
+    const fit = worker.sent.find(message => message.type === 'fitProjection');
+    assert.equal(fit.vectorBytes / (fit.dims * 4), 1024);
+    assert.ok(fit.vectorBytes <= 8 * 1024 * 1024);
+    const chunks = worker.sent.filter(message => message.type === 'projectMapChunk');
+    assert.equal(chunks.length, 42);
+    assert.ok(chunks.every(message => message.vectorBytes / (message.dims * 4) <= 50));
+    assert.equal(worker.engine.inspect().vectorsFlat, null);
+    assert.equal(worker.engine.inspect().norms, null);
+    assert.equal(worker.engine.inspect().basis, null, 'worker releases the fitted basis after projection');
+    const query = view.api.query('old alternate');
+    view.requests[0].resolve(archive.records[0].vector);
+    await query;
+    assert.equal(view.api.state().scoreValues.length, 2100);
+    assert.ok(Math.abs(view.api.state().scoreValues[0] - 1) < 1e-6, 'an archived alternate swipe remains queryable');
+    assert.equal(worker.sent.filter(message => message.type === 'scoreQuery').length, 0, 'query scoring does not restore a worker corpus');
+    const wrongDimensions = view.api.query('dimension mismatch');
+    view.requests[1].resolve(new Float32Array([1, 0])); await wrongDimensions;
+    assert.match(view.api.state().info, /2D but map vectors are 4D/);
+    assert.equal(view.api.state().scoreValues, null);
+    let buffersDeleted = 0, programsDeleted = 0, contextsLost = 0;
+    view.api.installGL({ deleteBuffer() { buffersDeleted++; }, deleteProgram() { programsDeleted++; },
+        getExtension: () => ({ loseContext() { contextsLost++; } }) });
+    const oldCanvas = state.canvas;
+    view.api.unmount();
+    const cleared = view.api.state();
+    for (const field of ['points2d', 'labels', 'fullRenderColors', 'fullRenderSizes', 'sampledPositions', 'sampledColors', 'sampledSizes', 'sampledIndices', 'gridBuckets', 'messageRefs']) {
+        assert.equal(cleared[field].length, 0, `${field} is released`);
+    }
+    assert.equal(cleared.requests, 0);
+    assert.equal(cleared.archiveBuildController, null);
+    assert.equal(cleared.archiveScoreController, null);
+    assert.equal(view.frames.size, 0);
+    assert.equal(worker.terminated, true);
+    assert.equal(oldCanvas.width, 0); assert.equal(oldCanvas.height, 0);
+    assert.equal(buffersDeleted, 6); assert.equal(programsDeleted, 1); assert.equal(contextsLost, 1);
+});
+
+test('streamed graph keeps bounded neighbors while finding archived messages and remapping pins', async () => {
+    const records = archiveRows(1200);
+    for (const record of records) { record.isActive = true; record.vector = new Float32Array([0, 1]); }
+    records.at(-1).vector = new Float32Array([1, 0]);
+    const archive = archiveFixture(records);
+    const view = viewContext('graph', { archive: archive.iterate.bind(archive) });
+    await view.api.mount(view.fixture);
+    await until(() => !view.api.state().archiveGraphController);
+    assert.equal(view.api.state().availableMessageCount, 1200);
+    assert.equal(view.api.state().messageVectors.length, 0, 'an unpinned graph retains no archive vector matrix');
+    const pin = view.api.addTerm('anchor'); view.requests[0].resolve(new Float32Array([1, 0])); await pin;
+    await until(() => !view.api.state().archiveGraphController);
+    let state = view.api.state();
+    assert.equal(state.availableMessageCount, 1200);
+    assert.ok(state.messageVectors.length <= 50);
+    assert.ok(state.messageRefs.every(ref => ref.text.length <= 160));
+    const oldNeighborIndex = state.messageRefs.findIndex(ref => ref.msgIndex === 1199);
+    assert.ok(oldNeighborIndex >= 0, 'best archived match appears even though no body/vector is resident');
+    view.api.addMessage(oldNeighborIndex);
+    await until(() => !view.api.state().archiveGraphController);
+    state = view.api.state();
+    assert.equal(state.pins.length, 2);
+    assert.ok(state.messageVectors.length <= 101);
+    records.at(-1).vector = new Float32Array([0.6, 0.8]);
+    await view.api.update();
+    assert.deepEqual(Array.from(view.api.state().pins.find(item => item.kind === 'message').vector), Array.from(records.at(-1).vector));
+    view.api.scope(() => new Set(['old.jsonl'])); await view.api.update();
+    state = view.api.state();
+    assert.equal(state.availableMessageCount, 600);
+    assert.equal(state.pins.length, 1, 'out-of-scope archived message pins are dropped');
+    assert.ok(state.messageRefs.every(ref => ref.fileName === 'old.jsonl'));
+    view.api.contextMenu(1);
+    await new Promise(resolve => setTimeout(resolve, 0));
+    assert.equal(view.context.document.listeners.get('pointerdown')?.size, 1);
+    const oldCanvas = state.canvas;
+    view.api.unmount();
+    assert.equal(view.context.document.listeners.get('pointerdown')?.size, 0);
+    assert.equal(view.api.state().contextMenuEl, null);
+    assert.equal(view.api.state().messageVectors.length, 0);
+    assert.equal(view.api.state().messageRefs.length, 0);
+    assert.equal(view.frames.size, 0);
+    assert.equal(oldCanvas.width, 0);
+});
+
+for (const kind of ['map', 'graph']) {
+    test(`${kind} cancels an archive scan on unmount and ignores its delayed completion`, async () => {
+        const gate = deferred();
+        let signal;
+        const view = viewContext(kind, { archive: async function* (options) {
+            signal = options.signal;
+            await gate.promise;
+            yield archiveRows(1)[0];
+        } });
+        await view.api.mount(view.fixture);
+        assert.ok(signal);
+        view.api.unmount();
+        assert.equal(signal.aborted, true);
+        gate.resolve();
+        await new Promise(resolve => setImmediate(resolve));
+        assert.equal(view.api.state().mounted, false);
+        assert.equal(view.api.state().messageRefs.length, 0);
+        assert.equal(view.frames.size, 0);
+    });
+}
+
+test('worker returns a truly empty clustering result when an archive disappears during a map build', async () => {
+    const output = [];
+    const worker = sourceContext('semantic-map-worker.js', '', { self: { postMessage: message => output.push(message) } });
+    await worker.self.onmessage({ data: { type: 'buildProjectedMap', rpcId: 1, pointsBuffer: new Float32Array(0).buffer } });
+    assert.equal(output[0].type, 'projectedMapReady');
+    assert.equal(output[0].points2dBuffer.byteLength, 0);
+    assert.equal(output[0].centroids2dBuffer.byteLength, 0);
+    assert.equal(output[0].clusterSizesBuffer.byteLength, 0);
+});
 
 for (const kind of ['map', 'graph']) {
     test(`${kind} initializes canvas input and sizing on empty mount before data arrives`, async () => {
