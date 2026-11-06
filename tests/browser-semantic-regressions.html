@@ -59,7 +59,8 @@ document.getElementById('run').onclick=async()=>{
         }
         window.Worker=DeferredWorker;
         await mountSemanticMap(map);await mountGraphView(graph);
-        assert(map.querySelector('canvas').width===600&&graph.querySelector('canvas').width===600,'empty mounts size real canvases');
+        const pixelWidth = Math.round(600 * (window.devicePixelRatio || 1));
+        assert(map.querySelector('canvas').width===pixelWidth&&graph.querySelector('canvas').width===pixelWidth,'empty mounts size real canvases');
         assert(wheel(map.querySelector('canvas'))&&wheel(graph.querySelector('canvas')),'empty mounts bind wheel controls');
         seed();await updateSemanticMapData();updateGraphViewData();
         const worker=DeferredWorker.last,build=worker.sent.find(message=>message.type==='buildMapData');

@@ -1,0 +1,116 @@
+<!doctype html>
+<html lang="en"><meta charset="utf-8"><title>Chat Manager memory efficiency checks</title>
+<style>body{background:#18212b;color:#e4e9ee;font:15px system-ui;margin:24px}pre{white-space:pre-wrap}button{padding:8px}#chat-manager-content{max-height:250px;overflow:auto}</style>
+<h1>Memory efficiency integration checks</h1><button id="run">Run checks</button>
+<pre id="results">Ready. Synthetic data, isolated IndexedDB, mocked provider.</pre>
+<div class="chat-manager-search-wrapper"><div class="chat-manager-search-row"><input id="chat-manager-search"></div></div>
+<div id="chat-manager-status"></div><div id="chat-manager-content"></div>
+<script type="module">
+import { pca3D, pca3DAsync } from '../src/semantic-engine.js';
+import { getIndex, clearIndex, setMessageEmbedding } from '../src/chat-reader.js';
+import { getEmbeddingSettings, setEmbeddingSettings } from '../src/metadata-store.js';
+import { performSearch, resetSearchState } from '../src/ui-controller.js';
+const results = document.getElementById('results');
+const pause = () => new Promise(resolve => setTimeout(resolve, 0));
+const assert = (condition, label) => { if (!condition) throw Error(label); results.textContent += `PASS ${label}\n`; };
+const open = (name, version, upgrade) => new Promise((resolve, reject) => {
+    const request = indexedDB.open(name, version);
+    request.onupgradeneeded = () => upgrade?.(request.result);
+    request.onsuccess = () => resolve(request.result);
+    request.onerror = () => reject(request.error);
+});
+const transaction = (db, names, mode, apply) => new Promise((resolve, reject) => {
+    const tx = db.transaction(names, mode);
+    apply(tx);
+    tx.oncomplete = resolve;
+    tx.onerror = tx.onabort = () => reject(tx.error || Error('Transaction aborted'));
+});
+document.getElementById('run').onclick = async () => {
+    results.textContent = '';
+    const dbName = `chat-manager-memory-test-${crypto.randomUUID()}`;
+    const nativeGet = IDBObjectStore.prototype.get;
+    const nativeFetch = window.fetch;
+    let db, moduleURL, timer;
+    try {
+        db = await open(dbName, 2, database => database.createObjectStore('chats', { keyPath: 'key' }));
+        await transaction(db, 'chats', 'readwrite', tx => tx.objectStore('chats').put({ key:'fixture:legacy', messages:[{text:'preserved legacy'}] }));
+        db.close();
+        const original = await (await fetch('../src/cache-store.js')).text();
+        const source = original.replace("const DB_NAME = 'chat_manager_cache';", `const DB_NAME = ${JSON.stringify(dbName)};`);
+        assert(source !== original, 'cache fixture uses a unique isolated database');
+        moduleURL = URL.createObjectURL(new Blob([source], {type:'text/javascript'}));
+        const cache = await import(moduleURL);
+        let reads = 0;
+        IDBObjectStore.prototype.get = function(key) {
+            if (this.transaction.db.name === dbName && this.name === 'chats') reads++;
+            return nativeGet.call(this, key);
+        };
+        const valid = (_file, entry) => entry.lastModified === 1 && entry.serverSignature === 'current'
+            && Date.now() - entry.validatedAt >= 0 && Date.now() - entry.validatedAt < 60_000;
+        await cache.consumeCachedChatsForCharacter('fixture', ['legacy'], valid, batch => assert(batch.size === 0, 'metadata-less v2 records are not restored as fresh'));
+        assert(reads === 0, 'migration does not deserialize legacy bodies');
+        db = await open(dbName, 3);
+        assert(db.objectStoreNames.contains('chats') && db.objectStoreNames.contains('chatMetadata'), 'real IndexedDB upgrade preserves bodies and adds metadata');
+        let legacy;
+        await transaction(db, 'chats', 'readonly', tx => {
+            const request = tx.objectStore('chats').get('fixture:legacy');
+            request.onsuccess = () => { legacy = request.result; };
+        });
+        assert(legacy.messages[0].text === 'preserved legacy', 'v2 body survives the schema upgrade');
+        const names = Array.from({length:121}, (_, i) => `fresh-${i}`);
+        cache.putCachedChats('fixture', [...names, 'expired'].map(fileName => ({fileName, entry:{
+            lastModified:1, serverSignature:'current', validatedAt:Date.now() - (fileName === 'expired' ? 90_000 : 0),
+            messageCount:1, messages:[{text:fileName}],
+        }})));
+        await pause();
+        // This later readonly transaction also waits for the paired cache write.
+        let count;
+        await transaction(db, 'chatMetadata', 'readonly', tx => {
+            const request = tx.objectStore('chatMetadata').count(); request.onsuccess = () => { count = request.result; };
+        });
+        assert(count === 122, 'production cache write commits matching metadata in real IndexedDB');
+        reads = 0; let restored = 0; const sizes = [];
+        await cache.consumeCachedChatsForCharacter('fixture', [...names, 'expired'], valid, batch => {
+            sizes.push(batch.size); restored += batch.size;
+            assert([...batch].every(([name, entry]) => entry.messages[0].text === name), 'restored batch preserves message contents');
+        });
+        assert(reads === 121 && restored === 121, 'expired body is skipped before deserialization');
+        assert(JSON.stringify(sizes) === '[50,50,21]', 'real IndexedDB restoration consumes bounded batches');
+        await transaction(db, 'chats', 'readwrite', tx => tx.objectStore('chats').put({key:'fixture:fresh-0',cacheFormatVersion:2,lastModified:1,serverSignature:'current',validatedAt:0,messages:[]}));
+        await cache.consumeCachedChatsForCharacter('fixture', ['fresh-0'], valid, batch => assert(batch.size === 0, 'mismatched body and metadata revisions are rejected'));
+
+        const small = Array.from({length:30}, (_, i) => [3, Math.sin(i), Math.cos(i * .3), i / 10]);
+        const expected = pca3D(small), actual = await pca3DAsync(small);
+        assert(actual.projected.every((row, i) => row.every((v, d) => Math.abs(v - expected.projected[i][d]) < 2e-6)), 'matrix-free PCA agrees with reference projection in the browser');
+        const wide = Array.from({length:128}, (_, i) => Array.from({length:3072}, (_, d) => Math.sin(i * .13) * Math.cos(d * .1) + .3 * Math.cos(i * .27) * Math.sin(d * .17)));
+        let ticks = 0; timer = setInterval(() => ticks++, 0);
+        const projected = await pca3DAsync(wide); clearInterval(timer); timer = null;
+        assert(ticks > 2 && projected.projected.flat().every(Number.isFinite), 'wide PCA yields to browser timers throughout computation');
+
+        const store = new Map();
+        const context = {characterId:0,characters:[{avatar:'fixture.png'}],extensionSettings:{},chat:[],saveSettingsDebounced(){}};
+        window.SillyTavern = {getContext:() => context, libs:{DOMPurify:{sanitize:html => html},moment:() => ({isValid:() => false}),localforage:{createInstance:() => ({
+            getItem:async key => store.get(key) ?? null, setItem:async (key, value) => {store.set(key,value);return value;}, clear:async () => store.clear(),
+        })}}};
+        window.fetch = async () => ({ok:true,text:async () => JSON.stringify({embeddings:[[1,0]]})});
+        clearIndex(); setEmbeddingSettings({enabled:true,provider:'ollama',model:'fixture',dimensions:null,embeddingLevels:{message:true,chat:false,query:true},includeAlternateSwipes:true,showAlternateSwipesInResults:true});
+        const msg = {filename:'fixture.jsonl',index:0,text:'active unrelated prose',swipes:['active unrelated prose','alternate swords'],swipeId:0,role:'assistant'};
+        const entry = getIndex()[msg.filename] = {fileName:msg.filename,isLoaded:true,messages:[msg],messageEmbeddings:new Map()};
+        setMessageEmbedding(entry,0,0,[0,1]); setMessageEmbedding(entry,0,1,[1,0]);
+        document.getElementById('chat-manager-search').value = 'swords';
+        await performSearch('swords');
+        assert(getEmbeddingSettings().dimensions === 2, 'mocked first query learns embedding dimensions');
+        assert(document.querySelector('.chat-manager-search-result')?.textContent.includes('alternate swords'), 'first semantic query renders the matched alternate after learning dimensions');
+        assert(document.getElementById('chat-manager-status').textContent.includes('Found 1 match'), 'semantic match count remains exact');
+        resetSearchState();
+        results.textContent += 'ALL BROWSER CHECKS PASSED';
+    } catch (error) {
+        results.textContent += `FAIL ${error.stack}`;
+    } finally {
+        if (timer) clearInterval(timer);
+        IDBObjectStore.prototype.get = nativeGet; window.fetch = nativeFetch;
+        db?.close(); if (moduleURL) URL.revokeObjectURL(moduleURL);
+        indexedDB.deleteDatabase(dbName);
+    }
+};
+</script></html>

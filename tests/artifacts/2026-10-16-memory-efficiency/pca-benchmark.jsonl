@@ -1,0 +1,3 @@
+{"trial":0,"before":{"initialBlockMs":655.9,"totalMs":765.1,"firstTimerMs":655.9,"ticks":2},"after":{"initialBlockMs":7.5,"totalMs":78.3,"firstTimerMs":9.5,"ticks":8},"maxProjectionError":3.552713678800501e-14,"removedCovarianceNumericMiB":72}
+{"trial":1,"before":{"initialBlockMs":591.3,"totalMs":694.1,"firstTimerMs":592.6,"ticks":2},"after":{"initialBlockMs":8.1,"totalMs":79.2,"firstTimerMs":9.3,"ticks":8},"maxProjectionError":3.552713678800501e-14,"removedCovarianceNumericMiB":72}
+{"trial":2,"before":{"initialBlockMs":625.3,"totalMs":717.1,"firstTimerMs":627.4,"ticks":2},"after":{"initialBlockMs":4,"totalMs":58.4,"firstTimerMs":8.1,"ticks":6},"maxProjectionError":3.552713678800501e-14,"removedCovarianceNumericMiB":72}

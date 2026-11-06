@@ -52,6 +52,9 @@ let threadFocusActive = true;
 let icicleRoot = null;
 let flatNodes = [];
 let nodesByDepth = new Map();
+let nodeDrawOrder = new WeakMap();
+let activeMembership = new WeakMap();
+let membershipChatFile = null;
 let maxDepth = 0;
 let loadedCount = 0;
 let pcaRanges = null;
@@ -182,6 +185,7 @@ export function setIcicleCallbacks(callbacks) {
 
 export function setThreadFocus(active) {
     threadFocusActive = active;
+    updateThreadFocusButton();
 }
 
 /** Retire held vectors immediately, including while the next data rebuild is pending. */
@@ -312,14 +316,13 @@ export async function mountIcicle(containerEl, mode) {
 
     // Create focus toggle button
     focusBtnEl = document.createElement('button');
-    focusBtnEl.className = 'chat-manager-btn chat-manager-icicle-focus-btn' + (threadFocusActive ? ' active' : '');
-    focusBtnEl.title = threadFocusActive ? 'Showing current thread — click for all chats' : 'Showing all chats — click for current thread';
-    focusBtnEl.innerHTML = '&#x1F500;';
+    focusBtnEl.className = 'chat-manager-btn chat-manager-labeled-btn chat-manager-icicle-focus-btn' + (threadFocusActive ? ' active' : '');
+    focusBtnEl.innerHTML = '<i class="fa-solid fa-code-branch" aria-hidden="true"></i><span>Current thread</span>';
+    updateThreadFocusButton();
     focusBtnEl.addEventListener('click', (e) => {
         e.stopPropagation();
         threadFocusActive = !threadFocusActive;
-        focusBtnEl.classList.toggle('active', threadFocusActive);
-        focusBtnEl.title = threadFocusActive ? 'Showing current thread — click for all chats' : 'Showing all chats — click for current thread';
+        updateThreadFocusButton();
         if (onThreadFocusChanged) onThreadFocusChanged(threadFocusActive);
         updateIcicleData({ resetView: true });
     });
@@ -327,9 +330,9 @@ export async function mountIcicle(containerEl, mode) {
 
     // Create jump-to-current button
     jumpToCurrentBtnEl = document.createElement('button');
-    jumpToCurrentBtnEl.className = 'chat-manager-btn chat-manager-icicle-jump-current-btn';
+    jumpToCurrentBtnEl.className = 'chat-manager-btn chat-manager-labeled-btn chat-manager-icicle-jump-current-btn';
     jumpToCurrentBtnEl.title = 'Jump to current chat';
-    jumpToCurrentBtnEl.innerHTML = '&#x1F4CD;';
+    jumpToCurrentBtnEl.innerHTML = '<i class="fa-solid fa-location-crosshairs" aria-hidden="true"></i><span>Find current</span>';
     jumpToCurrentBtnEl.addEventListener('click', (e) => {
         e.stopPropagation();
         jumpToCurrentThread();
@@ -357,11 +360,11 @@ export async function mountIcicle(containerEl, mode) {
     });
     toolbarEl.appendChild(resetBtnEl);
 
-    // Floating cluster legend (visible in cluster mode with semantic data)
+    // Keep the legend in the toolbar so wrapped controls cannot be covered.
     clusterLegendEl = document.createElement('div');
     clusterLegendEl.className = 'chat-manager-icicle-cluster-legend';
     clusterLegendEl.style.display = 'none';
-    container.appendChild(clusterLegendEl);
+    toolbarEl.appendChild(clusterLegendEl);
 
     // Create tooltip
     createTooltip();
@@ -429,6 +432,10 @@ export function unmountIcicle() {
     icicleRoot = null;
     flatNodes = [];
     nodesByDepth = new Map();
+    nodeDrawOrder = new WeakMap();
+    activeMembership = new WeakMap();
+    membershipChatFile = null;
+    maxDepthInIndex = -1;
     zoomStack = [];
     zoomRoot = null;
     exploreRoot = null;
@@ -675,13 +682,15 @@ function createSearchBar() {
 
     searchPrevBtn = document.createElement('button');
     searchPrevBtn.className = 'chat-manager-btn chat-manager-icicle-search-nav';
-    searchPrevBtn.textContent = '\u25B2';
+    searchPrevBtn.innerHTML = '<i class="fa-solid fa-chevron-up" aria-hidden="true"></i>';
+    searchPrevBtn.ariaLabel = 'Previous match';
     searchPrevBtn.title = 'Previous match (Shift+Enter)';
     searchPrevBtn.disabled = true;
 
     searchNextBtn = document.createElement('button');
     searchNextBtn.className = 'chat-manager-btn chat-manager-icicle-search-nav';
-    searchNextBtn.textContent = '\u25BC';
+    searchNextBtn.innerHTML = '<i class="fa-solid fa-chevron-down" aria-hidden="true"></i>';
+    searchNextBtn.ariaLabel = 'Next match';
     searchNextBtn.title = 'Next match (Enter)';
     searchNextBtn.disabled = true;
 
@@ -690,7 +699,7 @@ function createSearchBar() {
 
     // Semantic search toggle button
     searchModeBtnEl = document.createElement('button');
-    searchModeBtnEl.className = 'chat-manager-btn chat-manager-icicle-search-mode';
+    searchModeBtnEl.className = 'chat-manager-btn chat-manager-labeled-btn chat-manager-icicle-search-mode';
     searchModeBtnEl.title = 'Toggle semantic search (heatmap)';
     updateSearchModeBtn();
     if (!isEmbeddingConfigured()) {
@@ -745,9 +754,22 @@ function createSearchBar() {
     });
 }
 
+function updateThreadFocusButton() {
+    if (!focusBtnEl) return;
+    focusBtnEl.classList.toggle('active', threadFocusActive);
+    focusBtnEl.ariaPressed = String(threadFocusActive);
+    focusBtnEl.title = threadFocusActive
+        ? 'Showing current thread; click to show all chats'
+        : 'Showing all chats; click to show only the current thread';
+}
+
 function updateSearchModeBtn() {
     if (!searchModeBtnEl) return;
-    searchModeBtnEl.textContent = searchModeSemantic ? '\u{1F9E0}' : 'Aa';
+    searchModeBtnEl.textContent = searchModeSemantic ? 'Semantic' : 'Keyword';
+    searchModeBtnEl.ariaLabel = 'Search mode: ' + searchModeBtnEl.textContent;
+    searchModeBtnEl.title = searchModeSemantic
+        ? 'Search by meaning; click for exact keyword search'
+        : 'Search by keyword; click for semantic search';
     searchModeBtnEl.classList.toggle('active', searchModeSemantic);
 }
 
@@ -1095,12 +1117,12 @@ function updateColorModeControl() {
     const semanticReady = hasSemanticData();
     const effective = getEffectiveColorMode();
     const labels = {
-        structural: 'Struct',
+        structural: 'Structure',
         cluster: 'Cluster',
         gradient: 'Gradient',
     };
 
-    colorModeBtnEl.textContent = labels[effective] || 'Struct';
+    colorModeBtnEl.textContent = `Color: ${labels[effective] || 'Structure'}`;
     colorModeBtnEl.title = semanticReady
         ? `Color mode: ${labels[effective]} (click to cycle)`
         : 'Generate embeddings to enable semantic color modes';
@@ -1259,14 +1281,15 @@ function render() {
     const ySpan = yEnd - yStart;
     if (ySpan <= 0) return;
 
+    const visibleNodes = visibleDepthNodes(minVisibleDepth, maxVisibleDepth);
+
     // ── Active-path spine line & gutter marker ──
     // Collect visible active-path nodes, draw a continuous line behind blocks
     const MIN_ACTIVE_HEIGHT = 6;
     let activeNodes = [];
     if (activeChatFile) {
-        for (const node of flatNodes) {
-            if (!node.chatFiles.includes(activeChatFile)) continue;
-            if (node.depth < minVisibleDepth || node.depth > maxVisibleDepth) continue;
+        for (const node of visibleNodes) {
+            if (!isActiveMember(node, activeChatFile)) continue;
             if (node.y1 <= yStart || node.y0 >= yEnd) continue;
             activeNodes.push(node);
         }
@@ -1307,8 +1330,7 @@ function render() {
         ctx.fillRect(0, gutterMinY, 3, gutterH);
     }
 
-    for (const node of flatNodes) {
-        if (node.depth < minVisibleDepth || node.depth > maxVisibleDepth) continue;
+    for (const node of visibleNodes) {
 
         // Skip nodes outside viewport y range
         if (node.y1 <= yStart || node.y0 >= yEnd) continue;
@@ -1319,7 +1341,7 @@ function render() {
 
         const x = (node.depth - exploreDepthOffset) * COL_WIDTH - viewX;
         const w = COL_WIDTH - 2;
-        const isActive = activeChatFile && node.chatFiles.includes(activeChatFile);
+        const isActive = activeChatFile && isActiveMember(node, activeChatFile);
         let y = relY0 * canvasHeight;
         let h = Math.max((relY1 - relY0) * canvasHeight - GAP, MIN_BLOCK_HEIGHT);
 
@@ -1533,9 +1555,41 @@ function cancelViewportAnim() {
 //  Hit Testing
 // ──────────────────────────────────────────────
 
+function isActiveMember(node, activeChatFile) {
+    if (membershipChatFile !== activeChatFile) {
+        membershipChatFile = activeChatFile;
+        activeMembership = new WeakMap();
+    }
+    let member = activeMembership.get(node.chatFiles);
+    if (member === undefined) {
+        member = node.chatFiles.includes(activeChatFile);
+        activeMembership.set(node.chatFiles, member);
+    }
+    return member;
+}
+
+function visibleDepthNodes(minDepth, maxDepth) {
+    const visible = [];
+    for (let depth = Math.max(0, minDepth); depth <= Math.min(maxDepth, maxDepthInIndex); depth++) {
+        const nodes = nodesByDepth.get(depth);
+        if (nodes) for (const node of nodes) visible.push(node);
+    }
+    // Preserve pre-order paint order, including overlapping minimum-height blocks.
+    visible.sort((a, b) => nodeDrawOrder.get(a) - nodeDrawOrder.get(b));
+    return visible;
+}
+
+let maxDepthInIndex = -1;
 function rebuildDepthIndex() {
     nodesByDepth = new Map();
+    nodeDrawOrder = new WeakMap();
+    activeMembership = new WeakMap();
+    membershipChatFile = null;
+    maxDepthInIndex = -1;
+    let nodeDrawOrderCounter = 0;
     for (const node of flatNodes) {
+        nodeDrawOrder.set(node, nodeDrawOrderCounter++);
+        maxDepthInIndex = Math.max(maxDepthInIndex, node.depth);
         let arr = nodesByDepth.get(node.depth);
         if (!arr) { arr = []; nodesByDepth.set(node.depth, arr); }
         arr.push(node);
@@ -1567,7 +1621,7 @@ function hitTest(px, py) {
         const w = COL_WIDTH - 2;
 
         // Match render's expanded hit area for active-path nodes
-        const isActive = cachedActiveChatFile && node.chatFiles.includes(cachedActiveChatFile);
+        const isActive = cachedActiveChatFile && isActiveMember(node, cachedActiveChatFile);
         if (isActive && h < 6) {
             const mid = y + h / 2;
             h = 6;
@@ -2464,8 +2518,7 @@ function tryApplyPendingFocus() {
                 && !sharesActiveThread(entry, getIndex()[activeFile])) {
                 threadFocusActive = false;
                 if (focusBtnEl) {
-                    focusBtnEl.classList.remove('active');
-                    focusBtnEl.title = 'Showing all chats — click for current thread';
+                    updateThreadFocusButton();
                 }
                 if (onThreadFocusChanged) onThreadFocusChanged(false);
             }
@@ -2510,7 +2563,7 @@ function showNodePopup(clientX, clientY, node) {
     let html = '<div class="chat-manager-timeline-popup-inner">';
     html += '<div class="chat-manager-timeline-popup-header">';
     html += `<div class="chat-manager-timeline-popup-title">Message #${node.depth}</div>`;
-    html += '<button class="chat-manager-timeline-popup-close" title="Close">&times;</button>';
+    html += '<button class="chat-manager-timeline-popup-close" title="Close message details" aria-label="Close message details">&times;</button>';
     html += '</div>';
     html += `<div class="chat-manager-timeline-popup-preview">${escapeHtml(truncateForTooltip(node.representative.text || node.normalizedText, 120))}</div>`;
 
@@ -2660,14 +2713,14 @@ function removePopup() {
 function addExpandButton() {
     if (!container) return;
     const btn = document.createElement('button');
-    btn.className = 'chat-manager-btn chat-manager-timeline-expand-btn';
+    btn.className = 'chat-manager-btn chat-manager-labeled-btn chat-manager-timeline-expand-btn';
     btn.title = 'Expand to full screen';
-    btn.innerHTML = '&#x26F6;';
+    btn.innerHTML = '<i class="fa-solid fa-expand" aria-hidden="true"></i><span>Expand</span>';
     btn.addEventListener('click', (e) => {
         e.stopPropagation();
         expandToFullScreen();
     });
-    container.appendChild(btn);
+    toolbarEl.appendChild(btn);
 }
 
 // ──────────────────────────────────────────────

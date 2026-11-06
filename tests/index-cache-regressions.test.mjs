@@ -2,6 +2,7 @@ import test, { afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 
 const records = new Map();
+const metadataRecords = new Map();
 let requestedVersion;
 let upgraded = false;
 let writes = 0;
@@ -15,12 +16,12 @@ globalThis.indexedDB = { open(_name, version) {
             createObjectStore() { storeExists = true; return { createIndex() {} }; },
             close() {},
             transaction() {
-                const tx = { objectStore() { return {
-                    get(key) { const req = {}; queueMicrotask(() => { req.result = structuredClone(records.get(key)); req.onsuccess?.(); }); return req; },
-                    put(record) { records.set(record.key, structuredClone(record)); writes++; },
-                    delete(key) { records.delete(key); },
+                const tx = { objectStore(name) { const data = name === 'chatMetadata' ? metadataRecords : records; return {
+                    get(key) { const req = {}; queueMicrotask(() => { req.result = structuredClone(data.get(key)); req.onsuccess?.(); }); return req; },
+                    put(record) { data.set(record.key, structuredClone(record)); writes++; },
+                    delete(key) { data.delete(key); },
                 }; } };
-                queueMicrotask(() => tx.oncomplete?.());
+                setImmediate(() => tx.oncomplete?.());
                 return tx;
             },
         };
@@ -40,7 +41,7 @@ let bodies;
 let failures;
 let contentRequests;
 function setup(names = ['a.jsonl']) {
-    reader.clearIndex(); records.clear(); writes = 0; contentRequests = 0;
+    reader.clearIndex(); records.clear(); metadataRecords.clear(); writes = 0; contentRequests = 0;
     context = { characterId: 0, characters: [{ avatar: 'test.png', name: 'Test' }], chat: [], chatMetadata: {},
         extensionSettings: {}, saveSettingsDebounced() {}, getRequestHeaders: () => ({}) };
     rows = names.map(file_name => ({ file_name, last_mes: date, chat_items: 2, file_size: '100 B' }));
@@ -61,7 +62,7 @@ test('cache upgrade and format guard discard records containing legacy message I
     setup();
     records.set('test.png:old.jsonl', { messages: [{ index: 1 }] });
     assert.equal((await cache.getCachedChatsForCharacter('test.png', ['old.jsonl'])).size, 0);
-    assert.equal(requestedVersion, 2); assert.equal(upgraded, true);
+    assert.equal(requestedVersion, 3); assert.equal(upgraded, true);
     records.set('test.png:old.jsonl', { cacheFormatVersion: 1, messages: [{ index: 1 }] });
     assert.equal((await cache.getCachedChatsForCharacter('test.png', ['old.jsonl'])).size, 0);
 });
@@ -136,6 +137,10 @@ test('warm cached restoration reconciles queue membership with linear work', asy
         cacheFormatVersion: 2, fileName: row.file_name, lastModified: Date.parse(date),
         validatedAt: Date.now(), serverSignature: JSON.stringify(['100 B', 2]),
         messages: [{ filename: row.file_name, index: 0, role: 'assistant', text: 'cached' }], messageCount: 1,
+    });
+    for (const [key, record] of records) metadataRecords.set(key, {
+        cacheFormatVersion: record.cacheFormatVersion, lastModified: record.lastModified,
+        validatedAt: record.validatedAt, serverSignature: record.serverSignature,
     });
     let visits = 0;
     const filter = Array.prototype.filter;

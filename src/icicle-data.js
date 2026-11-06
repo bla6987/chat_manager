@@ -106,13 +106,15 @@ export async function buildIcicleData(chatIndex, activeChatFile, options = {}) {
                 child.representative = { text: msg.text, timestamp: msg.timestamp || null };
                 current.children.set(compositeKey, child);
             }
-            child.chatFiles.push(fileName);
 
             current = child;
             if (i > maxDepth) maxDepth = i;
         }
+        // Store each file only at its terminal until memberships are assembled.
+        current.chatFiles.push(fileName);
     }
 
+    assembleMembership(root, entries);
     compactSharedMembership(root, null);
     const semanticContext = await buildSemanticContext(entries);
     annotateSemanticFields(root, chatIndex, semanticContext, new WeakMap());
@@ -146,6 +148,32 @@ function makeNode(normalizedText, role, depth) {
         y0: 0,
         y1: 1,
     };
+}
+
+// Unary shared prefixes reuse their child's array immediately: no temporary
+// branches × common-depth file references are allocated during construction.
+function assembleMembership(root, entries) {
+    const order = new Map(entries.map(({ fileName }, index) => [fileName, index]));
+    const stack = [{ node: root, visited: false }];
+    while (stack.length) {
+        const { node, visited } = stack.pop();
+        if (!visited) {
+            stack.push({ node, visited: true });
+            for (const child of node.children.values()) stack.push({ node: child, visited: false });
+            continue;
+        }
+        if (node === root) continue; // Root already has the complete ordered list.
+        const groups = [];
+        if (node.chatFiles.length) groups.push(node.chatFiles);
+        for (const child of node.children.values()) groups.push(child.chatFiles);
+        if (groups.length === 1) {
+            node.chatFiles = groups[0];
+        } else if (groups.length > 1) {
+            node.chatFiles = groups.flat();
+            // Child insertion order can interleave the original input order.
+            node.chatFiles.sort((a, b) => order.get(a) - order.get(b));
+        }
+    }
 }
 
 function compactSharedMembership(root, parentChatFiles) {

@@ -1,0 +1,87 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Recent swipes browser checks</title>
+<link rel="stylesheet" href="../style.css">
+<link rel="stylesheet" href="/fontawesome/css/fontawesome.min.css">
+<link rel="stylesheet" href="/fontawesome/css/solid.min.css">
+<style>
+:root{--SmartThemeBlurTintColor:#20242b;--SmartThemeBodyColor:#e1e4e9;--SmartThemeBorderColor:#48515d;--mainFontSize:14px}
+body{background:#13161a;color:#e1e4e9;font:14px system-ui;margin:24px}pre{white-space:pre-wrap;line-height:1.5}body>button{padding:10px;margin:5px}
+</style>
+<h1>Recent swipes</h1>
+<p>Live production browser, synthetic messages. No provider or account calls.</p>
+<button id="open">Open swipe browser</button><button id="run">Run checks</button>
+<pre id="results">Ready.</pre>
+<script type="module">
+import { openSwipeBrowser, closeSwipeBrowser, refreshSwipeBrowser } from '../src/swipe-browser.js';
+const context={characterId:0,characters:[{avatar:'fixture.png',name:'Mira'}],chatMetadata:{chat_file_name:'harbor.jsonl'},chat:[]};
+window.SillyTavern={getContext:()=>context};
+const results=document.getElementById('results');
+const assert=(condition,label)=>{if(!condition)throw Error(label);results.textContent+=`PASS ${label}\n`;};
+const paint=()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
+const dialog=()=>document.querySelector('.chat-manager-swipe-dialog');
+const cards=()=>[...dialog().querySelectorAll('.chat-manager-swipe-card')];
+let jumps=[];
+function seed(){
+ context.characterId=0;context.groupId=null;context.chatMetadata.chat_file_name='harbor.jsonl';context.characters[0].avatar='fixture.png';context.chat=[];jumps=[];
+ for(let i=0;i<65;i++){
+  context.chat.push({is_user:true,mes:`What happens next? ${i}`});
+  context.chat.push({is_user:false,mes:`Mira studies the chart. Reply ${i}.`,swipe_id:0,swipes:[`Mira studies the chart. Reply ${i}.`,`Mira follows the shore. Alternate ${i}.`]});
+ }
+ const last=context.chat.at(-1);
+ last.swipes=Array.from({length:12},(_,i)=>`The harbor lights flicker through the mist.\n\n${['Mira waits by the quiet pier, listening for the ship’s bell.','A familiar silhouette appears at the bow. Mira steps forward, holding the letter tightly.','The captain has left a lantern burning beside the gangway. Mira follows its light.'][i%3]}\n\nAlternative ${i+1}: a different way for the scene to continue.`);
+ last.swipe_id=1;last.mes='Mira recognizes the ship at once.\n\nShe unfolds the letter one last time before stepping onto the gangway. This is the current, edited reply.';
+}
+function open(){openSwipeBrowser({onJump:async(fileName,index)=>{jumps.push({fileName,index});closeSwipeBrowser();}});}
+document.getElementById('open').onclick=open;
+document.getElementById('run').onclick=async()=>{
+ results.textContent='';closeSwipeBrowser();seed();
+ try{
+  const before=JSON.stringify(context.chat);open();await paint();
+  assert(dialog().open&&document.activeElement===dialog().querySelector('select'),'dialog opens with focus on the reply selector');
+  assert(dialog().querySelector('select').value==='129','latest assistant reply opens first');
+  assert(cards().length===8&&cards()[0].dataset.swipeIndex==='11','newest swipes appear first with bounded initial rendering');
+  assert(cards()[0].textContent.includes('Newest'),'newest alternative is labeled');
+  dialog().querySelector('.chat-manager-swipe-actions button').click();await paint();
+  assert(cards().length===9&&document.activeElement.dataset.swipeIndex==='1','Show current reveals and focuses an older current swipe without rendering every intermediate one');
+  assert(cards().find(card=>card.dataset.swipeIndex==='1').textContent.includes('current, edited reply'),'current preview uses live text rather than the stale stored variant');
+  assert(cards().find(card=>card.dataset.swipeIndex==='1').textContent.includes('Current'),'current selection has a visible badge');
+  assert(JSON.stringify(context.chat)===before,'opening and browsing leave all chat data unchanged');
+  dialog().querySelector('.chat-manager-swipe-more').click();assert(cards().length===12,'older swipe pages can be loaded without duplicates');
+  const select=dialog().querySelector('select');select.value='127';select.dispatchEvent(new Event('change'));
+  assert(cards().length===2&&select.value==='127','earlier replies are selectable');
+  select.value='71';select.dispatchEvent(new Event('change'));
+  const next={is_user:false,mes:'A new arrival',swipe_id:0,swipes:['A new arrival']};context.chat.push(next);refreshSwipeBrowser();
+  assert(select.value==='71','incoming replies preserve an earlier selection at the pagination boundary');
+  [...dialog().querySelectorAll('button')].find(button=>button.textContent==='Latest reply').click();
+  assert(select.value==='130'&&cards()[0].textContent.includes('A new arrival'),'Latest reply returns to the newest assistant response');
+  next.swipes.push('<img src=x onerror=alert(1)>');refreshSwipeBrowser();
+  assert(cards().length===2&&cards()[0].textContent.includes('<img')&&!dialog().querySelector('img'),'swipe contents render as text and cannot inject HTML');
+  context.chat.push({is_user:false,mes:'A later response'});refreshSwipeBrowser();
+  assert(select.value==='131'&&cards()[0].textContent.includes('A later response'),'latest mode follows new replies automatically');
+  context.chat.pop();refreshSwipeBrowser();assert(select.value==='130','deleting the latest reply falls back to the current latest response');
+  [...dialog().querySelectorAll('button')].find(button=>button.textContent==='Load earlier replies').click();
+  assert(select.options.length===60,'earlier reply pagination expands the selector');
+  context.characters[0].avatar='different.png';context.chat=[{is_user:false,mes:'Different character, same filename'}];refreshSwipeBrowser();
+  assert(cards().length===1&&!dialog().textContent.includes('Alternative 12')&&cards()[0].textContent.includes('Different character'),'switching characters clears previews even when the filename is unchanged');
+  context.groupId='group';refreshSwipeBrowser();assert(cards().length===0&&select.disabled,'unsupported group context clears the previous conversation');
+  seed();refreshSwipeBrowser();
+  context.chatMetadata.chat_file_name='changed-without-event.jsonl';
+  [...dialog().querySelectorAll('button')].find(button=>button.textContent==='Jump to reply').click();
+  assert(jumps.length===0,'a stale jump refreshes identity instead of navigating');
+  [...dialog().querySelectorAll('button')].find(button=>button.textContent==='Jump to reply').click();await paint();
+  assert(!dialog()&&jumps.length===1&&jumps[0].index===129,'Jump to reply targets the selected message and closes the preview');
+  open();await paint();const bounds=dialog().getBoundingClientRect();
+  assert(dialog().scrollWidth<=dialog().clientWidth&&[...dialog().querySelectorAll('button,select')].filter(node=>node.getClientRects().length).every(node=>{const b=node.getBoundingClientRect();return b.left>=bounds.left&&b.right<=bounds.right+1;}),'dialog controls fit within the available width');
+  dialog().dispatchEvent(new KeyboardEvent('keydown',{key:'Escape',bubbles:true,cancelable:true}));
+  assert(!dialog()&&document.activeElement===document.getElementById('run'),'Escape closes the dialog and restores focus');
+  closeSwipeBrowser();seed();context.chat=[];open();assert(cards().length===0&&dialog().textContent.includes('No replies yet'),'empty conversations show a useful empty state');
+  closeSwipeBrowser();seed();
+  results.textContent+='ALL SWIPE BROWSER CHECKS PASSED';open();
+ }catch(error){results.textContent+=`FAIL ${error.stack}`;}
+};
+seed();
+</script>
+</html>

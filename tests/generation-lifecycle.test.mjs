@@ -213,8 +213,8 @@ test('entry point invalidates local edits before optional display/embedding upda
     const f = fixture();
     const dirty = [];
     try {
-        const callback = new Function('SillyTavern', 'getActiveChatFile', 'getIndexCharacterAvatar', 'markChatDirty', `${match[0]}; return onMessageUpdate;`)(
-            globalThis.SillyTavern, () => 'fixture.jsonl', () => 'fixture.png', file => dirty.push(file),
+        const callback = new Function('SillyTavern', 'getActiveChatFile', 'getIndexCharacterAvatar', 'markChatDirty', 'refreshSwipeBrowser', `${match[0]}; return onMessageUpdate;`)(
+            globalThis.SillyTavern, () => 'fixture.jsonl', () => 'fixture.png', file => dirty.push(file), () => {},
         );
         callback();
         assert.deepEqual(dirty, ['fixture.jsonl'], 'cache invalidation is synchronous before the optional debounce');
@@ -232,6 +232,7 @@ test('branch injection refreshes the live edited snapshot with panel and embeddi
     try {
         const fixtureValues = {
             SillyTavern: globalThis.SillyTavern, getActiveChatFile: () => 'fixture.jsonl', getIndexCharacterAvatar: () => 'fixture.png',
+            refreshSwipeBrowser: () => operations.push('swipes'),
             markChatDirty: () => operations.push('dirty'), isEmbeddingGenerationEnabled: () => false, isPanelOpen: () => false,
             isBranchContextActive: () => true, updateActiveChat: async () => { operations.push('update'); return true; },
             updateBranchContextInjection: () => operations.push('inject'), clearBranchContextInjection() {},
@@ -240,7 +241,7 @@ test('branch injection refreshes the live edited snapshot with panel and embeddi
         callback();
         const scheduled = [...f.timers.values()].find(timer => timer.delay === 250);
         await scheduled.fn();
-        assert.deepEqual(operations, ['dirty', 'update', 'inject']);
+        assert.deepEqual(operations, ['dirty', 'swipes', 'update', 'inject']);
     } finally { f.restore(); }
 });
 

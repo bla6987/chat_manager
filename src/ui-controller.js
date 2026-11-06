@@ -52,7 +52,8 @@ import {
     captureEmbeddingOperation, isEmbeddingOperationCurrent, invalidateEmbeddingOperations, isStaleEmbeddingOperationError,
     onEmbeddingDimensionsInvalidated,
 } from './embedding-service.js';
-import { clusterColor, cosineSimilarity, findOptimalK, findOptimalKAsync, kMeans, kMeansAsync, topicShiftScores } from './semantic-engine.js';
+import { clusterColor, findOptimalK, findOptimalKAsync, kMeans, kMeansAsync, topicShiftScores } from './semantic-engine.js';
+import { rankSemanticCandidates } from './semantic-search.js';
 import { resolveActiveChatFilename } from './active-chat.js';
 import { getRepresentativeEmbeddingText } from './embedding-text.js';
 import { navigateToChat } from './chat-navigation.js';
@@ -66,6 +67,32 @@ const RECLUSTER_IMMEDIATE_THRESHOLD = 5;
 const RECLUSTER_CHAT_DELTA_RATIO = 0.2;
 const SWIPE_BACKGROUND_EMBED_DELAY_MS = 650;
 const SUMMARY_SIBLING_BRANCH_LIMIT = 3;
+
+// Keep the text readable while only the decorative icon spins.
+function setActionBusy(btn, busy) {
+    btn.disabled = busy;
+    btn.ariaBusy = String(busy);
+    btn.classList.toggle('disabled', busy);
+    const icon = btn.querySelector('i');
+    if (!icon) return;
+    if (busy) {
+        icon.dataset.idleClass = icon.className;
+        icon.className = 'fa-solid fa-spinner fa-spin';
+    } else if (icon.dataset.idleClass) {
+        icon.className = icon.dataset.idleClass;
+        delete icon.dataset.idleClass;
+    }
+}
+
+function setToggleState(btn, active) {
+    if (!btn) return;
+    btn.classList.toggle('active', active);
+    btn.ariaPressed = String(active);
+}
+
+function renderCardAction(actionClass, fileName, icon, label, title, disabled = false) {
+    return `<button type="button" class="chat-manager-btn chat-manager-labeled-btn chat-manager-card-action ${actionClass}${disabled ? ' disabled' : ''}" data-filename="${escapeAttr(fileName)}" title="${escapeAttr(title)}"${disabled ? ' disabled' : ''}><i class="fa-solid ${icon}" aria-hidden="true"></i><span>${escapeHtml(label)}</span></button>`;
+}
 
 let panelOpen = false;
 let timelineActive = false;
@@ -119,6 +146,8 @@ onEmbeddingDimensionsInvalidated(() => clearInMemoryEmbeddings({ rerender: false
  * @type {{ query: string, lowerQuery: string, searchable: Array, position: number, results: Array, totalMatches: number, exhausted?: boolean, mode?: 'keyword'|'semantic' } | null}
  */
 let searchState = null;
+let activeSearchRequestId = null;
+let searchRefreshPending = false;
 /** @type {null|'keyword'|'semantic'} — null = auto, otherwise forced mode */
 let searchModeOverride = null;
 
@@ -175,6 +204,8 @@ function _invalidateDomCache() {
 }
 
 export function resetSearchState() {
+    cancelSearchRefresh();
+    activeSearchRequestId = null;
     latestSearchRequestId += 1;
     searchState = null;
     setSearchModeBadge('keyword');
@@ -1331,8 +1362,8 @@ async function handleEmbedSingleCard(e) {
         return;
     }
 
-    btn.classList.remove('fa-bolt');
-    btn.classList.add('fa-spinner', 'fa-spin', 'chat-manager-embedding-active');
+    setActionBusy(btn, true);
+    btn.classList.add('chat-manager-embedding-active');
 
     try {
         const result = await queueEmbeddingRun(() => runEmbeddingGeneration([filename], {
@@ -1355,8 +1386,8 @@ async function handleEmbedSingleCard(e) {
         console.error(`[${MODULE_NAME}] Per-card embedding failed:`, err);
         toastr.error(`Embedding failed: ${err.message || err}`);
     } finally {
-        btn.classList.remove('fa-spinner', 'fa-spin', 'chat-manager-embedding-active');
-        btn.classList.add('fa-bolt');
+        setActionBusy(btn, false);
+        btn.classList.remove('chat-manager-embedding-active');
     }
 }
 
@@ -1414,7 +1445,7 @@ export function toggleSemanticMap() {
     semanticMapActive = !semanticMapActive;
 
     const btn = document.getElementById('chat-manager-semantic-map-toggle');
-    if (btn) btn.classList.toggle('active', semanticMapActive);
+    setToggleState(btn, semanticMapActive);
 
     if (semanticMapActive) {
         if (timelineActive) {
@@ -1465,7 +1496,7 @@ export function toggleGraphView() {
     graphViewActive = !graphViewActive;
 
     const btn = document.getElementById('chat-manager-graph-view-toggle');
-    if (btn) btn.classList.toggle('active', graphViewActive);
+    setToggleState(btn, graphViewActive);
 
     if (graphViewActive) {
         if (timelineActive) deactivateTimeline();
@@ -1521,7 +1552,7 @@ export function toggleTimeline() {
 
     // Update toggle button active state
     const btn = document.getElementById('chat-manager-timeline-toggle');
-    if (btn) btn.classList.toggle('active', timelineActive);
+    setToggleState(btn, timelineActive);
 
     // Deactivate stats if active
     if (timelineActive && statsActive) {
@@ -1595,7 +1626,7 @@ export function toggleStats() {
     statsActive = !statsActive;
 
     const btn = document.getElementById('chat-manager-stats-toggle');
-    if (btn) btn.classList.toggle('active', statsActive);
+    setToggleState(btn, statsActive);
 
     const searchWrapper = _getSearchWrapper();
     const toolbar = _getFilterToolbar();
@@ -1647,7 +1678,7 @@ export function toggleBranchContext() {
     setBranchContextEnabled(branchContextActive);
 
     const btn = document.getElementById('chat-manager-branch-context-toggle');
-    if (btn) btn.classList.toggle('active', branchContextActive);
+    setToggleState(btn, branchContextActive);
 
     if (branchContextActive) {
         const activeFile = getActiveFilename();
@@ -1692,7 +1723,7 @@ function deactivateStats() {
     unmountStatsView();
 
     const btn = document.getElementById('chat-manager-stats-toggle');
-    if (btn) btn.classList.remove('active');
+    setToggleState(btn, false);
 
     const searchWrapper = _getSearchWrapper();
     if (searchWrapper) searchWrapper.style.display = '';
@@ -1712,7 +1743,7 @@ function deactivateSemanticMap() {
     unmountSemanticMap();
 
     const btn = document.getElementById('chat-manager-semantic-map-toggle');
-    if (btn) btn.classList.remove('active');
+    setToggleState(btn, false);
 
     const searchWrapper = _getSearchWrapper();
     if (searchWrapper) searchWrapper.style.display = '';
@@ -1733,7 +1764,7 @@ function deactivateGraphView() {
     unmountGraphView();
 
     const btn = document.getElementById('chat-manager-graph-view-toggle');
-    if (btn) btn.classList.remove('active');
+    setToggleState(btn, false);
 
     const searchWrapper = _getSearchWrapper();
     if (searchWrapper) searchWrapper.style.display = '';
@@ -1923,16 +1954,30 @@ function scheduleBranchDetection() {
     task.id = task.idle ? globalThis.requestIdleCallback(run, { timeout: 500 }) : setTimeout(run, 0);
 }
 
-function scheduleSearchRefresh() {
+function cancelSearchRefresh() {
+    searchRefreshPending = false;
     if (refreshSearchFromHydrationTimer) {
         clearTimeout(refreshSearchFromHydrationTimer);
+        refreshSearchFromHydrationTimer = null;
     }
+}
+
+function scheduleSearchRefresh() {
+    searchRefreshPending = true;
+    if (refreshSearchFromHydrationTimer) {
+        clearTimeout(refreshSearchFromHydrationTimer);
+        refreshSearchFromHydrationTimer = null;
+    }
+    // Finish the active scan, then coalesce indexing batches into one refresh.
+    if (activeSearchRequestId !== null || !isHydrationComplete()) return;
 
     refreshSearchFromHydrationTimer = setTimeout(() => {
         refreshSearchFromHydrationTimer = null;
-        if (!panelOpen) return;
+        if (!searchRefreshPending || !panelOpen || isAnyViewActive()) return;
+        if (activeSearchRequestId !== null || !isHydrationComplete()) return;
 
         const latestQuery = getCurrentSearchQuery();
+        searchRefreshPending = false;
         if (latestQuery.length < 2) return;
         performSearch(latestQuery);
     }, 180);
@@ -2138,7 +2183,7 @@ function deactivateTimeline() {
     unmountIcicle();
 
     const btn = document.getElementById('chat-manager-timeline-toggle');
-    if (btn) btn.classList.remove('active');
+    setToggleState(btn, false);
 
     const searchWrapper = _getSearchWrapper();
     if (searchWrapper) searchWrapper.style.display = '';
@@ -2164,15 +2209,15 @@ export async function refreshPanel(options = {}) {
     // Restore branch context toggle state from persisted setting
     branchContextActive = getBranchContextEnabled();
     const branchCtxBtn = document.getElementById('chat-manager-branch-context-toggle');
-    if (branchCtxBtn) branchCtxBtn.classList.toggle('active', branchContextActive);
+    setToggleState(branchCtxBtn, branchContextActive);
     const timelineBtn = document.getElementById('chat-manager-timeline-toggle');
-    if (timelineBtn) timelineBtn.classList.toggle('active', timelineActive);
+    setToggleState(timelineBtn, timelineActive);
     const statsBtn = document.getElementById('chat-manager-stats-toggle');
-    if (statsBtn) statsBtn.classList.toggle('active', statsActive);
+    setToggleState(statsBtn, statsActive);
     const semanticMapBtn = document.getElementById('chat-manager-semantic-map-toggle');
-    if (semanticMapBtn) semanticMapBtn.classList.toggle('active', semanticMapActive);
+    setToggleState(semanticMapBtn, semanticMapActive);
     const graphViewBtn = document.getElementById('chat-manager-graph-view-toggle');
-    if (graphViewBtn) graphViewBtn.classList.toggle('active', graphViewActive);
+    setToggleState(graphViewBtn, graphViewActive);
 
     // Guard: no character selected or group chat
     if (context.characterId === undefined) {
@@ -2429,20 +2474,23 @@ function patchCardData() {
             if (indexingSpan) indexingSpan.remove();
 
             const aiTitleBtn = card.querySelector('.chat-manager-ai-title-btn');
-            if (aiTitleBtn && aiTitleBtn.classList.contains('disabled')) {
+            if (aiTitleBtn && aiTitleBtn.classList.contains('disabled') && aiTitleBtn.ariaBusy !== 'true') {
                 aiTitleBtn.classList.remove('disabled');
+                aiTitleBtn.disabled = false;
                 aiTitleBtn.title = 'Generate AI title';
             }
 
             const aiSummaryTitleBtn = card.querySelector('.chat-manager-ai-summarize-title-btn');
-            if (aiSummaryTitleBtn && aiSummaryTitleBtn.classList.contains('disabled')) {
+            if (aiSummaryTitleBtn && aiSummaryTitleBtn.classList.contains('disabled') && aiSummaryTitleBtn.ariaBusy !== 'true') {
                 aiSummaryTitleBtn.classList.remove('disabled');
+                aiSummaryTitleBtn.disabled = false;
                 aiSummaryTitleBtn.title = 'Generate summary and set AI title';
             }
 
             const regenBtn = card.querySelector('.chat-manager-regen-summary-btn');
-            if (regenBtn && regenBtn.classList.contains('disabled')) {
+            if (regenBtn && regenBtn.classList.contains('disabled') && regenBtn.ariaBusy !== 'true') {
                 regenBtn.classList.remove('disabled');
+                regenBtn.disabled = false;
                 regenBtn.title = 'Generate/regenerate summary';
             }
         }
@@ -2649,7 +2697,7 @@ function buildThreadCardsHtml(entries, previousEntry = null) {
         const embeddingSelectControl = `
             <label class="chat-manager-emb-select${selectedScope ? ' scope-selected' : ''}" title="Include this chat when embedding scope is set to selected chats">
                 <input type="checkbox" class="chat-manager-emb-select-cb" data-filename="${escapeAttr(entry.fileName)}" ${isSelectedForEmbedding ? 'checked' : ''}>
-                <span>Emb</span>
+                <span>Embed</span>
             </label>`;
         const clusterDot = entry.clusterLabel != null
             ? `<span class="chat-manager-cluster-dot" style="background:${escapeAttr(clusterColor(entry.clusterLabel))}" title="Cluster ${entry.clusterLabel + 1}"></span>`
@@ -2671,14 +2719,11 @@ function buildThreadCardsHtml(entries, previousEntry = null) {
         const indexingInfo = isReady ? '' : '<span>Indexing...</span>';
         const embStatus = getEmbeddingStatus(entry);
         const embBadge = (embStatus === 'full' || embStatus === 'partial' || embStatus === 'none')
-            ? `<span class="chat-manager-emb-status chat-manager-emb-status-${embStatus}" title="${escapeAttr(embStatusTitle(embStatus))}"><i class="fa-solid fa-vector-square"></i></span>`
+            ? `<span class="chat-manager-emb-status chat-manager-emb-status-${embStatus}" title="${escapeAttr(embStatusTitle(embStatus))}"><i class="fa-solid fa-vector-square" aria-hidden="true"></i><span>${escapeHtml(embStatusTitle(embStatus))}</span></span>`
             : '';
         const embedCardBtn = (embStatus !== 'disabled' && embStatus !== 'full' && embStatus !== 'unknown' && entry.isLoaded)
-            ? `<i class="chat-manager-icon-btn chat-manager-embed-card-btn fa-fw fa-solid fa-bolt" data-filename="${escapeAttr(entry.fileName)}" title="Generate embeddings for this thread" tabindex="0"></i>`
+            ? renderCardAction('chat-manager-embed-card-btn', entry.fileName, 'fa-vector-square', 'Generate embeddings', 'Generate embeddings for semantic search and topic views')
             : '';
-        const aiSummaryTitleClasses = `chat-manager-icon-btn chat-manager-ai-summarize-title-btn fa-fw fa-solid fa-wand-magic-sparkles${isReady ? '' : ' disabled'}`;
-        const aiTitleClasses = `chat-manager-icon-btn chat-manager-ai-title-btn fa-fw fa-solid fa-robot${isReady ? '' : ' disabled'}`;
-        const regenSummaryClasses = `chat-manager-icon-btn chat-manager-regen-summary-btn fa-fw fa-solid fa-rotate${isReady ? '' : ' disabled'}`;
         const aiSummaryTitle = isReady
             ? 'Generate summary and set AI title'
             : 'AI summary/title will be available once indexing finishes';
@@ -2711,12 +2756,10 @@ function buildThreadCardsHtml(entries, previousEntry = null) {
                     <span class="chat-manager-display-name" data-filename="${escapeAttr(entry.fileName)}" title="Click to switch thread">${escapeHtml(displayName)}</span>
                 </div>
                 <div class="chat-manager-card-actions">
-                    <i class="chat-manager-icon-btn chat-manager-tag-btn fa-fw fa-solid fa-tag" data-filename="${escapeAttr(entry.fileName)}" title="Manage tags" tabindex="0"></i>
-                    <i class="chat-manager-icon-btn chat-manager-edit-name-btn fa-fw fa-solid fa-pen" data-filename="${escapeAttr(entry.fileName)}" title="Edit display name" tabindex="0"></i>
-                    <i class="${aiSummaryTitleClasses}" data-filename="${escapeAttr(entry.fileName)}" title="${escapeAttr(aiSummaryTitle)}" tabindex="0"></i>
-                    <i class="${aiTitleClasses}" data-filename="${escapeAttr(entry.fileName)}" title="${escapeAttr(aiTitle)}" tabindex="0"></i>
-                    <i class="chat-manager-icon-btn chat-manager-rename-file-btn fa-fw fa-solid fa-file-pen" data-filename="${escapeAttr(entry.fileName)}" title="Rename original file" tabindex="0"></i>
-                    ${embedCardBtn}
+                    ${renderCardAction('chat-manager-edit-name-btn', entry.fileName, 'fa-pen', 'Rename title', 'Edit the display title shown in Chat Manager')}
+                    ${renderCardAction('chat-manager-tag-btn', entry.fileName, 'fa-tag', 'Tags', 'Manage tags for this chat')}
+                    ${renderCardAction('chat-manager-ai-title-btn', entry.fileName, 'fa-heading', 'AI title', aiTitle, !isReady)}
+                    ${renderCardAction('chat-manager-ai-summarize-title-btn', entry.fileName, 'fa-wand-magic-sparkles', 'AI title + summary', aiSummaryTitle, !isReady)}
                 </div>
             </div>
             ${tagChipsHtml}
@@ -2726,17 +2769,21 @@ function buildThreadCardsHtml(entries, previousEntry = null) {
                 <span>${lastActive}</span>
                 ${indexingInfo}
                 ${embBadge}
+                ${embedCardBtn}
                 ${driftInfo}
                 ${branchInfo}
             </div>
             <div class="chat-manager-card-summary" data-filename="${escapeAttr(entry.fileName)}">
                 <p class="${summaryDisplay.className}">${escapeHtml(summaryDisplay.text)}</p>
                 <div class="chat-manager-summary-actions">
-                    <i class="chat-manager-icon-btn chat-manager-edit-summary-btn fa-fw fa-solid fa-pen" data-filename="${escapeAttr(entry.fileName)}" title="Edit summary" tabindex="0"></i>
-                    <i class="${regenSummaryClasses}" data-filename="${escapeAttr(entry.fileName)}" title="${escapeAttr(summaryTitle)}" tabindex="0"></i>
+                    ${renderCardAction('chat-manager-edit-summary-btn', entry.fileName, 'fa-pen-to-square', 'Edit summary', 'Edit this chat summary')}
+                    ${renderCardAction('chat-manager-regen-summary-btn', entry.fileName, 'fa-align-left', 'AI summary', summaryTitle, !isReady)}
                 </div>
             </div>
-            <div class="chat-manager-card-filename">${escapeHtml(entry.fileName)}</div>
+            <div class="chat-manager-card-file-row">
+                <span class="chat-manager-card-filename">${escapeHtml(entry.fileName)}</span>
+                ${renderCardAction('chat-manager-rename-file-btn', entry.fileName, 'fa-file-pen', 'Rename file', 'Rename the chat file on disk')}
+            </div>
         </div>`;
     }
 
@@ -2833,7 +2880,7 @@ function ensureFilterToolbar() {
         });
 
         const dirBtn = document.createElement('button');
-        dirBtn.className = 'chat-manager-btn chat-manager-sort-dir-btn';
+        dirBtn.className = 'chat-manager-btn chat-manager-sort-dir-btn chat-manager-labeled-btn';
         dirBtn.title = 'Toggle sort direction';
         updateSortDirIcon(dirBtn, sortState.direction);
         dirBtn.addEventListener('click', () => {
@@ -2852,21 +2899,21 @@ function ensureFilterToolbar() {
         filterDiv.className = 'chat-manager-filter-controls';
 
         const tagFilterBtn = document.createElement('button');
-        tagFilterBtn.className = 'chat-manager-btn chat-manager-filter-btn chat-manager-tag-filter-btn';
+        tagFilterBtn.className = 'chat-manager-btn chat-manager-filter-btn chat-manager-tag-filter-btn chat-manager-labeled-btn';
         tagFilterBtn.title = 'Filter by tags';
-        tagFilterBtn.innerHTML = '<i class="fa-solid fa-tags"></i>';
+        tagFilterBtn.innerHTML = '<i class="fa-solid fa-tags" aria-hidden="true"></i><span>Tags</span>';
         tagFilterBtn.addEventListener('click', (e) => { e.stopPropagation(); showTagFilterDropdown(tagFilterBtn); });
 
         const advFilterBtn = document.createElement('button');
-        advFilterBtn.className = 'chat-manager-btn chat-manager-filter-btn chat-manager-adv-filter-btn';
+        advFilterBtn.className = 'chat-manager-btn chat-manager-filter-btn chat-manager-adv-filter-btn chat-manager-labeled-btn';
         advFilterBtn.title = 'Advanced filters';
-        advFilterBtn.innerHTML = '<i class="fa-solid fa-sliders"></i>';
+        advFilterBtn.innerHTML = '<i class="fa-solid fa-filter" aria-hidden="true"></i><span>Filters</span>';
         advFilterBtn.addEventListener('click', (e) => { e.stopPropagation(); showAdvancedFilterDropdown(advFilterBtn); });
 
         const clearBtn = document.createElement('button');
-        clearBtn.className = 'chat-manager-btn chat-manager-clear-filters-btn';
+        clearBtn.className = 'chat-manager-btn chat-manager-clear-filters-btn chat-manager-labeled-btn';
         clearBtn.title = 'Clear all filters';
-        clearBtn.innerHTML = '<i class="fa-solid fa-filter-circle-xmark"></i>';
+        clearBtn.innerHTML = '<i class="fa-solid fa-filter-circle-xmark" aria-hidden="true"></i><span>Clear filters</span>';
         clearBtn.addEventListener('click', () => { clearFilterState(); refreshAfterFilterChange(); });
 
         const selectVisibleEmbBtn = document.createElement('button');
@@ -2939,9 +2986,11 @@ function ensureFilterToolbar() {
 }
 
 function updateSortDirIcon(btn, direction) {
-    btn.innerHTML = direction === 'desc'
-        ? '<i class="fa-solid fa-arrow-down-short-wide"></i>'
-        : '<i class="fa-solid fa-arrow-up-short-wide"></i>';
+    const descending = direction === 'desc';
+    btn.innerHTML = descending
+        ? '<i class="fa-solid fa-arrow-down-wide-short" aria-hidden="true"></i><span>Descending</span>'
+        : '<i class="fa-solid fa-arrow-up-wide-short" aria-hidden="true"></i><span>Ascending</span>';
+    btn.title = `${descending ? 'Descending' : 'Ascending'} order; click to reverse`;
 }
 
 function showTagFilterDropdown(anchorEl) {
@@ -3180,7 +3229,7 @@ function openTagManagerDialog() {
         <div class="chat-manager-tag-manager-row" data-tag-id="${escapeAttr(tagId)}">
             <input type="color" class="cm-tag-color" value="${escapeAttr(def.color)}">
             <input type="text" class="cm-tag-name" value="${escapeAttr(def.name)}">
-            <button class="chat-manager-btn chat-manager-tag-manager-delete" title="Delete tag"><i class="fa-solid fa-trash"></i></button>
+            <button class="chat-manager-btn chat-manager-tag-manager-delete" title="Delete tag" aria-label="Delete tag"><i class="fa-solid fa-trash" aria-hidden="true"></i></button>
         </div>`;
     }
 
@@ -3240,7 +3289,7 @@ function openTagManagerDialog() {
             row.innerHTML = `
                 <input type="color" class="cm-tag-color" value="${escapeAttr(created.color)}">
                 <input type="text" class="cm-tag-name" value="${escapeAttr(created.name)}">
-                <button class="chat-manager-btn chat-manager-tag-manager-delete" title="Delete tag"><i class="fa-solid fa-trash"></i></button>
+                <button class="chat-manager-btn chat-manager-tag-manager-delete" title="Delete tag" aria-label="Delete tag"><i class="fa-solid fa-trash" aria-hidden="true"></i></button>
             `;
             row.querySelector('.cm-tag-color').addEventListener('change', (e) => updateTagDefinition(created.id, { color: e.target.value }));
             row.querySelector('.cm-tag-name').addEventListener('change', (e) => updateTagDefinition(created.id, { name: e.target.value.trim() }));
@@ -3360,59 +3409,63 @@ async function performSemanticSearch(trimmed, requestId) {
 
     const lowerQuery = trimmed.toLowerCase();
     const searchable = getSearchableMessages();
-    const queryVector = await getSemanticQueryEmbedding(trimmed);
-
-    if (requestId !== latestSearchRequestId) return;
-
     const index = getIndex();
     const embeddingSettings = getEmbeddingSettings();
     const showAlternateMatches = embeddingSettings.showAlternateSwipesInResults === true;
-    const aggregated = new Map();
-    let semanticResultOrder = 0;
-    for (const msg of searchable) {
-        const entry = index[msg.filename];
-        if (!entry || !(entry.messageEmbeddings instanceof Map)) continue;
-        const variants = collectMessageVariantsForEmbedding(msg, embeddingSettings, showAlternateMatches ? 'all' : 'active');
-        if (variants.length === 0) continue;
-
-        const activeSwipeIndex = getMessageActiveSwipeIndex(msg);
-        for (const variant of variants) {
-            const msgVector = getMessageEmbedding(entry, msg, variant.swipeIndex);
-            if (!Array.isArray(msgVector) || msgVector.length === 0) continue;
-
-            const variantTextLower = variant.isActive
-                ? (msg.textLower || (msg.textLower = msg.text.toLowerCase()))
-                : variant.text.toLowerCase();
-            const keywordScore = variantTextLower.includes(lowerQuery) ? 1.0 : 0.0;
-
-            let semanticScore = 0;
-            try {
-                semanticScore = cosineSimilarity(queryVector, msgVector);
-            } catch {
-                semanticScore = 0;
+    const indexVersion = getIndexVersion();
+    const epoch = queryEmbeddingEpoch;
+    // Dimensions are learned during the query request; unrelated per-character
+    // selection/settings maps do not change scores for this captured index.
+    const searchRecipe = settings => JSON.stringify([
+        getQueryEmbeddingKey(trimmed, settings), settings.enabled === true,
+        settings.embeddingLevels?.query === true, settings.embeddingLevels?.message === true,
+        settings.includeAlternateSwipes === true, settings.showAlternateSwipesInResults === true,
+        clampPositiveInt(getEmbeddingOption(settings, 'maxSwipesPerMessage', 8), 8),
+    ]);
+    const recipe = searchRecipe(embeddingSettings);
+    const embeddingVersions = new Map();
+    let embeddingsCurrent = true;
+    const isCurrent = () => embeddingsCurrent && requestId === latestSearchRequestId
+        && index === getIndex() && indexVersion === getIndexVersion()
+        && epoch === queryEmbeddingEpoch && recipe === searchRecipe(getEmbeddingSettings());
+    const queryVector = await getSemanticQueryEmbedding(trimmed);
+    if (!isCurrent()) return;
+    function* candidates() {
+        for (const msg of searchable) {
+            yield { vector: null };
+            const entry = index[msg.filename];
+            if (!entry || !(entry.messageEmbeddings instanceof Map)) continue;
+            if (!embeddingVersions.has(entry)) embeddingVersions.set(entry, entry.messageEmbeddingVersion);
+            else if (embeddingVersions.get(entry) !== entry.messageEmbeddingVersion) {
+                embeddingsCurrent = false;
+                return;
             }
-
-            const combinedScore = (0.7 * semanticScore) + (0.3 * keywordScore);
-            const result = {
-                item: msg,
-                matchedText: variant.text,
-                matchIndex: variantTextLower.indexOf(lowerQuery),
-                combinedScore,
-                semanticScore,
-                matchedSwipeIndex: variant.swipeIndex,
-                activeSwipeIndex,
-                isActiveSwipeMatch: variant.swipeIndex === activeSwipeIndex,
-                otherFiles: [],
-                _semanticOrder: semanticResultOrder++,
-            };
+            const variants = collectMessageVariantsForEmbedding(msg, embeddingSettings, showAlternateMatches ? 'all' : 'active');
+            const activeSwipeIndex = getMessageActiveSwipeIndex(msg);
             const textLower = msg.textLower || (msg.textLower = msg.text.toLowerCase());
-            const dedupKey = `${msg.index}:${textLower}`;
-            aggregateSemanticResult(aggregated, dedupKey, result);
+            const key = `${msg.index}:${textLower}`;
+            for (const variant of variants) {
+                const vector = getMessageEmbedding(entry, msg, variant.swipeIndex);
+                // Yield even for missing vectors so sparse indexes remain cooperative.
+                if (!Array.isArray(vector) || vector.length === 0) {
+                    yield { vector: null };
+                    continue;
+                }
+                const lower = variant.isActive ? textLower : variant.text.toLowerCase();
+                yield { key, item: msg, vector, text: variant.text, swipeIndex: variant.swipeIndex,
+                    activeSwipeIndex, keywordScore: lower.includes(lowerQuery) ? 1 : 0,
+                    matchIndex: lower.indexOf(lowerQuery) };
+            }
         }
     }
-
-    const totalMatches = aggregated.size;
-    const limited = finalizeSemanticResults(aggregated);
+    const ranked = await rankSemanticCandidates({ candidates, queryVector, isCurrent, limit: HYBRID_SEARCH_LIMIT });
+    if (!ranked || !isCurrent()) return;
+    // Background swipe attachment bumps an entry version rather than indexVersion.
+    // Validate every participating entry before publishing the two-pass result.
+    for (const [entry, version] of embeddingVersions) {
+        if (entry.messageEmbeddingVersion !== version) return;
+    }
+    const { totalMatches, results: limited } = ranked;
 
     searchState = {
         query: trimmed,
@@ -3454,30 +3507,39 @@ function performKeywordSearch(trimmed) {
 }
 
 export async function performSearch(query) {
+    cancelSearchRefresh();
     const requestId = ++latestSearchRequestId;
-    const container = document.getElementById('chat-manager-content');
-    if (!container) return;
+    activeSearchRequestId = requestId;
+    try {
+        const container = document.getElementById('chat-manager-content');
+        if (!container) return;
 
-    if (!query || query.trim().length < 2) {
-        searchState = null;
-        setSearchModeBadge('keyword');
-        renderThreadCards();
-        return;
-    }
-
-    const trimmed = query.trim();
-
-    if (shouldUseSemanticSearch(trimmed)) {
-        try {
-            await performSemanticSearch(trimmed, requestId);
+        if (!query || query.trim().length < 2) {
+            searchState = null;
+            setSearchModeBadge('keyword');
+            renderThreadCards();
             return;
-        } catch (err) {
-            console.warn(`[${MODULE_NAME}] Semantic search failed, falling back to keyword:`, err);
+        }
+
+        const trimmed = query.trim();
+
+        if (shouldUseSemanticSearch(trimmed)) {
+            try {
+                await performSemanticSearch(trimmed, requestId);
+                return;
+            } catch (err) {
+                console.warn(`[${MODULE_NAME}] Semantic search failed, falling back to keyword:`, err);
+            }
+        }
+
+        if (requestId !== latestSearchRequestId) return;
+        performKeywordSearch(trimmed);
+    } finally {
+        if (activeSearchRequestId === requestId) {
+            activeSearchRequestId = null;
+            if (searchRefreshPending) scheduleSearchRefresh();
         }
     }
-
-    if (requestId !== latestSearchRequestId) return;
-    performKeywordSearch(trimmed);
 }
 
 function setSearchStatus(queryText) {
@@ -3897,15 +3959,14 @@ async function handleAITitle(e) {
         return;
     }
 
-    btn.classList.add('disabled', 'fa-spin');
-    btn.classList.remove('fa-robot');
-    btn.classList.add('fa-gear');
+    setActionBusy(btn, true);
 
     try {
         const action = captureChatAction(filename, entry);
+        const initialMeta = JSON.stringify(getChatMeta(filename, action.avatar));
         const title = await generateTitleForChat(action.messages, action.characterName);
 
-        if (title) {
+        if (title && JSON.stringify(getChatMeta(filename, action.avatar)) === initialMeta) {
             setChatMeta(filename, { displayName: title, titleEditedByUser: false }, action.avatar);
             // Update the UI
             const card = document.querySelector(`.chat-manager-card[data-filename="${CSS.escape(filename)}"]`);
@@ -3919,8 +3980,7 @@ async function handleAITitle(e) {
         console.error(`[${MODULE_NAME}] AI title generation failed:`, err);
         toastr.error('Failed to generate title.');
     } finally {
-        btn.classList.remove('disabled', 'fa-spin', 'fa-gear');
-        btn.classList.add('fa-robot');
+        setActionBusy(btn, false);
     }
 }
 
@@ -3937,30 +3997,30 @@ async function handleAISummaryAndTitle(e) {
         return;
     }
 
-    btn.classList.add('disabled', 'fa-spin');
-    btn.classList.remove('fa-wand-magic-sparkles');
-    btn.classList.add('fa-gear');
+    setActionBusy(btn, true);
 
     try {
         const action = captureChatAction(filename, entry);
+        const initialMeta = JSON.stringify(getChatMeta(filename, action.avatar));
         const summary = await generateSummaryForChat(action.messages, action.characterName, action.branchPoint, action.siblingContext);
         const title = await generateTitleForChat(action.messages, action.characterName);
 
-        if (summary) {
+        const unchanged = JSON.stringify(getChatMeta(filename, action.avatar)) === initialMeta;
+        if (summary && unchanged) {
             setChatMeta(filename, { summary, summaryEditedByUser: false }, action.avatar);
         }
-        if (title) {
+        if (title && unchanged) {
             setChatMeta(filename, { displayName: title, titleEditedByUser: false }, action.avatar);
         }
 
         if (summary || title) {
             const card = document.querySelector(`.chat-manager-card[data-filename="${CSS.escape(filename)}"]`);
             if (card && isCurrentActionCharacter(action)) {
-                if (title) {
+                if (title && unchanged) {
                     const nameEl = card.querySelector('.chat-manager-display-name');
                     if (nameEl) nameEl.textContent = title;
                 }
-                if (summary) {
+                if (summary && unchanged) {
                     const textEl = card.querySelector('.chat-manager-summary-text');
                     if (textEl) {
                         patchSummaryTextElement(textEl, entry || { fileName: filename, isLoaded: false, messages: [] });
@@ -3982,8 +4042,7 @@ async function handleAISummaryAndTitle(e) {
         console.error(`[${MODULE_NAME}] AI summary+title generation failed:`, err);
         toastr.error('Failed to generate summary and title.');
     } finally {
-        btn.classList.remove('disabled', 'fa-spin', 'fa-gear');
-        btn.classList.add('fa-wand-magic-sparkles');
+        setActionBusy(btn, false);
     }
 }
 
@@ -4128,13 +4187,14 @@ async function handleRegenSummary(e) {
         return;
     }
 
-    btn.classList.add('disabled', 'fa-spin');
+    setActionBusy(btn, true);
 
     try {
         const action = captureChatAction(filename, entry);
+        const initialMeta = JSON.stringify(getChatMeta(filename, action.avatar));
         const summary = await generateSummaryForChat(action.messages, action.characterName, action.branchPoint, action.siblingContext);
 
-        if (summary) {
+        if (summary && JSON.stringify(getChatMeta(filename, action.avatar)) === initialMeta) {
             setChatMeta(filename, { summary, summaryEditedByUser: false }, action.avatar);
             const card = document.querySelector(`.chat-manager-card[data-filename="${CSS.escape(filename)}"]`);
             if (card && isCurrentActionCharacter(action)) {
@@ -4149,7 +4209,7 @@ async function handleRegenSummary(e) {
         console.error(`[${MODULE_NAME}] AI summary generation failed:`, err);
         toastr.error('Failed to generate summary.');
     } finally {
-        btn.classList.remove('disabled', 'fa-spin');
+        setActionBusy(btn, false);
     }
 }
 

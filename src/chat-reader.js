@@ -3,7 +3,7 @@
  * Never modifies any chat files.
  */
 
-import { getCachedChatsForCharacter, putCachedChat, putCachedChats, removeCachedChat } from './cache-store.js';
+import { consumeCachedChatsForCharacter, putCachedChat, putCachedChats, removeCachedChat } from './cache-store.js';
 import { getRepresentativeEmbeddingText } from './embedding-text.js';
 import { timestampMs, localDateBoundary } from './timestamps.js';
 import { resolveActiveChatFilename } from './active-chat.js';
@@ -523,6 +523,8 @@ export function prioritizeHydrationFiles(fileNames) {
 }
 
 function bumpIndexVersion() {
+    cachedSearchableMessages = null;
+    cachedSearchableVersion = -1;
     indexVersion++;
 }
 
@@ -851,22 +853,38 @@ export async function buildIndex(onProgress, onMetadataReady, options = {}) {
                 cacheFiles.push(fileName);
             }
         }
-        let idbCache = new Map();
-        try {
-            if (cacheFiles.length > 0) {
-                idbCache = await getCachedChatsForCharacter(character.avatar, cacheFiles);
-                if (buildSessionId !== hydrationSessionId || currentCharacterAvatar !== buildAvatar) {
-                    return getBuildStateResponse(false);
+        if (cacheFiles.length > 0) {
+            await consumeCachedChatsForCharacter(character.avatar, cacheFiles, (fileName, cached) => {
+                const meta = serverChats.get(fileName);
+                return buildSessionId === hydrationSessionId && currentCharacterAvatar === buildAvatar
+                    && chatIndex[fileName] === entriesBeforeCacheRead.get(fileName)
+                    && cached.lastModified === getMetaTimestamp(meta)
+                    && cached.serverSignature === metaSignature(meta) && recentlyValidated(cached);
+            }, (entries) => {
+                if (buildSessionId !== hydrationSessionId || currentCharacterAvatar !== buildAvatar) return false;
+                let restored = false;
+                for (const [fileName, cached] of entries) {
+                    const entry = chatIndex[fileName];
+                    if (entry !== entriesBeforeCacheRead.get(fileName) || !recentlyValidated(cached)) continue;
+                    for (const msg of cached.messages) if (!msg.filename) msg.filename = fileName;
+                    chatIndex[fileName] = {
+                        ...entry, ...cached, fileName, initialOrder: entry.initialOrder,
+                        firstTimestampMs: normalizeTimestamp(cached.firstMessageTimestamp),
+                        lastTimestampMs: normalizeTimestamp(cached.lastMessageTimestamp),
+                        branchPoint: null, isLoaded: true, needsHydration: false,
+                        chatEmbedding: null, chatEmbeddingHash: null, clusterLabel: null, messageEmbeddings: null,
+                    };
+                    // This build owns the restored replacement in the later reconciliation.
+                    entriesBeforeCacheRead.set(fileName, chatIndex[fileName]);
+                    queuedFiles.delete(fileName);
+                    changed = true;
+                    restored = true;
                 }
-                for (const [fileName, entry] of idbCache) {
-                    if (!Array.isArray(entry.messages)) continue;
-                    for (const msg of entry.messages) {
-                        if (!msg.filename) msg.filename = fileName;
-                    }
-                }
+                if (restored) bumpIndexVersion();
+            });
+            if (buildSessionId !== hydrationSessionId || currentCharacterAvatar !== buildAvatar) {
+                return getBuildStateResponse(false);
             }
-        } catch {
-            // IndexedDB unavailable — proceed without cache
         }
 
         const existingKeys = indexKeysBeforeCacheRead;
@@ -888,30 +906,15 @@ export async function buildIndex(onProgress, onMetadataReady, options = {}) {
                 && !metadataChanged && recentlyValidated(entry);
             if (reusable) continue;
 
-            const cached = idbCache.get(fileName);
-            if (!options.forceRevalidate && !entry.isLoaded && cached
-                && cached.lastModified === serverTimestamp && cached.serverSignature === signature
-                && recentlyValidated(cached) && Array.isArray(cached.messages)) {
-                chatIndex[fileName] = {
-                    ...entry, ...cached, fileName, initialOrder: entry.initialOrder,
-                    firstTimestampMs: normalizeTimestamp(cached.firstMessageTimestamp),
-                    lastTimestampMs: normalizeTimestamp(cached.lastMessageTimestamp),
-                    branchPoint: null, isLoaded: true, needsHydration: false,
-                    chatEmbedding: null, chatEmbeddingHash: null, clusterLabel: null, messageEmbeddings: null,
-                };
-                queuedFiles.delete(fileName);
-                changed = true;
-            } else {
-                // Keep the last successful body visible while revalidating; a
-                // failed request must not turn known-good data into an empty chat.
-                chatIndex[fileName] = {
-                    ...entry, lastModified: serverTimestamp, serverSignature: signature,
-                    sortTimestamp: metadataChanged ? serverTimestamp : entry.sortTimestamp,
-                    needsHydration: true,
-                };
-                markEntryForHydration(fileName);
-                changed = true;
-            }
+            // Keep the last successful body visible while revalidating; a
+            // failed request must not turn known-good data into an empty chat.
+            chatIndex[fileName] = {
+                ...entry, lastModified: serverTimestamp, serverSignature: signature,
+                sortTimestamp: metadataChanged ? serverTimestamp : entry.sortTimestamp,
+                needsHydration: true,
+            };
+            markEntryForHydration(fileName);
+            changed = true;
         }
 
         // Reconcile queue membership once, including all restored and deleted files.

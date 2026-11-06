@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import vm from 'node:vm';
 import * as meta from '../src/metadata-store.js';
 import * as reader from '../src/chat-reader.js';
+import { rankSemanticCandidates } from '../src/semantic-search.js';
 import { timestampMs } from '../src/timestamps.js';
 
 const source = fs.readFileSync(new URL('../src/ui-controller.js', import.meta.url), 'utf8')
@@ -65,7 +66,7 @@ function setup(overrides = {}) {
         setTimeout: fn => { timers.push(fn); return timers.length; }, clearTimeout() {}, requestAnimationFrame() {},
         toastr: Object.fromEntries(['success', 'warning', 'error', 'info'].map(kind => [kind, message => toasts.push({ kind, message })])),
         ...meta,
-        timestampMs,
+        timestampMs, rankSemanticCandidates,
         persistThreadFocus: meta.setThreadFocus,
         getIndex: () => index, getIndexVersion: () => 1, getEmbeddingSettings: () => settings,
         getHydrationProgress: () => ({ loaded: 0, total: 0 }), isHydrationComplete: () => true,
@@ -405,4 +406,36 @@ test('branch detection coalesces during idle time, reads the latest chat, and ca
     sandbox.scheduleBranchDetection();
     vm.runInContext('panelOpen = false;', sandbox); idle[2]();
     assert.deepEqual(detected, ['after.jsonl']);
+});
+
+for (const mutation of ['request', 'index', 'recipe', 'embedding']) {
+    test(`semantic scoring chunks discard ${mutation} changes before publication`, async () => {
+        const gate = deferred(); let atYield; const yielded = new Promise(resolve => { atYield = resolve; });
+        const { sandbox, index } = setup({ rankSemanticCandidates: options => rankSemanticCandidates({ ...options,
+            chunkSize: 4, yieldControl: async () => { atYield(); await gate.promise; } }) });
+        const msg = { filename:'target.jsonl', index:0, role:'assistant', text:'swords', swipeId:0 };
+        const entry = index[msg.filename] = { messageEmbeddings:new Map(), messages:[msg] };
+        reader.setMessageEmbedding(entry, 0, 0, [1,0]);
+        sandbox.getSearchableMessages = () => Array(20).fill(msg);
+        let version = 1; sandbox.getIndexVersion = () => version;
+        vm.runInContext('getSemanticQueryEmbedding = async () => [1,0]; renderSearchState = () => { throw new Error("stale publication"); };', sandbox);
+        const pending = sandbox.performSemanticSearch('swords',0);
+        await yielded;
+        if (mutation === 'request') vm.runInContext('latestSearchRequestId++;',sandbox);
+        if (mutation === 'index') version++;
+        if (mutation === 'recipe') sandbox.getEmbeddingSettings().model = 'changed';
+        if (mutation === 'embedding') reader.setMessageEmbedding(entry,0,0,[0,1]);
+        gate.resolve(); await pending;
+        assert.equal(vm.runInContext('searchState',sandbox),null);
+    });
+}
+test('query dimension discovery and unrelated selection changes permit semantic publication', async () => {
+    const { sandbox,index } = setup();
+    const msg = { filename:'target.jsonl',index:0,role:'assistant',text:'swords',swipeId:0 };
+    const entry = index[msg.filename] = { messageEmbeddings:new Map(),messages:[msg] };
+    reader.setMessageEmbedding(entry,0,0,[1,0]);
+    sandbox.getSearchableMessages = () => [msg];
+    vm.runInContext('getSemanticQueryEmbedding = async () => { const s = getEmbeddingSettings(); s.dimensions = 2; s.selectedChatsByAvatar = { other: ["large unrelated selection"] }; return [1,0]; }; renderSearchState = () => {};',sandbox);
+    await sandbox.performSemanticSearch('swords',0);
+    assert.equal(vm.runInContext('searchState.results.length',sandbox),1);
 });

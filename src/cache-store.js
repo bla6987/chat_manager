@@ -4,10 +4,11 @@
  */
 
 const DB_NAME = 'chat_manager_cache';
-// Version 2 discards records whose message IDs included the JSONL header.
-const DB_VERSION = 2;
+// Version 3 adds lightweight validity metadata; version 2 discarded legacy message IDs.
+const DB_VERSION = 3;
 const CACHE_FORMAT_VERSION = 2;
 const STORE_NAME = 'chats';
+const METADATA_STORE_NAME = 'chatMetadata';
 const READ_BATCH_SIZE = 50;
 
 /** @type {IDBDatabase|null} */
@@ -34,6 +35,10 @@ function openDB() {
             if (!database.objectStoreNames.contains(STORE_NAME)) {
                 const store = database.createObjectStore(STORE_NAME, { keyPath: 'key' });
                 store.createIndex('avatar', 'avatar', { unique: false });
+            }
+            // Older bodies have no matching metadata and are safely rehydrated.
+            if (!database.objectStoreNames.contains(METADATA_STORE_NAME)) {
+                database.createObjectStore(METADATA_STORE_NAME, { keyPath: 'key' });
             }
         };
 
@@ -104,6 +109,44 @@ export async function getCachedChatsForCharacter(avatar, fileNames) {
 }
 
 /**
+ * Restore usable bodies one bounded batch at a time. Metadata and bodies are
+ * read in the same transaction so a concurrent write cannot pair revisions.
+ * The consumer must recheck its own session/entry ownership after each await.
+ */
+export async function consumeCachedChatsForCharacter(avatar, candidates, isValid, consume) {
+    let database;
+    try { database = await openDB(); } catch { return; }
+    for (let offset = 0; offset < candidates.length; offset += READ_BATCH_SIZE) {
+        const batch = candidates.slice(offset, offset + READ_BATCH_SIZE);
+        const entries = await new Promise((resolve) => {
+            const result = new Map();
+            const tx = database.transaction([METADATA_STORE_NAME, STORE_NAME], 'readonly');
+            const metadataStore = tx.objectStore(METADATA_STORE_NAME);
+            const bodyStore = tx.objectStore(STORE_NAME);
+            for (const fileName of batch) {
+                const request = metadataStore.get(makeKey(avatar, fileName));
+                request.onsuccess = () => {
+                    const metadata = request.result;
+                    if (metadata?.cacheFormatVersion !== CACHE_FORMAT_VERSION || !isValid(fileName, metadata)) return;
+                    const bodyRequest = bodyStore.get(makeKey(avatar, fileName));
+                    bodyRequest.onsuccess = () => {
+                        const body = bodyRequest.result;
+                        if (body?.cacheFormatVersion === CACHE_FORMAT_VERSION
+                            && body.lastModified === metadata.lastModified
+                            && body.serverSignature === metadata.serverSignature
+                            && body.validatedAt === metadata.validatedAt
+                            && Array.isArray(body.messages) && isValid(fileName, body)) result.set(fileName, body);
+                    };
+                };
+            }
+            tx.oncomplete = () => resolve(result);
+            tx.onerror = tx.onabort = () => resolve(new Map());
+        }).catch(() => new Map());
+        if (consume(entries) === false) return;
+    }
+}
+
+/**
  * Write a hydrated chat entry to the cache (fire-and-forget).
  * @param {string} avatar
  * @param {string} fileName
@@ -121,11 +164,11 @@ export function putCachedChat(avatar, fileName, entry) {
 export function putCachedChats(avatar, chats) {
     if (!Array.isArray(chats) || chats.length === 0) return;
     openDB().then((database) => {
-        const tx = database.transaction(STORE_NAME, 'readwrite');
+        const tx = database.transaction([STORE_NAME, METADATA_STORE_NAME], 'readwrite');
         const store = tx.objectStore(STORE_NAME);
         for (const { fileName, entry } of chats) {
             if (!fileName || !entry) continue;
-            store.put({
+            const record = {
                 key: makeKey(avatar, fileName),
                 cacheFormatVersion: CACHE_FORMAT_VERSION,
                 avatar,
@@ -139,6 +182,14 @@ export function putCachedChats(avatar, chats) {
                 validatedAt: entry.validatedAt,
                 serverSignature: entry.serverSignature,
                 mainChat: entry.mainChat,
+            };
+            store.put(record);
+            tx.objectStore(METADATA_STORE_NAME).put({
+                key: record.key,
+                cacheFormatVersion: record.cacheFormatVersion,
+                lastModified: record.lastModified,
+                validatedAt: record.validatedAt,
+                serverSignature: record.serverSignature,
             });
         }
     }).catch(() => {
@@ -153,9 +204,10 @@ export function putCachedChats(avatar, chats) {
  */
 export function removeCachedChat(avatar, fileName) {
     openDB().then((database) => {
-        const tx = database.transaction(STORE_NAME, 'readwrite');
+        const tx = database.transaction([STORE_NAME, METADATA_STORE_NAME], 'readwrite');
         const store = tx.objectStore(STORE_NAME);
         store.delete(makeKey(avatar, fileName));
+        tx.objectStore(METADATA_STORE_NAME).delete(makeKey(avatar, fileName));
     }).catch(() => {
         // Silently ignore cache delete failures
     });

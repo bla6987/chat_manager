@@ -250,7 +250,7 @@ test('CHAT_CHANGED finishes while archive refresh is still pending', async () =>
     const refresh = deferred();
     let refreshStarted = false;
     const dependencies = {
-        mountTopBarToggleButton() {}, syncTopBarToggleDisabledState() {},
+        mountTopBarToggleButton() {}, syncTopBarToggleDisabledState() {}, refreshSwipeBrowser() {},
         SillyTavern: { getContext: () => ({ characterId: 0, characters: [{ avatar: 'test.png' }] }) },
         getIndexCharacterAvatar: () => 'test.png', isPanelOpen: () => true,
         refreshPanel: () => { refreshStarted = true; return refresh.promise; },

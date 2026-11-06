@@ -5,39 +5,6 @@
 import { getAIConnectionProfile } from './metadata-store.js';
 
 const MODULE_NAME = 'chat_manager';
-// Keep this window short so repeated user actions are still counted separately.
-const TOKEN_USAGE_DEDUPE_TTL_MS = 2000;
-const recentTokenUsageKeys = new Map();
-
-function hashText(text) {
-    const value = typeof text === 'string' ? text : '';
-    let hash = 2166136261;
-    for (let i = 0; i < value.length; i += 1) {
-        hash ^= value.charCodeAt(i);
-        hash = Math.imul(hash, 16777619);
-    }
-    return (hash >>> 0).toString(16);
-}
-
-function pruneUsageKeyCache(now = Date.now()) {
-    for (const [key, timestamp] of recentTokenUsageKeys.entries()) {
-        if ((now - timestamp) > TOKEN_USAGE_DEDUPE_TTL_MS) {
-            recentTokenUsageKeys.delete(key);
-        }
-    }
-}
-
-function buildUsageKey(operation, profileId, modelId, sourceId, inputText, outputText) {
-    return [
-        operation || 'unknown',
-        profileId || 'current',
-        modelId || 'unknown-model',
-        sourceId || 'unknown-source',
-        hashText(inputText),
-        hashText(outputText),
-    ].join(':');
-}
-
 /**
  * Report token usage for an AI feature call when TokenUsageTracker is available.
  * For quiet generations, prefer consuming pending quiet usage from the tracker so
@@ -71,24 +38,6 @@ async function reportTokenUsageIfNeeded({ operation, inputText = '', outputText 
 
         const modelId = typeof tracker.getCurrentModelId === 'function' ? tracker.getCurrentModelId() : null;
         const sourceId = typeof tracker.getCurrentSourceId === 'function' ? tracker.getCurrentSourceId() : null;
-        const usageKey = buildUsageKey(
-            operation,
-            getAIConnectionProfile(),
-            modelId,
-            sourceId,
-            promptText,
-            outputText,
-        );
-
-        const now = Date.now();
-        pruneUsageKeyCache(now);
-
-        const seenAt = recentTokenUsageKeys.get(usageKey);
-        if (typeof seenAt === 'number' && (now - seenAt) <= TOKEN_USAGE_DEDUPE_TTL_MS) {
-            return false;
-        }
-        recentTokenUsageKeys.set(usageKey, now);
-
         tracker.recordUsage(inputTokens, outputTokens, null, modelId, sourceId, 0);
         return true;
     } catch (e) {
@@ -202,9 +151,38 @@ async function selectConnectionProfile(context, name) {
  * @returns {Promise<T>}
  * @template T
  */
+
+async function captureCommandRoute(context) {
+    const commands = context.SlashCommandParser?.commands;
+    if (!commands) throw new Error('Connection commands unavailable');
+    const route = [];
+    route.settings = { chat: context.chatCompletionSettings ? structuredClone(context.chatCompletionSettings) : null, text: context.textCompletionSettings ? structuredClone(context.textCompletionSettings) : null };
+    for (const name of ['api', 'preset', 'proxy', 'context', 'instruct', 'sysprompt', 'tokenizer', 'instruct-state', 'sysprompt-state', 'reasoning-template', 'prompt-post-processing', 'regex-preset', 'api-url', 'model', 'secret-id']) {
+        const command = commands[name];
+        if (typeof command?.callback !== 'function') {
+            if (['api', 'api-url', 'model', 'secret-id'].includes(name)) throw new Error(`Cannot safely restore /${name}`);
+            continue;
+        }
+        const value = await command.callback({ quiet: 'true', connect: 'false' }, '');
+        route.push([name, String(value ?? '')]);
+    }
+    return route;
+}
+async function restoreCommandRoute(context, route) {
+    if (route?.settings?.chat && context.chatCompletionSettings) Object.assign(context.chatCompletionSettings, structuredClone(route.settings.chat));
+    if (route?.settings?.text && context.textCompletionSettings) Object.assign(context.textCompletionSettings, structuredClone(route.settings.text));
+    for (const [name, value] of route || []) {
+        if (!value) continue;
+        const command = context.SlashCommandParser?.commands?.[name];
+        if (!command) throw new Error(`Cannot restore /${name}`);
+        const applied = await command.callback({ quiet: 'true', connect: 'false' }, value);
+        if (name === 'secret-id' && String(applied ?? '') !== value) throw new Error('Credential restoration failed');
+    }
+}
 async function switchAndRun(targetProfile, originalProfileId, cmProfiles, fn) {
     const context = SillyTavern.getContext();
 
+    const originalRoute = originalProfileId ? null : await captureCommandRoute(context);
     // Switch to the AI profile
     try {
         await selectConnectionProfile(context, targetProfile.name);
@@ -227,6 +205,7 @@ async function switchAndRun(targetProfile, originalProfileId, cmProfiles, fn) {
                     : null;
                 const restoreName = originalProfile ? originalProfile.name : NO_CONNECTION_PROFILE;
                 await selectConnectionProfile(current, restoreName);
+                if (originalRoute) await restoreCommandRoute(SillyTavern.getContext(), originalRoute);
             }
         } catch (err) {
             console.warn(`[${MODULE_NAME}] Failed to restore original profile:`, err);

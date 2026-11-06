@@ -683,123 +683,151 @@ export async function findOptimalKAsync(vectors, maxK = 8) {
 }
 
 /**
- * Async PCA projection to 3 dimensions — yields during power iteration.
+ * Async full-data PCA projection with matrix-free covariance and cooperative work.
  * @param {number[][]} vectors
  * @returns {Promise<{ projected: number[][], mean: number[], components: number[][] }>}
  */
 export async function pca3DAsync(vectors) {
-    const dims = validateVectors(vectors);
+    // Bound work between event-loop turns, including setup, seeding and projection.
+    // Check the clock in small dimension blocks rather than on every multiply.
+    let deadline = performance.now() + 8;
+    const due = () => performance.now() >= deadline;
+    const pause = async () => {
+        await yieldToEventLoop();
+        deadline = performance.now() + 8;
+    };
+    const cooperativeDot = async (left, right) => {
+        let sum = 0;
+        for (let d = 0; d < left.length; d++) {
+            sum += left[d] * right[d];
+            if ((d & 4095) === 4095 && due()) await pause();
+        }
+        return sum;
+    };
+    if (!Array.isArray(vectors)) throw new Error('Expected vectors to be an array.');
     const n = vectors.length;
-    if (n === 0) {
-        return { projected: [], mean: [], components: [] };
+    if (n === 0) return { projected: [], mean: [], components: [] };
+    const dims = Array.isArray(vectors[0]) ? vectors[0].length : 0;
+    if (dims === 0) throw new Error('Vectors must contain at least one dimension.');
+    for (let i = 0; i < n; i++) {
+        if (!Array.isArray(vectors[i]) || vectors[i].length !== dims) {
+            throw new Error(`Vector dimension mismatch at index ${i}.`);
+        }
+        if ((i & 4095) === 4095 && due()) await pause();
     }
-
     const mean = new Array(dims).fill(0);
     for (let i = 0; i < n; i++) {
-        const row = vectors[i];
         for (let d = 0; d < dims; d++) {
-            mean[d] += row[d];
+            mean[d] += vectors[i][d];
+            if ((d & 4095) === 4095 && due()) await pause();
         }
+        if (due()) await pause();
     }
     for (let d = 0; d < dims; d++) {
         mean[d] /= n;
+        if ((d & 4095) === 4095 && due()) await pause();
     }
-
-    const centered = new Array(n);
-    for (let i = 0; i < n; i++) {
-        const row = new Array(dims);
-        for (let d = 0; d < dims; d++) {
-            row[d] = vectors[i][d] - mean[d];
-        }
-        centered[i] = row;
-    }
-
-    const cov = new Array(dims);
-    for (let i = 0; i < dims; i++) {
-        cov[i] = new Array(dims).fill(0);
-    }
-
-    for (let r = 0; r < n; r++) {
-        const row = centered[r];
-        for (let i = 0; i < dims; i++) {
-            const vi = row[i];
-            for (let j = i; j < dims; j++) {
-                cov[i][j] += vi * row[j];
-            }
-        }
-    }
-
     const scale = 1 / Math.max(1, n - 1);
-    for (let i = 0; i < dims; i++) {
-        for (let j = i; j < dims; j++) {
-            const value = cov[i][j] * scale;
-            cov[i][j] = value;
-            cov[j][i] = value;
-        }
-    }
-
-    await yieldToEventLoop();
-
-    const componentCount = Math.min(3, dims);
     const components = [];
-
-    for (let c = 0; c < componentCount; c++) {
-        let v = pcaSeed(centered, dims, components);
-        if (!v) break;
-
-        for (let iter = 0; iter < POWER_ITER_MAX; iter++) {
-            if (iter > 0 && iter % YIELD_INTERVAL === 0) {
-                await yieldToEventLoop();
-            }
-
-            let w = matrixVectorMultiply(cov, v);
-
-            for (let p = 0; p < components.length; p++) {
-                const u = components[p];
-                const projection = dot(w, u);
-                for (let d = 0; d < dims; d++) {
-                    w[d] -= projection * u[d];
-                }
-            }
-
-            const wNorm = vectorNorm(w);
-            if (wNorm <= EPSILON) break;
-
+    // C v = X' (X v) / (n - 1), with X centered on demand. No n*d
+    // centered copy or d*d covariance is retained; all input rows participate.
+    const multiply = async vector => {
+        const out = new Array(dims).fill(0);
+        for (let i = 0; i < n; i++) {
+            const row = vectors[i];
+            let projection = 0;
             for (let d = 0; d < dims; d++) {
-                w[d] /= wNorm;
+                projection += (row[d] - mean[d]) * vector[d];
+                if ((d & 4095) === 4095 && due()) await pause();
             }
-
-            let diff = 0;
             for (let d = 0; d < dims; d++) {
-                const delta = w[d] - v[d];
-                diff += delta * delta;
+                out[d] += (row[d] - mean[d]) * projection;
+                if ((d & 4095) === 4095 && due()) await pause();
             }
-            v = w;
-            if (Math.sqrt(diff) <= POWER_ITER_TOL) {
-                break;
-            }
+            if (due()) await pause();
         }
-
-        const Av = matrixVectorMultiply(cov, v);
-        const eigenvalue = dot(v, Av);
-        if (eigenvalue <= EPSILON) {
-            break;
-        }
-        components.push(v.slice());
-    }
-
-    while (components.length < 3) {
-        components.push(new Array(dims).fill(0));
-    }
-
-    const projected = centered.map(row => {
-        const out = [0, 0, 0];
-        for (let c = 0; c < 3; c++) {
-            out[c] = dot(row, components[c]);
+        for (let d = 0; d < dims; d++) {
+            out[d] *= scale;
+            if ((d & 4095) === 4095 && due()) await pause();
         }
         return out;
-    });
-
+    };
+    const centeredDot = async (row, vector) => {
+        let result = 0;
+        for (let d = 0; d < dims; d++) {
+            result += (row[d] - mean[d]) * vector[d];
+            if ((d & 4095) === 4095 && due()) await pause();
+        }
+        return result;
+    };
+    for (let c = 0; c < Math.min(3, dims); c++) {
+        // Match pcaSeed's residual-variance seed, tie order and deflation.
+        const variances = new Float64Array(dims);
+        for (const row of vectors) {
+            const projections = [];
+            for (const component of components) projections.push(await centeredDot(row, component));
+            for (let d = 0; d < dims; d++) {
+                let residual = row[d] - mean[d];
+                for (let p = 0; p < components.length; p++) residual -= projections[p] * components[p][d];
+                variances[d] += residual * residual;
+                if ((d & 4095) === 4095 && due()) await pause();
+            }
+            if (due()) await pause();
+        }
+        let seed = 0;
+        for (let d = 1; d < dims; d++) {
+            if (variances[d] > variances[seed]) seed = d;
+            if ((d & 4095) === 4095 && due()) await pause();
+        }
+        if (variances[seed] / Math.max(1, n - 1) <= EPSILON) break;
+        let v = new Array(dims).fill(0);
+        v[seed] = 1;
+        for (const component of components) {
+            const projection = await cooperativeDot(v, component);
+            for (let d = 0; d < dims; d++) {
+                v[d] -= projection * component[d];
+                if ((d & 4095) === 4095 && due()) await pause();
+            }
+        }
+        const length = Math.sqrt(await cooperativeDot(v, v));
+        if (!Number.isFinite(length) || length <= EPSILON) break;
+        for (let d = 0; d < dims; d++) {
+            v[d] /= length;
+            if ((d & 4095) === 4095 && due()) await pause();
+        }
+        for (let iter = 0; iter < POWER_ITER_MAX; iter++) {
+            const w = await multiply(v);
+            for (const u of components) {
+                const projection = await cooperativeDot(w, u);
+                for (let d = 0; d < dims; d++) {
+                    w[d] -= projection * u[d];
+                    if ((d & 4095) === 4095 && due()) await pause();
+                }
+            }
+            const wNorm = Math.sqrt(await cooperativeDot(w, w));
+            if (wNorm <= EPSILON) break;
+            let diff = 0;
+            for (let d = 0; d < dims; d++) {
+                w[d] /= wNorm;
+                const delta = w[d] - v[d];
+                diff += delta * delta;
+                if ((d & 4095) === 4095 && due()) await pause();
+            }
+            v = w;
+            if (Math.sqrt(diff) <= POWER_ITER_TOL) break;
+        }
+        const Av = await multiply(v);
+        if (await cooperativeDot(v, Av) <= EPSILON) break;
+        components.push(v);
+    }
+    while (components.length < 3) components.push(new Array(dims).fill(0));
+    const projected = new Array(n);
+    for (let i = 0; i < n; i++) {
+        const out = [0, 0, 0];
+        for (let c = 0; c < 3; c++) out[c] = await centeredDot(vectors[i], components[c]);
+        projected[i] = out;
+        if (due()) await pause();
+    }
     return { projected, mean, components };
 }
 

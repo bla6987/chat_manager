@@ -1,0 +1,113 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<title>Chat Manager control clarity checks</title>
+<link rel="stylesheet" href="../style.css">
+<!-- Optional: serve SillyTavern's Font Awesome assets at /fontawesome for visual QA. -->
+<link rel="stylesheet" href="/fontawesome/css/fontawesome.min.css">
+<link rel="stylesheet" href="/fontawesome/css/solid.min.css">
+<style>
+:root { --sheldWidth:760px; --topBarBlockSize:0px; --SmartThemeBlurTintColor:#20242b; --SmartThemeBodyColor:#e1e4e9; --SmartThemeBorderColor:#444b55; }
+body { background:#13161a; color:#e1e4e9; font:14px system-ui; margin:24px; }
+#checks { max-width:calc(100% - 430px); }
+#checks button { padding:8px 12px; margin:0 4px 8px 0; }
+pre { white-space:pre-wrap; line-height:1.5; }
+.chat-manager-panel { transition:none; }
+body.narrow .chat-manager-panel { width:320px; }
+body.narrow .chat-manager-popup { max-width:320px; box-sizing:border-box; }
+</style>
+<div id="checks">
+<h1>Control clarity</h1>
+<p>Production templates and rendering, synthetic chats, mocked AI. No live account calls.</p>
+<button id="run">Run checks</button><button id="mode">Preview popup</button><button id="width">320px panel</button>
+<pre id="results">Loading…</pre>
+</div>
+<script type="module">
+import { getIndex, clearIndex } from '../src/chat-reader.js';
+import { openSwipeBrowser } from '../src/swipe-browser.js';
+import { setChatMeta, setDisplayMode } from '../src/metadata-store.js';
+import { renderThreadCards, refreshThreadCardsAfterMessage, toggleStats, toggleTimeline, toggleGraphView, toggleSemanticMap, toggleBranchContext } from '../src/ui-controller.js';
+const context = {
+    characterId:0, characters:[{avatar:'fixture.png',name:'Mira'}], name2:'Mira',
+    chatMetadata:{chat_file_name:'harbor.jsonl'}, onlineStatus:'connected',
+    extensionSettings:{}, chat:[{is_user:true,mes:'The harbor lights appeared through the fog.'}],
+    saveSettingsDebounced(){}, generateRaw:async()=>new Promise(resolve=>{finishGeneration=resolve;}),
+};
+const previewOptions=new URLSearchParams(location.search);
+let finishGeneration, mode=previewOptions.get('mode')==='popup'?'popup':'panel';
+document.body.classList.toggle('narrow',previewOptions.has('narrow'));
+document.getElementById('mode').textContent=mode==='panel'?'Preview popup':'Preview panel';
+window.SillyTavern={getContext:()=>context,libs:{DOMPurify:{sanitize:x=>x},moment:()=>({isValid:()=>true,format:()=> 'Oct 16',fromNow:()=> 'just now'})}};
+window.toastr=Object.fromEntries(['success','warning','info','error'].map(kind=>[kind,()=>{}]));
+const results=document.getElementById('results');
+const paint=()=>new Promise(resolve=>requestAnimationFrame(()=>requestAnimationFrame(resolve)));
+const assert=(value,label)=>{if(!value)throw Error(label);results.textContent+=`PASS ${label}\n`;};
+const card=()=>document.querySelector('.chat-manager-card[data-filename="harbor.jsonl"]');
+function seed(){
+    clearIndex();
+    for(const [i,fileName] of ['harbor.jsonl','mountain-pass.jsonl','a-very-long-filename-that-must-wrap-without-hiding-any-controls.jsonl'].entries()){
+        getIndex()[fileName]={fileName,isLoaded:i!==1,needsHydration:i===1,messageCount:12-i,sortTimestamp:1000-i,firstMessageTimestamp:'2026-10-16',lastMessageTimestamp:'2026-10-16',branchPoint:null,messages:[{index:0,role:'user',text:'The harbor lights appeared through the fog.',timestamp:'2026-10-16'}]};
+        setChatMeta(fileName,{displayName:['Lights in the harbor','Across the mountain pass','An unusually long chapter title to check narrow layouts'][i],summary:'Mira follows the harbor lights and finds a familiar ship waiting in the mist.'});
+    }
+}
+async function mount(){
+    document.getElementById('chat-manager-panel')?.remove();
+    document.getElementById('chat-manager-shadow-overlay')?.remove();
+    setDisplayMode(mode);
+    document.body.insertAdjacentHTML('beforeend',await (await fetch(`../templates/${mode}.html`)).text());
+    document.querySelector(mode==='panel'?'#chat-manager-panel':'#chat-manager-shadow-overlay').classList.add(mode==='panel'?'open':'visible');
+    for(const [id,handler] of [['stats',toggleStats],['timeline',toggleTimeline],['graph-view',toggleGraphView],['semantic-map',toggleSemanticMap],['branch-context',toggleBranchContext]]){
+        document.getElementById(`chat-manager-${id}-toggle`).addEventListener('click',handler);
+    }
+    document.querySelector('.chat-manager-close').addEventListener('click',()=>document.querySelector(mode==='panel'?'#chat-manager-panel':'#chat-manager-shadow-overlay').classList.remove(mode==='panel'?'open':'visible'));
+    document.getElementById('chat-manager-recent-swipes').addEventListener('click',()=>openSwipeBrowser());
+    renderThreadCards();await paint();
+}
+document.getElementById('mode').onclick=async()=>{mode=mode==='panel'?'popup':'panel';document.getElementById('mode').textContent=mode==='panel'?'Preview popup':'Preview panel';await document.getElementById('run').onclick();};
+document.getElementById('width').onclick=()=>document.body.classList.toggle('narrow');
+document.getElementById('run').onclick=async()=>{
+    results.textContent='';
+    try{
+        seed();await mount();
+        const root=document.querySelector(mode==='panel'?'#chat-manager-panel':'#chat-manager-popup');
+        const controls=[...root.querySelectorAll('.chat-manager-header-actions button,.chat-manager-card button,.chat-manager-filter-toolbar button')];
+        assert(controls.every(button=>button.textContent.trim()),'view, card and filter actions have visible text labels');
+        assert([...card().querySelectorAll('.chat-manager-card-actions button,.chat-manager-summary-actions button')].every(button=>getComputedStyle(button.parentElement).opacity==='1'),'card actions remain visible without hover');
+        assert([...root.querySelectorAll('.chat-manager-card-action')].every(button=>button.tagName==='BUTTON'),'card actions use native keyboard-operable buttons');
+        const pending=document.querySelector('[data-filename="mountain-pass.jsonl"] .chat-manager-ai-title-btn');
+        assert(pending.disabled,'AI action is disabled while the chat is indexing');
+        const ready=getIndex()['mountain-pass.jsonl'];ready.isLoaded=true;ready.needsHydration=false;
+        refreshThreadCardsAfterMessage(ready.fileName);
+        assert(!document.querySelector('[data-filename="mountain-pass.jsonl"] .chat-manager-ai-title-btn').disabled,'hydration enables the native AI button');
+        const titleButton=card().querySelector('.chat-manager-ai-title-btn');titleButton.click();await paint();
+        assert(titleButton.disabled&&titleButton.getAttribute('aria-busy')==='true','AI generation exposes a disabled busy state');
+        assert(titleButton.textContent==='AI title'&&!titleButton.classList.contains('fa-spin')&&titleButton.querySelector('i').classList.contains('fa-spin'),'only the icon spins; the action label stays readable');
+        finishGeneration('A ship in the mist');await paint();
+        assert(!titleButton.disabled&&titleButton.getAttribute('aria-busy')==='false'&&card().querySelector('.chat-manager-display-name').textContent==='A ship in the mist','AI completion restores the button and updates its title');
+        card().querySelector('.chat-manager-edit-name-btn i').click();
+        const edit=card().querySelector('input.chat-manager-inline-edit');assert(!!edit,'clicking a nested icon delegates to the correct action');
+        edit.value='Lights in the harbor';edit.blur();
+        for(const narrow of [true,false]){
+            document.body.classList.toggle('narrow',narrow);await paint();
+            assert(root.scrollWidth<=root.clientWidth,`${narrow?'320px':'default'} layout does not overflow horizontally`);
+            const bounds=root.getBoundingClientRect();
+            assert([...root.querySelectorAll('.chat-manager-labeled-btn')].every(button=>{const r=button.getBoundingClientRect();return !button.getClientRects().length||r.left>=bounds.left&&r.right<=bounds.right+1;}),`${narrow?'320px':'default'} layout keeps action labels inside the container`);
+        }
+        const stats=document.getElementById('chat-manager-stats-toggle');stats.click();await paint();
+        assert(stats.getAttribute('aria-pressed')==='true','active view is announced as pressed');
+        stats.click();await paint();assert(stats.getAttribute('aria-pressed')==='false','returning to threads resets the pressed state');
+        document.getElementById('chat-manager-timeline-toggle').click();await paint();
+        assert(!!root.querySelector('.chat-manager-icicle-focus-btn span')&&root.querySelector('.chat-manager-icicle-search-mode').textContent==='Keyword','timeline scope and search mode use plain text labels');
+        const focus=root.querySelector('.chat-manager-icicle-focus-btn');const before=focus.getAttribute('aria-pressed');focus.click();await paint();
+        assert(focus.getAttribute('aria-pressed')!==before,'timeline scope keeps its pressed state in sync');
+        document.body.classList.add('narrow');await paint();
+        const legend=root.querySelector('.chat-manager-icicle-cluster-legend').getBoundingClientRect();
+        assert([...root.querySelectorAll('.chat-manager-icicle-toolbar button')].filter(button=>button.getClientRects().length).every(button=>{const b=button.getBoundingClientRect();return b.right<=legend.left||b.left>=legend.right||b.bottom<=legend.top||b.top>=legend.bottom;}),'narrow timeline legend does not cover controls');
+        document.body.classList.remove('narrow');await paint();
+        document.getElementById('chat-manager-timeline-toggle').click();await paint();
+        results.textContent+='ALL CONTROL CHECKS PASSED';
+    }catch(error){results.textContent+=`FAIL ${error.stack}`;}
+};
+seed();await mount();results.textContent='Ready. Run checks or explore the preview.';
+</script>
+</html>

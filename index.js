@@ -3,7 +3,7 @@
  * Lifecycle hooks, event listeners, UI injection.
  */
 
-import { clearIndex, getIndex, getIndexCharacterAvatar, markChatDirty, removeChatFromIndex, updateActiveChat } from './src/chat-reader.js';
+import { onHydrationUpdate, buildIndex, clearIndex, getIndex, getIndexCharacterAvatar, markChatDirty, removeChatFromIndex, updateActiveChat } from './src/chat-reader.js';
 import {
     togglePanel, closePanel, refreshPanel, renderThreadCards, refreshThreadCardsAfterMessage, onSearchInput, isPanelOpen, resetSearchState,
     toggleTimeline, isTimelineActive, toggleSemanticMap, isSemanticMapActive, toggleGraphView, isGraphViewActive, toggleStats, isStatsActive, toggleBranchContext, isBranchContextActive,
@@ -20,6 +20,8 @@ import { updateGraphViewData, isGraphViewMounted } from './src/graph-view.js';
 import { resolveActiveChatFilename } from './src/active-chat.js';
 import { initGenerationFailureAlert, primeFailureAlertAudio } from './src/generation-failure-alert.js';
 import { initEmbeddingGenerationLifecycle } from './src/generation-lifecycle.js';
+import { openSwipeBrowser, closeSwipeBrowser, refreshSwipeBrowser } from './src/swipe-browser.js';
+import { navigateToChat } from './src/chat-navigation.js';
 
 const MODULE_NAME = 'chat_manager';
 const EXTENSION_PATH = '/scripts/extensions/third-party/chat_manager';
@@ -58,6 +60,7 @@ const onMessageUpdate = (() => {
         const eventAvatar = eventContext.characters?.[eventContext.characterId]?.avatar;
         const eventFile = getActiveChatFile(eventContext);
         if (eventFile && eventAvatar === getIndexCharacterAvatar()) markChatDirty(eventFile);
+        refreshSwipeBrowser();
         if (timer) clearTimeout(timer);
         timer = setTimeout(async () => {
             timer = null;
@@ -156,6 +159,13 @@ const onMessageUpdate = (() => {
     }
 
     registerSlashCommands();
+    onHydrationUpdate(progress => {
+        if (!progress.complete || !isBranchContextActive()) return;
+        const context = SillyTavern.getContext();
+        if (context.characters?.[context.characterId]?.avatar !== getIndexCharacterAvatar()) return;
+        const activeFile = getActiveChatFile(context);
+        if (activeFile) updateBranchContextInjection(activeFile);
+    });
 
     // If embeddings are enabled, attempt to restore vectors/clusters from cache.
     if (isEmbeddingGenerationEnabled()) {
@@ -1170,7 +1180,7 @@ function mountTopBarToggleButton() {
 
         const icon = document.createElement('i');
         icon.id = TOPBAR_TOGGLE_ID;
-        icon.className = 'fa-solid fa-address-book chat-manager-icon-btn';
+        icon.className = 'fa-solid fa-comments chat-manager-icon-btn';
         icon.title = 'Toggle Chat Manager';
         icon.tabIndex = 0;
         icon.setAttribute('role', 'button');
@@ -1281,6 +1291,19 @@ function bindPanelEvents() {
     const searchAIProfileSelect = document.getElementById('chat-manager-search-ai-profile');
     bindAIProfileDropdown(searchAIProfileSelect);
 
+    const recentSwipesBtn = document.getElementById('chat-manager-recent-swipes');
+    if (recentSwipesBtn) {
+        recentSwipesBtn.addEventListener('click', (event) => {
+            event.stopPropagation();
+            openSwipeBrowser({
+                onJump: (fileName, messageIndex) => navigateToChat(fileName, messageIndex, {
+                    beforeScroll: () => { closeSwipeBrowser(); closePanel(); },
+                    onError: error => toastr.warning(error.message),
+                }),
+            });
+        });
+    }
+
     // Branch context toggle button
     const branchCtxToggleBtn = document.getElementById('chat-manager-branch-context-toggle');
     if (branchCtxToggleBtn) {
@@ -1338,6 +1361,7 @@ function bindPanelEvents() {
 async function onChatChanged() {
     mountTopBarToggleButton();
     syncTopBarToggleDisabledState();
+    refreshSwipeBrowser();
 
     const context = SillyTavern.getContext();
     const character = context.characterId !== undefined ? context.characters[context.characterId] : null;
@@ -1367,8 +1391,14 @@ async function onChatChanged() {
     if (getBranchContextEnabled()) {
         // Clear immediately, then defer re-injection to let index stabilize
         clearBranchContextInjection();
-        setTimeout(() => {
+        setTimeout(async () => {
             if (!isBranchContextActive()) return;
+            const owner = currentAvatar;
+            if (!sameCharacter && !isPanelOpen()) {
+                try { await buildIndex(); } catch (error) { console.warn(`[${MODULE_NAME}] Branch index refresh failed`, error); return; }
+                const current = SillyTavern.getContext();
+                if (current.characters?.[current.characterId]?.avatar !== owner) return;
+            }
             const ctx = SillyTavern.getContext();
             const activeFile = getActiveChatFile(ctx);
             if (activeFile) {
