@@ -2,39 +2,73 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
 import vm from 'node:vm';
+import { searchArchivePage } from '../src/archive-search.js';
 
 const source = readFileSync(new URL('../src/ui-controller.js', import.meta.url), 'utf8')
     .replace(/^import[\s\S]*?;\n/gm, '').replace(/^export /gm, '');
+const deferred = () => {
+    let resolve, reject;
+    const promise = new Promise((r, j) => { resolve = r; reject = j; });
+    return { promise, resolve, reject };
+};
+const emptyPage = { results: [], scanned: 2000, pageReferences: [], hasMore: false };
 
-function fixture({ complete = true } = {}) {
-    const timers = new Map(), requests = [], paints = [];
+async function until(predicate) {
+    for (let i = 0; i < 30; i++) {
+        if (predicate()) return;
+        await Promise.resolve();
+    }
+    assert.fail('Expected search work did not start');
+}
+
+function fixture({ complete = true, semantic = false, queryEmbedding = async () => [1], scan } = {}) {
+    const index = {};
+    const timers = new Map();
+    const requests = [];
+    const paints = [];
     const input = { value: 'needle' };
-    let hydrationListener, nextTimer = 0;
+    const status = { textContent: '' };
+    let nextTimer = 0;
+    let hydrationListener;
     const sandbox = vm.createContext({
-        Map, Set, WeakMap, WeakSet, console,
-        document: { getElementById: id => id === 'chat-manager-search' ? input : {} },
+        console: { warn() {} }, AbortController, DOMException, Map, Set, WeakMap, WeakSet,
+        document: { getElementById: id => id === 'chat-manager-search' ? input : id === 'chat-manager-status' ? status : {} },
         setTimeout: callback => { const id = ++nextTimer; timers.set(id, callback); return id; },
         clearTimeout: id => timers.delete(id),
         onEmbeddingDimensionsInvalidated() {},
         onHydrationUpdate: callback => { hydrationListener = callback; },
         isHydrationComplete: () => complete,
+        getIndex: () => index, hashEmbeddingText: text => text,
+        getQueryEmbeddingKey: query => query, getEmbeddingOption: (_settings, _key, fallback) => fallback,
+        getIndexVersion: () => 1,
+        getEmbeddingSettings: () => ({}),
+        captureEmbeddingOperation: () => ({}),
+        isEmbeddingOperationCurrent: () => true,
+        semantic,
+        queryEmbedding,
         paints,
-        scan: (query, requestId) => new Promise(resolve => requests.push({ query, requestId, resolve })),
+        searchArchivePage: options => {
+            if (scan) {
+                requests.push(options);
+                return scan(options);
+            }
+            const pending = deferred();
+            requests.push({ ...options, ...pending });
+            return pending.promise;
+        },
     });
     vm.runInContext(source, sandbox);
     vm.runInContext(`
         panelOpen = true;
-        shouldUseSemanticSearch = () => true;
+        shouldUseSemanticSearch = () => semantic;
+        getSemanticQueryEmbedding = () => queryEmbedding();
         setSearchModeBadge = () => {};
         renderThreadCards = () => paints.push('cards');
-        performSemanticSearch = async (query, requestId) => {
-            await scan(query, requestId);
-            if (requestId === latestSearchRequestId) paints.push(query);
-        };
+        renderSearchState = (_container, _status, query) => paints.push(query);
         ensureHydrationSubscription();
     `, sandbox);
     return {
-        sandbox, timers, requests, paints, input,
+        sandbox, timers, requests, paints, input, status,
         hydrate(done = complete) { complete = done; hydrationListener(); },
         async runTimers() {
             const callbacks = [...timers.values()];
@@ -46,28 +80,54 @@ function fixture({ complete = true } = {}) {
     };
 }
 
-test('background indexing lets a pending search finish before one coalesced refresh', async () => {
-    const f = fixture();
-    const search = f.start();
-    for (let i = 0; i < 8; i++) {
-        f.hydrate();
-        await f.runTimers();
-        assert.equal(f.requests.length, 1);
-    }
-    f.requests[0].resolve();
-    await search;
+test('a real archive scan checks all 2000 messages while indexing notifications arrive', async () => {
+    const progress = [];
+    const f = fixture({ scan: options => searchArchivePage({
+        ...options,
+        sourceFactory: async function* () {
+            for (let i = 0; i < 2000; i++) yield { text: 'unmatched message', msgIndex: i };
+        },
+        onProgress: count => {
+            options.onProgress(count);
+            progress.push(count);
+            f.hydrate();
+            assert.equal(f.timers.size, 0, 'no restart is queued during the real scan');
+        },
+    }) });
+    await f.start();
+    assert.deepEqual(progress, [250, 500, 750, 1000, 1250, 1500, 1750, 2000]);
+    assert.equal(f.requests.length, 1);
     assert.deepEqual(f.paints, ['needle']);
     assert.equal(f.timers.size, 1);
-    await f.runTimers();
-    assert.equal(f.requests.length, 2);
-    f.requests[1].resolve();
 });
 
-test('indexing batches wait for completion even when no scan is running', async () => {
+test('indexing updates preserve an active scan past 750 and produce one later refresh', async () => {
+    const f = fixture();
+    const search = f.start();
+    const scan = f.requests[0];
+    for (const count of [250, 500, 750, 1000, 1250]) {
+        scan.onProgress(count);
+        f.hydrate();
+        await f.runTimers();
+        assert.equal(scan.signal.aborted, false);
+        assert.equal(f.requests.length, 1);
+        assert.match(f.status.textContent, new RegExp(count.toLocaleString() + ' messages checked'));
+    }
+    scan.resolve(emptyPage);
+    await search;
+    assert.deepEqual(f.paints, ['needle'], 'the original scan publishes results');
+    assert.equal(f.timers.size, 1, 'all updates coalesce after the scan finishes');
+    await f.runTimers();
+    assert.equal(f.requests.length, 2);
+    f.requests[1].resolve(emptyPage);
+    await Promise.resolve();
+});
+
+test('indexing batches wait until indexing is complete even after the scan finishes', async () => {
     const f = fixture({ complete: false });
     const search = f.start();
-    f.hydrate(false);
-    f.requests[0].resolve();
+    for (let i = 0; i < 10; i++) f.hydrate(false);
+    f.requests[0].resolve(emptyPage);
     await search;
     await f.runTimers();
     assert.equal(f.requests.length, 1);
@@ -76,33 +136,45 @@ test('indexing batches wait for completion even when no scan is running', async 
     assert.equal(f.timers.size, 1);
     await f.runTimers();
     assert.equal(f.requests.length, 2);
-    f.requests[1].resolve();
+    f.requests[1].resolve(emptyPage);
 });
 
-test('a new query consumes queued refreshes and supersedes old search work', async () => {
+test('an explicit new search consumes an already queued indexing refresh', async () => {
     const f = fixture();
     f.hydrate();
-    const first = f.start();
+    assert.equal(f.timers.size, 1);
+    const search = f.start('new query');
     await f.runTimers();
     assert.equal(f.requests.length, 1);
+    assert.equal(f.requests[0].signal.aborted, false);
+    f.requests[0].resolve(emptyPage);
+    await search;
+    assert.equal(f.timers.size, 0);
+});
+
+test('a new query cancels the old scan without losing the new scan refresh guard', async () => {
+    const f = fixture();
+    const first = f.start();
     f.hydrate();
-    const second = f.start('changed query');
+    const second = f.start('new query');
+    assert.equal(f.requests[0].signal.aborted, true);
     f.hydrate();
-    f.requests[0].resolve();
+    f.requests[0].resolve(emptyPage);
     await first;
     await f.runTimers();
-    assert.equal(f.requests.length, 2, 'an old completion cannot release the new scan guard');
+    assert.equal(f.requests.length, 2);
+    assert.equal(f.requests[1].signal.aborted, false);
     assert.deepEqual(f.paints, []);
-    f.requests[1].resolve();
+    f.requests[1].resolve(emptyPage);
     await second;
-    assert.deepEqual(f.paints, ['changed query']);
+    assert.deepEqual(f.paints, ['new query']);
     await f.runTimers();
-    assert.equal(f.requests[2].query, 'changed query');
-    f.requests[2].resolve();
+    assert.equal(f.requests[2].query, 'new query');
+    f.requests[2].resolve(emptyPage);
 });
 
 for (const transition of ['reset', 'clear query', 'close', 'alternate view']) {
-    test(`queued indexing work cannot revive search after ${transition}`, async () => {
+    test(`deferred indexing refresh cannot revive search after ${transition}`, async () => {
         const f = fixture();
         const search = f.start();
         f.hydrate();
@@ -112,7 +184,8 @@ for (const transition of ['reset', 'clear query', 'close', 'alternate view']) {
             if (transition === 'close') vm.runInContext('panelOpen = false;', f.sandbox);
             if (transition === 'alternate view') vm.runInContext('timelineActive = true;', f.sandbox);
         }
-        f.requests[0].resolve();
+        assert.equal(f.requests[0].signal.aborted, true);
+        f.requests[0].resolve(emptyPage);
         await search;
         await f.runTimers();
         assert.equal(f.requests.length, 1);
@@ -120,11 +193,73 @@ for (const transition of ['reset', 'clear query', 'close', 'alternate view']) {
     });
 }
 
-test('an already scheduled refresh respects a view switch before its timer fires', async () => {
+test('queued refresh respects a view change before its timer fires', async () => {
     const f = fixture();
     f.hydrate();
     vm.runInContext('statsActive = true;', f.sandbox);
     await f.runTimers();
     assert.equal(f.requests.length, 0);
+});
+
+test('a failed scan releases the guard so a deferred refresh can retry', async () => {
+    const f = fixture();
+    const search = f.start();
+    f.hydrate();
+    f.requests[0].reject(new Error('Synthetic archive failure'));
+    await search;
+    assert.match(f.status.textContent, /could not finish/);
+    await f.runTimers();
+    assert.equal(f.requests.length, 2);
+    f.requests[1].resolve(emptyPage);
+});
+
+test('background indexing also waits for an in-flight results page', async () => {
+    const f = fixture();
+    const search = f.start();
+    f.requests[0].resolve({ ...emptyPage, hasMore: true });
+    await search;
+    const requestId = vm.runInContext('latestSearchRequestId', f.sandbox);
+    const page = f.sandbox.performArchiveSearch('needle', requestId, 'keyword', 1);
+    f.hydrate();
+    await f.runTimers();
+    assert.equal(f.requests.length, 2);
+    assert.equal(f.requests[1].signal.aborted, false);
+    f.requests[1].resolve(emptyPage);
+    await page;
+    assert.equal(vm.runInContext('searchState.pageIndex', f.sandbox), 1);
+    assert.equal(f.timers.size, 1);
+});
+
+test('semantic query embedding remains in flight through indexing updates', async () => {
+    const embedding = deferred();
+    const f = fixture({ semantic: true, queryEmbedding: () => embedding.promise });
+    const search = f.start();
+    f.hydrate();
+    await f.runTimers();
+    assert.equal(f.requests.length, 0, 'no duplicate embedding or archive request starts');
+    embedding.resolve([1]);
+    await until(() => f.requests.length === 1);
+    assert.equal(f.requests.length, 1);
+    f.requests[0].resolve(emptyPage);
+    await search;
+    assert.deepEqual(f.paints, ['needle']);
+    assert.equal(f.timers.size, 1);
+});
+
+test('empty semantic search falls back without a refresh interrupting the keyword scan', async () => {
+    const f = fixture({ semantic: true });
+    const search = f.start();
+    await until(() => f.requests.length === 1);
+    f.hydrate();
+    f.requests[0].resolve({ ...emptyPage, scanned: 0 });
+    await until(() => f.requests.length === 2);
+    assert.equal(f.requests[1].mode, 'keyword');
+    await f.runTimers();
+    assert.equal(f.requests.length, 2);
+    assert.equal(f.requests[1].signal.aborted, false);
+    f.requests[1].resolve(emptyPage);
+    await search;
+    assert.deepEqual(f.paints, ['needle']);
+    assert.equal(f.timers.size, 1);
 });
 

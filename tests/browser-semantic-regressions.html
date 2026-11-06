@@ -35,12 +35,13 @@ const results=document.getElementById('results'), map=document.getElementById('m
 const pause=ms=>new Promise(resolve=>setTimeout(resolve,ms));
 function assert(value,label){if(!value)throw Error(label);results.textContent+=`PASS ${label}\n`;}
 function seed(){
-    const entry={isLoaded:true,messages:[{index:0,text:'opposed vector',role:'assistant',swipeId:0}],messageEmbeddings:new Map()};
+    const entry={fileName:'fixture.jsonl',isLoaded:true,messages:[{index:0,text:'opposed vector',role:'assistant',swipeId:0}],messageEmbeddings:new Map()};
     setMessageEmbedding(entry,0,0,[-1,0]);getIndex()['fixture.jsonl']=entry;
 }
 function wheel(canvas){const event=new WheelEvent('wheel',{deltaY:100,clientX:100,clientY:100,cancelable:true});canvas.dispatchEvent(event);return event.defaultPrevented;}
 document.getElementById('run').onclick=async()=>{
     const NativeWorker=window.Worker, originalFetch=window.fetch, errors=[];
+    let releaseQuery = null;
     const capture=event=>{errors.push(event.error||event.message);event.preventDefault();};
     results.textContent='';document.getElementById('run').disabled=true;
     window.addEventListener('error',capture);
@@ -49,31 +50,23 @@ document.getElementById('run').onclick=async()=>{
         window.fetch=async(url,options)=>{
             if(!String(url).startsWith('http://synthetic.invalid/'))throw Error(`Unexpected network request: ${url}`);
             const body=JSON.parse(options.body),inputs=Array.isArray(body.input)?body.input:[body.input];
+            if(inputs.includes('synthetic query')) await new Promise(resolve=>{releaseQuery=resolve;});
             return {ok:true,text:async()=>JSON.stringify({embeddings:inputs.map(()=>[1,0])})};
         };
-        class DeferredWorker{
-            constructor(){this.sent=[];DeferredWorker.last=this;}
-            postMessage(message){this.sent.push(message);}
-            terminate(){}
-            deliver(message){this.onmessage({data:message});}
-        }
-        window.Worker=DeferredWorker;
         await mountSemanticMap(map);await mountGraphView(graph);
         const pixelWidth = Math.round(600 * (window.devicePixelRatio || 1));
         assert(map.querySelector('canvas').width===pixelWidth&&graph.querySelector('canvas').width===pixelWidth,'empty mounts size real canvases');
         assert(wheel(map.querySelector('canvas'))&&wheel(graph.querySelector('canvas')),'empty mounts bind wheel controls');
         seed();await updateSemanticMapData();updateGraphViewData();
-        const worker=DeferredWorker.last,build=worker.sent.find(message=>message.type==='buildMapData');
-        worker.deliver({type:'mapDataReady',jobId:build.jobId,points2dBuffer:new Float32Array([0,0]).buffer,
-            labelsBuffer:new Uint16Array([0]).buffer,centroids2dBuffer:new Float32Array([0,0]).buffer,
-            clusterSizesBuffer:new Uint32Array([1]).buffer,bounds:{minX:-1,maxX:1,minY:-1,maxY:1}});
+        for(let i=0;i<200&&!map.querySelector('.chat-manager-semantic-map-info').textContent.startsWith('1 points');i++)await pause(10);
+        assert(map.querySelector('.chat-manager-semantic-map-info').textContent.includes('1'), 'streamed worker projection builds the synthetic point');
         const query=map.querySelector('.chat-manager-semantic-map-query');query.value='synthetic query';
         [...map.querySelectorAll('button')].find(button=>button.textContent==='Search').click();
-        for(let i=0;i<100&&!worker.sent.some(message=>message.type==='scoreQuery');i++)await pause(10);
-        const score=worker.sent.find(message=>message.type==='scoreQuery');assert(score,'query submits mocked worker score');
+        for(let i=0;i<100&&!releaseQuery;i++)await pause(10);
+        assert(releaseQuery,'query starts a mocked embedding request');
         [...map.querySelectorAll('button')].find(button=>button.textContent==='Clear').click();
-        worker.deliver({type:'queryScoresReady',jobId:score.jobId,scoresBuffer:new Float32Array([1]).buffer,min:1,max:1});
-        assert(!map.querySelector('.chat-manager-semantic-map-info').textContent.startsWith('Scored'),'Clear rejects late score response');
+        releaseQuery();await pause(30);
+        assert(!map.querySelector('.chat-manager-semantic-map-info').textContent.startsWith('Scored'),'Clear rejects a late semantic query completion');
         const pinQuery=graph.querySelector('.chat-manager-graph-view-query');pinQuery.value='synthetic anchor';
         graph.querySelector('.chat-manager-graph-view-btn').click();
         for(let i=0;i<100&&!graph.querySelector('.chat-manager-graph-view-info').textContent.includes('1 pin');i++)await pause(10);

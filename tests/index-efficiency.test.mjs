@@ -12,6 +12,8 @@ function nextReadStarted() {
 }
 
 function releaseHeldReads() {
+    // Release this cache operation, including follow-up metadata/body transactions.
+    holdReadTransactions = false;
     const releases = heldReadTransactions;
     heldReadTransactions = [];
     for (const release of releases) release();

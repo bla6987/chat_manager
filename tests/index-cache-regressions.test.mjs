@@ -256,8 +256,8 @@ test('background hydration prioritizes requested files and bounds concurrent cha
     await reader.buildIndex();
     reader.prioritizeHydrationFiles(['chat20.jsonl', 'chat19.jsonl', 'chat20.jsonl']);
     await new Promise(resolve => setTimeout(resolve, 20));
-    assert.deepEqual(started.slice(0, 3), ['chat20.jsonl', 'chat19.jsonl', 'chat24.jsonl']);
-    assert.equal(peak, 6, 'large archives do not launch fifty concurrent parses');
+    assert.deepEqual(started.slice(0, 2), ['chat20.jsonl', 'chat19.jsonl']);
+    assert.equal(peak, 2, 'large archive bodies are parsed at most two at a time');
     reader.clearIndex(); release.forEach(resolve => resolve());
     await new Promise(resolve => setImmediate(resolve));
 });

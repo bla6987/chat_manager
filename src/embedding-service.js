@@ -2,6 +2,8 @@
  * Embedding Service — API dispatch, batching, cache, and settings glue.
  */
 
+import { isVector, toFloat32Vector, vectorByteLength } from './vector-utils.js';
+
 const MODULE_NAME = 'chat_manager';
 const CACHE_DB_NAME = 'ChatManager_Embeddings';
 const CACHE_META_KEY = '__cache_meta__';
@@ -131,6 +133,14 @@ export function isEmbeddingOperationCurrent(operation) {
 
 function assertEmbeddingOperationCurrent(operation) {
     if (!isEmbeddingOperationCurrent(operation)) throw new StaleEmbeddingOperationError();
+}
+
+function throwIfAborted(signal) {
+    if (!signal?.aborted) return;
+    if (typeof signal.throwIfAborted === 'function') signal.throwIfAborted();
+    const error = new Error('Embedding operation aborted.');
+    error.name = 'AbortError';
+    throw error;
 }
 
 // A clear waits for writes already issued to IndexedDB. Epoch checks alone cannot
@@ -347,7 +357,7 @@ function sleep(ms) {
  * @returns {number}
  */
 function getVectorDimensions(value) {
-    return Array.isArray(value) ? value.length : 0;
+    return isVector(value) ? value.length : 0;
 }
 
 /**
@@ -355,15 +365,7 @@ function getVectorDimensions(value) {
  * @returns {number[]}
  */
 function validateVector(vector) {
-    if (!Array.isArray(vector) || vector.length === 0) {
-        throw new Error('Embedding API returned an empty/invalid vector.');
-    }
-    for (let i = 0; i < vector.length; i++) {
-        if (!Number.isFinite(vector[i])) {
-            throw new Error('Embedding API returned non-numeric vector values.');
-        }
-    }
-    return vector;
+    return toFloat32Vector(vector);
 }
 
 /**
@@ -385,7 +387,7 @@ function extractErrorMessage(payload) {
  * @param {Object<string, string>} [extraHeaders]
  * @returns {Promise<any>}
  */
-async function postJson(url, body, extraHeaders = {}) {
+async function postJson(url, body, extraHeaders = {}, signal = undefined) {
     const response = await fetch(url, {
         method: 'POST',
         headers: {
@@ -393,6 +395,7 @@ async function postJson(url, body, extraHeaders = {}) {
             ...extraHeaders,
         },
         body: JSON.stringify(body),
+        signal,
     });
 
     const raw = await response.text();
@@ -421,7 +424,7 @@ async function postJson(url, body, extraHeaders = {}) {
  * @param {string[]} texts
  * @returns {Promise<number[][]>}
  */
-async function embedOpenAICompatible(provider, settings, texts) {
+async function embedOpenAICompatible(provider, settings, texts, signal) {
     const endpoint = OPENAI_COMPAT_ENDPOINTS[provider];
     const payload = await postJson(
         endpoint,
@@ -432,6 +435,7 @@ async function embedOpenAICompatible(provider, settings, texts) {
         {
             Authorization: `Bearer ${settings.apiKey}`,
         },
+        signal,
     );
 
     if (!Array.isArray(payload?.data)) {
@@ -455,12 +459,12 @@ async function embedOpenAICompatible(provider, settings, texts) {
  * @param {string} text
  * @returns {Promise<number[]>}
  */
-async function embedOllamaSingle(settings, text) {
+async function embedOllamaSingle(settings, text, signal) {
     const baseUrl = settings.ollamaUrl.replace(/\/+$/, '');
     const payload = await postJson(`${baseUrl}/api/embeddings`, {
         model: settings.model,
         prompt: text,
-    });
+    }, {}, signal);
     return validateVector(payload?.embedding);
 }
 
@@ -482,12 +486,12 @@ function isTransientEmbeddingRequestError(error) {
  * @param {string[]} texts
  * @returns {Promise<number[][]>}
  */
-async function embedOllamaBatch(settings, texts) {
+async function embedOllamaBatch(settings, texts, signal) {
     const baseUrl = settings.ollamaUrl.replace(/\/+$/, '');
     const payload = await postJson(`${baseUrl}/api/embed`, {
         model: settings.model,
         input: texts,
-    });
+    }, {}, signal);
     if (!Array.isArray(payload?.embeddings) || payload.embeddings.length !== texts.length) {
         throw new Error(`Ollama /api/embed returned ${payload?.embeddings?.length ?? 0} vectors for ${texts.length} texts.`);
     }
@@ -539,10 +543,13 @@ function isUsableCacheEntry(cachedValue, settings, expectedDims, text) {
     if (cachedValue.recipeKey !== getEmbeddingRecipeKey(settings)) return false;
     // Require exact text match to prevent accidental hash collision reuse.
     if (typeof cachedValue.text !== 'string' || cachedValue.text !== text) return false;
-    if (!Array.isArray(cachedValue.vector) || cachedValue.vector.length === 0) return false;
+    if (!isVector(cachedValue.vector)) return false;
     if (!Number.isInteger(cachedValue.dims) || cachedValue.dims <= 0) return false;
     if (cachedValue.dims !== cachedValue.vector.length) return false;
     if (expectedDims != null && cachedValue.dims !== expectedDims) return false;
+    for (const value of cachedValue.vector) {
+        if (!Number.isFinite(value) || !Number.isFinite(Math.fround(value))) return false;
+    }
     return true;
 }
 
@@ -567,7 +574,7 @@ export async function getCachedEmbeddingForText(text) {
     if (!isUsableCacheEntry(cached, settings, expectedDims, normalizedText)) {
         return null;
     }
-    return cached.vector;
+    return toFloat32Vector(cached.vector);
 }
 
 /**
@@ -609,7 +616,7 @@ export async function getCachedEmbeddingsForTexts(texts) {
     });
     await cacheMutationTail;
     const vectors = await batchCacheGet(cache, items, 50, (value, item) =>
-        isUsableCacheEntry(value, settings, expectedDims, item.text) ? value.vector : null,
+        isUsableCacheEntry(value, settings, expectedDims, item.text) ? toFloat32Vector(value.vector) : null,
     );
     assertEmbeddingOperationCurrent(operation);
     return vectors;
@@ -621,7 +628,8 @@ export async function getCachedEmbeddingsForTexts(texts) {
  * @param {{ level?: 'chat'|'message'|'query', onProgress?: (completed:number, total:number)=>void }} [options]
  * @returns {Promise<number[][]>}
  */
-export async function embedTexts(texts, options = {}) {
+async function embedTextBatch(texts, options, operation, dimensionState) {
+    throwIfAborted(options.signal);
     if (!Array.isArray(texts)) {
         throw new Error('embedTexts(texts) expects an array of strings.');
     }
@@ -630,7 +638,6 @@ export async function embedTexts(texts, options = {}) {
     const total = normalizedTexts.length;
     if (total === 0) return [];
 
-    const operation = captureEmbeddingOperation();
     const settings = operation.settings;
     if (!isEmbeddingConfigured()) {
         throw new Error('Embeddings are not configured. Set provider/model (and API key for cloud providers).');
@@ -649,6 +656,7 @@ export async function embedTexts(texts, options = {}) {
     // Recipe namespaces make old model/server caches harmless. Settings UI owns
     // any user-requested clearing; generating never clears another recipe.
     await cacheMutationTail;
+    throwIfAborted(options.signal);
     assertEmbeddingOperationCurrent(operation);
 
     const vectors = new Array(total);
@@ -670,21 +678,18 @@ export async function embedTexts(texts, options = {}) {
 
     /** @type {{hash:string, text:string, indices:number[]}[]} */
     const pending = [];
-    const dimensionState = {
-        expected: Number.isInteger(settings.dimensions) && settings.dimensions > 0 ? settings.dimensions : null,
-        observed: null,
-    };
-
     const uniqueItems = [...uniqueByText.values()];
     const cachedValues = await batchCacheGet(cache, uniqueItems);
+    throwIfAborted(options.signal);
     assertEmbeddingOperationCurrent(operation);
     for (let ci = 0; ci < uniqueItems.length; ci++) {
         const item = uniqueItems[ci];
         const cached = cachedValues[ci];
         if (isUsableCacheEntry(cached, settings, dimensionState.expected, item.text)) {
             updateDimensionState(cached.dims, dimensionState);
+            const vector = toFloat32Vector(cached.vector);
             for (const idx of item.indices) {
-                vectors[idx] = cached.vector;
+                vectors[idx] = vector;
             }
             completed += item.indices.length;
         } else {
@@ -696,9 +701,11 @@ export async function embedTexts(texts, options = {}) {
     try {
         const batchSize = provider === 'ollama' ? OLLAMA_BATCH_SIZE : BATCH_SIZE;
         for (let i = 0; i < pending.length; i += batchSize) {
+            throwIfAborted(options.signal);
             assertEmbeddingOperationCurrent(operation);
             const batch = pending.slice(i, i + batchSize);
             await sleep(0);
+            throwIfAborted(options.signal);
             assertEmbeddingOperationCurrent(operation);
             let batchVectors;
             if (provider === 'ollama') {
@@ -706,7 +713,7 @@ export async function embedTexts(texts, options = {}) {
                 if (!unsupportedOllamaBatchEndpoints.has(endpoint)) {
                     for (let attempt = 0; attempt < 2; attempt++) {
                         try {
-                            batchVectors = await embedOllamaBatch(settings, batch.map(item => item.text));
+                            batchVectors = await embedOllamaBatch(settings, batch.map(item => item.text), options.signal);
                             break;
                         } catch (error) {
                             assertEmbeddingOperationCurrent(operation);
@@ -716,6 +723,7 @@ export async function embedTexts(texts, options = {}) {
                             }
                             if (attempt > 0 || !isTransientEmbeddingRequestError(error)) throw error;
                             await sleep(150);
+                            throwIfAborted(options.signal);
                             assertEmbeddingOperationCurrent(operation);
                         }
                     }
@@ -723,19 +731,22 @@ export async function embedTexts(texts, options = {}) {
                 if (!batchVectors) {
                     batchVectors = [];
                     for (const item of batch) {
+                        throwIfAborted(options.signal);
                         assertEmbeddingOperationCurrent(operation);
-                        batchVectors.push(await embedOllamaSingle(settings, item.text));
+                        batchVectors.push(await embedOllamaSingle(settings, item.text, options.signal));
                     }
                 }
             } else {
-                batchVectors = await embedOpenAICompatible(provider, settings, batch.map(item => item.text));
+                batchVectors = await embedOpenAICompatible(provider, settings, batch.map(item => item.text), options.signal);
             }
+            throwIfAborted(options.signal);
             assertEmbeddingOperationCurrent(operation);
             // Validate the entire batch before scheduling any persistent writes.
             for (const vector of batchVectors) {
                 updateDimensionState(getVectorDimensions(vector), dimensionState);
             }
             await mutateEmbeddingCache(async () => {
+                throwIfAborted(options.signal);
                 assertEmbeddingOperationCurrent(operation);
                 const writes = await Promise.allSettled(batch.map((item, j) => cache.setItem(item.hash, {
                     vector: batchVectors[j],
@@ -775,6 +786,7 @@ export async function embedTexts(texts, options = {}) {
         throw error;
     }
 
+    throwIfAborted(options.signal);
     assertEmbeddingOperationCurrent(operation);
     const finalDims = dimensionState.expected ?? dimensionState.observed;
     const current = ensureEmbeddingSettings();
@@ -784,6 +796,7 @@ export async function embedTexts(texts, options = {}) {
     }
 
     await mutateEmbeddingCache(() => {
+        throwIfAborted(options.signal);
         assertEmbeddingOperationCurrent(operation);
         return cache.setItem(CACHE_META_KEY, {
             provider,
@@ -794,7 +807,103 @@ export async function embedTexts(texts, options = {}) {
     });
     assertEmbeddingOperationCurrent(operation);
 
-    return /** @type {number[][]} */ (vectors);
+    return /** @type {Float32Array[]} */ (vectors);
+}
+
+/**
+ * Process an iterable without retaining the whole job. A batch is persisted
+ * before it is yielded, and consumer back-pressure keeps only one batch live.
+ * maxBatchChars is a soft text bound: a single larger input runs alone rather
+ * than being truncated. maxBatchVectorBytes budgets known Float32 dimensions.
+ *
+ * @param {Iterable<string>|AsyncIterable<string>} texts
+ * @param {{level:'chat'|'message'|'query', batchSize?:number, maxBatchChars?:number,
+ *   maxBatchVectorBytes?:number, signal?:AbortSignal,
+ *   onProgress?:(completed:number,total:number|null)=>void}} options
+ */
+export async function* iterateEmbeddingBatches(texts, options = {}) {
+    if (!texts || typeof texts === 'string'
+        || (!texts[Symbol.iterator] && !texts[Symbol.asyncIterator])) {
+        throw new TypeError('Embedding inputs must be an iterable of strings.');
+    }
+    if (!isValidEmbeddingLevel(options.level)) {
+        throw new Error('embedTexts requires options.level to be one of: chat, message, query.');
+    }
+    const operation = captureEmbeddingOperation();
+    const settings = operation.settings;
+    const providerLimit = settings.provider === 'ollama' ? OLLAMA_BATCH_SIZE : BATCH_SIZE;
+    const batchLimit = Math.max(1, Math.min(providerLimit, Math.floor(Number(options.batchSize) || providerLimit)));
+    const maxChars = Math.max(1, Math.floor(Number(options.maxBatchChars) || 262144));
+    const maxVectorBytes = Math.max(4, Math.floor(Number(options.maxBatchVectorBytes) || (8 * 1024 * 1024)));
+    const total = Array.isArray(texts) ? texts.length : null;
+    const dimensionState = {
+        expected: Number.isInteger(settings.dimensions) && settings.dimensions > 0 ? settings.dimensions : null,
+        observed: null,
+    };
+    let offset = 0;
+    let batch = [];
+    let characters = 0;
+    notifyProgress(0, total, options.onProgress);
+
+    const processBatch = async (input, batchOffset) => {
+        throwIfAborted(options.signal);
+        assertEmbeddingOperationCurrent(operation);
+        const vectors = await embedTextBatch(input, {
+            ...options,
+            onProgress: completed => notifyProgress(batchOffset + completed, total, options.onProgress),
+        }, operation, dimensionState);
+        throwIfAborted(options.signal);
+        assertEmbeddingOperationCurrent(operation);
+        return { offset: batchOffset, texts: input, vectors };
+    };
+
+    for await (const input of texts) {
+        throwIfAborted(options.signal);
+        assertEmbeddingOperationCurrent(operation);
+        const text = String(input ?? '');
+        if (batch.length && characters + text.length > maxChars) {
+            yield await processBatch(batch, offset);
+            offset += batch.length;
+            batch = [];
+            characters = 0;
+        }
+        batch.push(text);
+        characters += text.length;
+        const dimensions = dimensionState.observed || dimensionState.expected || 0;
+        const vectorLimit = dimensions ? Math.max(1, Math.floor(maxVectorBytes / (dimensions * 4))) : batchLimit;
+        if (batch.length >= Math.min(batchLimit, vectorLimit) || characters >= maxChars) {
+            yield await processBatch(batch, offset);
+            offset += batch.length;
+            batch = [];
+            characters = 0;
+        }
+    }
+    if (batch.length) {
+        yield await processBatch(batch, offset);
+        offset += batch.length;
+    }
+    notifyProgress(offset, total ?? offset, options.onProgress);
+}
+
+/** Callback convenience for callers that persist/attach each batch immediately. */
+export async function embedTextsBatched(texts, options = {}) {
+    let count = 0;
+    let dimensions = null;
+    for await (const batch of iterateEmbeddingBatches(texts, options)) {
+        count += batch.vectors.length;
+        dimensions = batch.vectors[0]?.length || dimensions;
+        if (typeof options.onBatch === 'function') await options.onBatch(batch);
+    }
+    return { count, dimensions };
+}
+
+/** Legacy all-results API. Large callers should consume iterateEmbeddingBatches. */
+export async function embedTexts(texts, options = {}) {
+    if (!Array.isArray(texts)) throw new TypeError('embedTexts(texts) expects an array of strings.');
+    if (texts.length === 0) return [];
+    const vectors = [];
+    for await (const batch of iterateEmbeddingBatches(texts, options)) vectors.push(...batch.vectors);
+    return vectors;
 }
 
 /**
@@ -868,9 +977,12 @@ export async function getCacheStats() {
 
     await cache.iterate((value, key) => {
         if (key === CACHE_META_KEY) return;
-        if (value && typeof value === 'object' && Array.isArray(value.vector)) {
+        if (value && typeof value === 'object' && isVector(value.vector)) {
             count += 1;
-            estimatedBytes += (value.vector.length * 4) + (value.model ? value.model.length * 2 : 0) + 32;
+            estimatedBytes += vectorByteLength(value.vector)
+                + (value.model ? value.model.length * 2 : 0)
+                + (value.text ? value.text.length * 2 : 0)
+                + (value.recipeKey ? value.recipeKey.length * 2 : 0) + 64;
             return;
         }
         // Fallback rough JSON estimate for unknown values.

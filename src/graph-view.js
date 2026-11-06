@@ -12,6 +12,9 @@
 
 import { getIndex, getMessageEmbedding, getMessageActiveSwipeIndex } from './chat-reader.js';
 import { embedText, isEmbeddingConfigured, getEmbeddingRecipeKey } from './embedding-service.js';
+import { isVector } from './vector-utils.js';
+import { iterateCachedMessageVectors } from './archive-data.js';
+import { messagePreview } from './message-descriptors.js';
 import { clusterColor, cosineSimilarity } from './semantic-engine.js';
 import { getDisplayName, getEmbeddingSettings } from './metadata-store.js';
 import { selectTopStable } from './view-efficiency-utils.js';
@@ -66,6 +69,9 @@ let sliderEl = null;
 let sliderLabelEl = null;
 let emptyEl = null;
 let loadingEl = null;
+let contextMenuEl = null;
+let contextMenuDismiss = null;
+let contextMenuTimer = null;
 
 let dpr = 1;
 let canvasWidth = 0;
@@ -93,6 +99,9 @@ let lastCollectScopeActive = false;
 let messageRefs = [];     // { fileName, displayName, msgIndex, swipeIndex, isActiveSwipe, role, timestamp, text }
 let messageVectors = [];  // number[][] — parallel to messageRefs
 let messageDims = 0;
+let availableMessageCount = 0;
+let archiveGraphController = null;
+let archiveGraphEpoch = 0;
 let messageNorms = [];    // precomputed L2 norms
 
 /* ── Pin State ── */
@@ -207,6 +216,10 @@ export async function mountGraphView(containerEl) {
     resizeCanvas();
     showLoading('Preparing graph view…');
 
+    if (typeof iterateCachedMessageVectors === 'function') {
+        void refreshStreamedGraph();
+        return;
+    }
     collectMessageVectors();
 
     if (messageRefs.length === 0) {
@@ -218,12 +231,18 @@ export async function mountGraphView(containerEl) {
 
     hideLoading();
     mounted = true;
-    setInfo(`${messageRefs.length.toLocaleString()} messages available · Pin a search term to begin`);
+    setInfo(`${(typeof iterateCachedMessageVectors === 'function' ? availableMessageCount : messageRefs.length).toLocaleString()} messages available · Pin a search term to begin`);
 
     queueRender();
 }
 
 export function unmountGraphView() {
+    mounted = false;
+    archiveGraphController?.abort();
+    archiveGraphController = null;
+    archiveGraphEpoch++;
+    availableMessageCount = 0;
+    closeNodeContextMenu();
     pinEpoch += 1;
     pendingTermPins.clear();
     if (rafId) {
@@ -237,7 +256,7 @@ export function unmountGraphView() {
     unbindResizeObserver();
 
     if (overlayEl) { overlayEl.remove(); overlayEl = null; }
-    if (canvas) { canvas.remove(); canvas = null; }
+    if (canvas) { canvas.width = 0; canvas.height = 0; canvas.remove(); canvas = null; }
     ctx = null;
 
     container = null;
@@ -263,6 +282,10 @@ export function unmountGraphView() {
     hoveredNodeIndex = -1;
     selectedNodeIndex = -1;
     tooltipVisible = false;
+    interaction.mode = null;
+    interaction.dragNodeIndex = -1;
+    interaction.moved = false;
+    embeddingRecipeKey = null;
 
     camera.x = 0;
     camera.y = 0;
@@ -276,6 +299,9 @@ export function unmountGraphView() {
 export function updateGraphViewData() {
     if (!mounted || !container) return;
     synchronizeEmbeddingRecipe();
+    if (typeof iterateCachedMessageVectors === 'function') {
+        return refreshStreamedGraph();
+    }
     const prevRefs = messageRefs;
     const prevVectors = messageVectors;
     const prevNorms = messageNorms;
@@ -316,6 +342,10 @@ export function updateGraphViewData() {
 
 /** Clear all retained vectors, including hydration fallbacks and term pins. */
 export function invalidateGraphEmbeddings() {
+    archiveGraphController?.abort();
+    archiveGraphController = null;
+    archiveGraphEpoch++;
+    availableMessageCount = 0;
     embeddingRecipeKey = getEmbeddingRecipeKey(getEmbeddingSettings());
     messageRefs = [];
     messageVectors = [];
@@ -334,6 +364,7 @@ function synchronizeEmbeddingRecipe() {
 }
 
 function clearGraphDataState() {
+    closeNodeContextMenu();
     pinEpoch += 1;
     pendingTermPins.clear();
     pins = [];
@@ -375,19 +406,20 @@ function collectMessageVectors() {
         }
 
         const displayName = getDisplayName(fileName) || fileName;
-        for (const msg of entry.messages || []) {
+        for (const msg of entry.messageDescriptors || entry.messages || []) {
             const activeSwipeIndex = getMessageActiveSwipeIndex(msg);
             const variants = [{
                 swipeIndex: activeSwipeIndex,
-                text: typeof msg.text === 'string' ? msg.text : '',
+                text: messagePreview(msg.preview ?? msg.text ?? '', 160),
                 isActiveSwipe: true,
             }];
 
-            if (showAlternateSwipes && Array.isArray(msg.swipes) && msg.swipes.length > 0) {
-                const limit = Math.min(msg.swipes.length, maxSwipesPerMessage);
+            const swipeCount = msg.swipeCount ?? msg.swipes?.length ?? 0;
+            if (showAlternateSwipes && swipeCount > 0) {
+                const limit = Math.min(swipeCount, maxSwipesPerMessage);
                 for (let swipeIndex = 0; swipeIndex < limit; swipeIndex++) {
                     if (swipeIndex === activeSwipeIndex) continue;
-                    const swipeText = typeof msg.swipes[swipeIndex] === 'string' ? msg.swipes[swipeIndex] : '';
+                    const swipeText = messagePreview(msg.swipePreviews?.[swipeIndex] ?? msg.swipes?.[swipeIndex] ?? '', 160);
                     if (!swipeText.trim()) continue;
                     variants.push({
                         swipeIndex,
@@ -399,7 +431,7 @@ function collectMessageVectors() {
 
             for (const variant of variants) {
                 const vec = getMessageEmbedding(entry, msg, variant.swipeIndex);
-                if (!Array.isArray(vec) || vec.length === 0) continue;
+                if (!isVector(vec) || vec.length === 0) continue;
 
                 if (!detectedDims) detectedDims = vec.length;
                 if (vec.length !== detectedDims) continue;
@@ -431,8 +463,99 @@ function collectMessageVectors() {
     messageDims = detectedDims;
 }
 
+function compactGraphRecord(record) {
+    return { fileName: record.fileName, displayName: getDisplayName(record.fileName) || record.fileName,
+        msgIndex: record.msgIndex, swipeIndex: record.swipeIndex, isActiveSwipe: record.isActive !== false,
+        role: record.role, timestamp: record.timestamp || '', text: messagePreview(record.preview ?? record.text ?? '', 160) };
+}
+
+/** Keep only top neighbors and pinned vectors; score the complete persisted archive in bounded batches. */
+async function refreshStreamedGraph() {
+    if (!mounted) return;
+    archiveGraphController?.abort();
+    const controller = new AbortController();
+    archiveGraphController = controller;
+    const epoch = ++archiveGraphEpoch;
+    const stillCurrent = () => mounted && !controller.signal.aborted && epoch === archiveGraphEpoch;
+    const settings = getEmbeddingSettings();
+    const scope = graphScopeProvider ? graphScopeProvider() : null;
+    lastCollectScopeActive = scope !== null;
+    const mode = settings.includeAlternateSwipes === true && settings.showAlternateSwipesInResults === true ? 'all' : 'active';
+    const options = { signal: controller.signal, settings, mode, ...(scope ? { fileNames: [...scope] } : {}) };
+    const requestedPins = [...pins];
+    const pinnedRecords = new Map();
+    try {
+        showLoading('Reading semantic archive…');
+        const messagePins = requestedPins.filter(pin => pin.kind === 'message');
+        if (messagePins.length) {
+            const keys = new Set(messagePins.map(pin => pin.messageKey));
+            const fileNames = [...new Set(messagePins.map(pin => JSON.parse(pin.messageKey)[0]))]
+                .filter(fileName => !scope || scope.has(fileName));
+            for await (const record of iterateCachedMessageVectors({ ...options, fileNames })) {
+                if (!stillCurrent()) return;
+                const key = JSON.stringify([record.fileName, record.msgIndex, record.swipeIndex]);
+                if (keys.has(key)) pinnedRecords.set(key, { ref: compactGraphRecord(record), vector: record.vector, norm: vectorNorm(record.vector) });
+            }
+        }
+        const livePins = requestedPins.filter(pin => pin.kind !== 'message' || pinnedRecords.has(pin.messageKey));
+        for (const pin of livePins) {
+            if (pin.kind !== 'message') continue;
+            const source = pinnedRecords.get(pin.messageKey);
+            pin.vector = source.vector; pin.vectorNorm = source.norm;
+        }
+        const buckets = livePins.map(() => []);
+        let total = 0, detectedDims = 0;
+        for await (const record of iterateCachedMessageVectors(options)) {
+            if (!stillCurrent()) return;
+            const vector = record.vector;
+            if (!isVector(vector) || !vector.length) continue;
+            if (!detectedDims) detectedDims = vector.length;
+            if (vector.length !== detectedDims) continue;
+            total++;
+            const key = JSON.stringify([record.fileName, record.msgIndex, record.swipeIndex]);
+            if (pinnedRecords.has(key)) continue;
+            const norm = vectorNorm(vector);
+            let bestPin = -1, bestSim = -Infinity;
+            for (let p = 0; p < livePins.length; p++) {
+                const pin = livePins[p];
+                if (!isVector(pin.vector) || pin.vector.length !== detectedDims) continue;
+                const score = fastCosineSim(pin.vector, vector, norm, pin.vectorNorm);
+                if (score > bestSim) { bestSim = score; bestPin = p; }
+            }
+            if (bestPin < 0) continue;
+            const bucket = buckets[bestPin];
+            if (bucket.length >= neighborsPerPin && bestSim <= bucket[bucket.length - 1].similarity) continue;
+            let position = bucket.length;
+            while (position > 0 && bucket[position - 1].similarity < bestSim) position--;
+            bucket.splice(position, 0, { ref: compactGraphRecord(record), vector, norm, similarity: bestSim });
+            if (bucket.length > neighborsPerPin) bucket.pop();
+        }
+        if (!stillCurrent()) return;
+        const kept = [...pinnedRecords.values()];
+        for (const bucket of buckets) for (const candidate of bucket) kept.push(candidate);
+        pins = livePins;
+        availableMessageCount = total;
+        messageDims = detectedDims;
+        messageRefs = kept.map(candidate => candidate.ref);
+        messageVectors = kept.map(candidate => candidate.vector);
+        messageNorms = kept.map(candidate => candidate.norm);
+        buildSimulationFromCandidates();
+        hideLoading();
+        if (!total) showEmpty(scope ? 'No threads with message embeddings match the current filter.' : 'No message embeddings found. Generate message embeddings first.');
+        else hideEmpty();
+        updatePinInfo();
+        queueRender();
+    } catch (error) {
+        if (!stillCurrent()) return;
+        console.warn(`[${MODULE_NAME}] Archive graph refresh failed:`, error);
+        hideLoading(); setInfo('Archive refresh incomplete; previous graph retained.');
+    } finally {
+        if (archiveGraphController === controller) archiveGraphController = null;
+    }
+}
+
 function isPinVectorCompatible(pin) {
-    if (!Array.isArray(pin?.vector) || pin.vector.length === 0) return false;
+    if (!isVector(pin?.vector) || pin.vector.length === 0) return false;
     if (messageDims > 0 && pin.vector.length !== messageDims) return false;
     return true;
 }
@@ -498,7 +621,7 @@ async function addSearchTermPin(query) {
     if (!mounted || epoch !== pinEpoch || pins.length >= MAX_PINS) return;
     if (pins.some(p => p.kind === 'term' && p.label.toLowerCase() === lowerQuery)) return;
 
-    if (!Array.isArray(vector) || vector.length === 0) {
+    if (!isVector(vector) || vector.length === 0) {
         setInfo('Embedding returned empty vector.');
         return;
     }
@@ -586,6 +709,13 @@ function removePin(pinIndex) {
 }
 
 function clearAllPins() {
+    archiveGraphController?.abort();
+    archiveGraphController = null;
+    archiveGraphEpoch++;
+    if (typeof iterateCachedMessageVectors === 'function') {
+        messageRefs = []; messageVectors = []; messageNorms = [];
+    }
+    closeNodeContextMenu();
     pinEpoch += 1;
     pendingTermPins.clear();
     pins = [];
@@ -597,13 +727,13 @@ function clearAllPins() {
     camera.x = 0;
     camera.y = 0;
     camera.zoom = 1;
-    setInfo(`${messageRefs.length.toLocaleString()} messages available · Pin a search term to begin`);
+    setInfo(`${(typeof iterateCachedMessageVectors === 'function' ? availableMessageCount : messageRefs.length).toLocaleString()} messages available · Pin a search term to begin`);
     queueRender();
 }
 
 function updatePinInfo() {
     if (pins.length === 0) {
-        setInfo(`${messageRefs.length.toLocaleString()} messages available · Pin a search term to begin`);
+        setInfo(`${(typeof iterateCachedMessageVectors === 'function' ? availableMessageCount : messageRefs.length).toLocaleString()} messages available · Pin a search term to begin`);
     } else {
         const neighborCount = simNodes.filter(n => !n.isPin).length;
         const incompatiblePinCount = messageDims > 0
@@ -621,7 +751,15 @@ function updatePinInfo() {
    ══════════════════════════════════════════════ */
 
 function rebuildSimulation() {
-    container?.querySelector?.('.chat-manager-graph-view-context')?.remove();
+    if (typeof iterateCachedMessageVectors === 'function') {
+        void refreshStreamedGraph();
+        return;
+    }
+    buildSimulationFromCandidates();
+}
+
+function buildSimulationFromCandidates() {
+    closeNodeContextMenu();
     const refIndices = pins.some(pin => pin.kind === 'message')
         ? new Map(messageRefs.map((ref, index) => [messageKey(ref), index]))
         : null;
@@ -758,7 +896,7 @@ function rebuildSimulation() {
 }
 
 function vectorNorm(vector) {
-    if (!Array.isArray(vector)) return 0;
+    if (!isVector(vector)) return 0;
     let sum = 0;
     for (let i = 0; i < vector.length; i++) sum += vector[i] * vector[i];
     return Math.sqrt(sum);
@@ -1324,7 +1462,7 @@ function unbindEvents() {
         canvas.removeEventListener('wheel', boundHandlers.onWheel);
     }
     if (boundHandlers.onPointerMove) {
-        canvas.removeEventListener('pointermove', boundHandlers.onPointerMove);
+        canvas?.removeEventListener('pointermove', boundHandlers.onPointerMove);
         window.removeEventListener('pointermove', boundHandlers.onPointerMove);
     }
     if (boundHandlers.onPointerUp) {
@@ -1490,6 +1628,15 @@ function handleNodeClick(index) {
     }
 }
 
+function closeNodeContextMenu() {
+    clearTimeout(contextMenuTimer);
+    contextMenuTimer = null;
+    if (contextMenuDismiss) document.removeEventListener('pointerdown', contextMenuDismiss, true);
+    contextMenuDismiss = null;
+    contextMenuEl?.remove();
+    contextMenuEl = null;
+}
+
 function showNodeContextMenu(index) {
     const node = simNodes[index];
     if (!node || node.msgRefIndex == null) return;
@@ -1497,13 +1644,12 @@ function showNodeContextMenu(index) {
     const ref = messageRefs[node.msgRefIndex];
     if (!ref) return;
 
-    // Remove old context menu if any
-    const existing = container.querySelector('.chat-manager-graph-view-context');
-    if (existing) existing.remove();
+    closeNodeContextMenu();
 
     const screen = worldToScreen(node.x, node.y);
 
     const menu = document.createElement('div');
+    contextMenuEl = menu;
     menu.className = 'chat-manager-graph-view-context';
     menu.style.position = 'absolute';
     menu.style.left = `${Math.min(screen.x + 8, canvasWidth - 180)}px`;
@@ -1515,14 +1661,14 @@ function showNodeContextMenu(index) {
     pinBtn.textContent = 'Pin this message';
     pinBtn.addEventListener('click', () => {
         addMessagePin(node.msgRefIndex);
-        menu.remove();
+        closeNodeContextMenu();
     });
 
     const jumpBtn = document.createElement('button');
     jumpBtn.className = 'chat-manager-btn chat-manager-graph-view-ctx-btn';
     jumpBtn.textContent = 'Jump to message';
     jumpBtn.addEventListener('click', () => {
-        menu.remove();
+        closeNodeContextMenu();
         if (onJumpToChat && ref) {
             onJumpToChat(ref.fileName, ref.msgIndex);
         }
@@ -1531,7 +1677,7 @@ function showNodeContextMenu(index) {
     const closeBtn = document.createElement('button');
     closeBtn.className = 'chat-manager-btn chat-manager-graph-view-ctx-btn';
     closeBtn.textContent = 'Close';
-    closeBtn.addEventListener('click', () => menu.remove());
+    closeBtn.addEventListener('click', closeNodeContextMenu);
 
     menu.appendChild(pinBtn);
     menu.appendChild(jumpBtn);
@@ -1539,13 +1685,15 @@ function showNodeContextMenu(index) {
     container.appendChild(menu);
 
     // Auto-dismiss on next canvas click
-    const dismiss = (ev) => {
-        if (!menu.contains(ev.target)) {
-            menu.remove();
-            document.removeEventListener('pointerdown', dismiss, true);
-        }
+    contextMenuDismiss = (ev) => {
+        if (!menu.contains(ev.target)) closeNodeContextMenu();
     };
-    setTimeout(() => document.addEventListener('pointerdown', dismiss, true), 0);
+    contextMenuTimer = setTimeout(() => {
+        contextMenuTimer = null;
+        if (mounted && contextMenuEl === menu && contextMenuDismiss) {
+            document.addEventListener('pointerdown', contextMenuDismiss, true);
+        }
+    }, 0);
 }
 
 /* ══════════════════════════════════════════════

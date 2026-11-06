@@ -1,3 +1,5 @@
+import { normalizedMessageFingerprint, messagePreview as truncateMessagePreview } from '../src/message-descriptors.js';
+import { clearIcicleSemanticCache } from '../src/icicle-data.js';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { readFile } from 'node:fs/promises';
@@ -7,7 +9,7 @@ const dataSource = (await readFile(new URL('../src/icicle-data.js', import.meta.
 const viewSource = (await readFile(new URL('../src/icicle-view.js', import.meta.url), 'utf8'))
     .replace(/^import\s[\s\S]*?from\s+['"][^'"]+['"];\s*/gm, '').replace(/^export /gm, '');
 function builder(source, stats = { refs: 0 }) {
-    return new Function('stats', `${source}; return buildIcicleData;`)(stats);
+    return new Function('stats', 'normalizedMessageFingerprint', 'truncateMessagePreview', `${source}; return buildIcicleData;`)(stats, normalizedMessageFingerprint, truncateMessagePreview);
 }
 const originalConstruction = dataSource
     .replace('            current = child;', '            child.chatFiles.push(fileName);\n            current = child;')
@@ -48,11 +50,11 @@ test('shared-prefix construction allocates file references once per distinct mem
 });
 
 function viewHarness(nodes) {
-    return new Function('window', `${viewSource}; return {
+    return new Function('window', 'clearIcicleSemanticCache', `${viewSource}; return {
         load(nodes) { flatNodes = nodes; rebuildDepthIndex(); },
         visible: visibleDepthNodes, member: isActiveMember, unmount: unmountIcicle,
         indexSize: () => nodesByDepth.size,
-    };`)({ removeEventListener() {} });
+    };`)({ removeEventListener() {} }, clearIcicleSemanticCache);
 }
 
 test('depth culling preserves pre-order and only checks visible shared memberships', () => {

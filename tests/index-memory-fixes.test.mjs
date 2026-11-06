@@ -154,7 +154,7 @@ test('clearIndex releases the owned flattened search cache immediately', async (
 });
 
 
-test('each restored cache batch invalidates searches before the next batch completes', async () => {
+test('restored compact catalogs invalidate searches before the next catalog completes', async () => {
     reset();
     const reader = await import('../src/chat-reader.js');
     reader.clearIndex();
@@ -171,10 +171,9 @@ test('each restored cache batch invalidates searches before the next batch compl
         file_name, last_mes: date, file_size: '100 B', chat_items: 1,
     })) });
     let release;
-    let completions = 0;
     const paused = new Promise(resolve => {
         delayReadCompletion = complete => {
-            if (++completions === 2) { release = complete; resolve(); }
+            if (bodyReads.filter(key => !key.startsWith('\u0000catalog:')).length === 51) { release = complete; resolve(); }
             else complete();
         };
     });
@@ -184,7 +183,8 @@ test('each restored cache batch invalidates searches before the next batch compl
     try {
         assert.equal(initialSearch.length, 0);
         assert.equal(Object.values(reader.getIndex()).filter(entry => entry.isLoaded).length, 50);
-        assert.equal(reader.getSearchableMessages().length, 50);
+        assert.ok(Object.values(reader.getIndex()).filter(entry => entry.isLoaded).every(entry => entry.bodyResident === false));
+        assert.equal(reader.getSearchableMessages().length, 0, 'descriptor restores do not retain complete search bodies');
         assert.notEqual(reader.getSearchableMessages(), initialSearch);
     } finally {
         delayReadCompletion = null; release(); await building; reader.clearIndex();

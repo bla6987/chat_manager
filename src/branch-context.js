@@ -3,53 +3,129 @@
  * via SillyTavern's setExtensionPrompt API so the AI can compare parallel threads.
  */
 
-import { getSiblingBranchContextForThread } from './chat-reader.js';
+import { getSiblingBranchContextForThread, getIndex, readChatMessages } from './chat-reader.js';
+import { resolveActiveChatFilename } from './active-chat.js';
+import { messagePreview } from './message-descriptors.js';
 import { getDisplayName } from './metadata-store.js';
 
 const PROMPT_ID = 'chat_manager_branch_ctx';
 const MSG_TRUNCATE = 500;
 
 let lastInjectedText = null;
+let lastInjectionScope = null;
+let injectionRequest = 0;
+let pendingInjectionController = null;
 
-/**
- * Update the branch context injection for the active chat.
- * Fetches sibling data, formats, and injects via setExtensionPrompt.
- * @param {string} activeFilename
- * @returns {{ branchCount: number, injected: boolean }}
- */
-export function updateBranchContextInjection(activeFilename) {
+function captureScope(fileName) {
     const context = SillyTavern.getContext();
-    const siblings = getSiblingBranchContextForThread(activeFilename);
+    return {
+        fileName,
+        avatar: context.characters?.[context.characterId]?.avatar ?? null,
+        characterId: context.characterId,
+        groupId: context.groupId ?? null,
+        entry: getIndex()[fileName],
+    };
+}
 
-    if (siblings.length === 0) {
-        if (lastInjectedText !== null) {
-            clearBranchContextInjection();
-        }
-        return { branchCount: 0, injected: false };
-    }
+function isScopeCurrent(scope, requireActive = false) {
+    const context = SillyTavern.getContext();
+    return (context.characters?.[context.characterId]?.avatar ?? null) === scope.avatar
+        && context.characterId === scope.characterId
+        && (context.groupId ?? null) === scope.groupId
+        && getIndex()[scope.fileName] === scope.entry
+        && (!requireActive || resolveActiveChatFilename(context, getIndex()) === scope.fileName);
+}
 
-    const characterName = context.name2 || 'Character';
-    const text = formatBranchContext(siblings, characterName);
-
-    // Skip no-op updates
-    if (text === lastInjectedText) {
-        return { branchCount: siblings.length, injected: true };
-    }
-
-    // position=1 (IN_CHAT), depth=0, scan=false, role=0 (SYSTEM)
-    context.setExtensionPrompt(PROMPT_ID, text, 1, 0, false, 0);
-    lastInjectedText = text;
-
-    return { branchCount: siblings.length, injected: true };
+function assertScopeCurrent(scope, signal) {
+    if (signal?.aborted) throw signal.reason || new DOMException('Operation cancelled', 'AbortError');
+    if (!isScopeCurrent(scope)) throw new DOMException('The target chat changed', 'AbortError');
 }
 
 /**
- * Clear the branch context injection.
+ * Fetch at most three sibling bodies sequentially. Only copied, bounded text
+ * leaves this helper; full swipes, body objects and vectors are never retained
+ * in a summary action or an injected prompt snapshot.
+ * @returns {Promise<Array<{fileName:string,branchPoint:number,messages:Array}>>}
  */
+export async function getSiblingMessagesAsync(fileName, { maxSiblings = 3, maxTextChars = MSG_TRUNCATE, signal } = {}) {
+    if (!fileName) return [];
+    const scope = captureScope(fileName);
+    assertScopeCurrent(scope, signal);
+    const count = Math.max(0, Math.min(3, Math.floor(Number(maxSiblings) || 0)));
+    const textLimit = Math.max(1, Math.min(MSG_TRUNCATE, Math.floor(Number(maxTextChars) || MSG_TRUNCATE)));
+    // Copy identifiers before the first await, releasing any resident message
+    // references returned by the branch selector immediately.
+    const selections = getSiblingBranchContextForThread(fileName, count)
+        .map(({ fileName: siblingFile, branchPoint }) => ({ fileName: siblingFile, branchPoint }));
+    const siblings = [];
+    for (const selection of selections) {
+        assertScopeCurrent(scope, signal);
+        const body = await readChatMessages(selection.fileName, { signal });
+        assertScopeCurrent(scope, signal);
+        const messages = [];
+        for (let i = selection.branchPoint; i < body.length; i++) {
+            const message = body[i];
+            const text = typeof message?.text === 'string' ? message.text : '';
+            messages.push({
+                index: message.index, role: message.role,
+                timestamp: message.timestamp, timestampMs: message.timestampMs,
+                text: messagePreview(text, textLimit) + (text.length > textLimit ? '…' : ''),
+            });
+        }
+        if (messages.length) siblings.push({ ...selection, messages });
+    }
+    assertScopeCurrent(scope, signal);
+    return siblings;
+}
+
+/**
+ * Update the active prompt after demand-loading cold sibling text. Newer
+ * updates, explicit clears and character/chat switches invalidate pending reads.
+ * @returns {Promise<{branchCount:number,injected:boolean,stale?:boolean}>}
+ */
+export async function updateBranchContextInjection(activeFilename) {
+    const request = ++injectionRequest;
+    pendingInjectionController?.abort();
+    const controller = new AbortController();
+    pendingInjectionController = controller;
+    const scope = captureScope(activeFilename);
+    const current = () => request === injectionRequest && isScopeCurrent(scope, true);
+    try {
+        if (!activeFilename || !current()) return { branchCount: 0, injected: false, stale: true };
+        const siblings = await getSiblingMessagesAsync(activeFilename, { signal: controller.signal });
+        if (!current()) return { branchCount: 0, injected: false, stale: true };
+        if (!siblings.length) {
+            clearBranchContextInjection();
+            return { branchCount: 0, injected: false };
+        }
+        const context = SillyTavern.getContext();
+        const text = formatBranchContext(siblings, context.name2 || 'Character');
+        const sameScope = lastInjectionScope?.fileName === scope.fileName
+            && lastInjectionScope?.avatar === scope.avatar;
+        if (sameScope && text === lastInjectedText) return { branchCount: siblings.length, injected: true };
+        context.setExtensionPrompt(PROMPT_ID, text, 1, 0, false, 0);
+        lastInjectedText = text;
+        lastInjectionScope = { fileName: scope.fileName, avatar: scope.avatar };
+        return { branchCount: siblings.length, injected: true };
+    } catch (error) {
+        if (error?.name === 'AbortError' || controller.signal.aborted || !current()) {
+            return { branchCount: 0, injected: false, stale: true };
+        }
+        throw error;
+    } finally {
+        if (pendingInjectionController === controller) pendingInjectionController = null;
+    }
+}
+
+/** Clear the prompt and prevent an older asynchronous update from restoring it. */
 export function clearBranchContextInjection() {
+    injectionRequest++;
+    pendingInjectionController?.abort();
+    pendingInjectionController = null;
     const context = SillyTavern.getContext();
     context.setExtensionPrompt(PROMPT_ID, '', 1, 0, false, 0);
     lastInjectedText = null;
+    lastInjectionScope = null;
 }
 
 /**

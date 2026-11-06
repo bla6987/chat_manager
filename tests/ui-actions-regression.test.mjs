@@ -4,8 +4,11 @@ import fs from 'node:fs';
 import vm from 'node:vm';
 import * as meta from '../src/metadata-store.js';
 import * as reader from '../src/chat-reader.js';
-import { rankSemanticCandidates } from '../src/semantic-search.js';
 import { timestampMs } from '../src/timestamps.js';
+import { isVector } from '../src/vector-utils.js';
+import { iterateVariantBatches } from '../src/archive-data.js';
+import { searchArchivePage } from '../src/archive-search.js';
+import { messagePreview } from '../src/message-descriptors.js';
 
 const source = fs.readFileSync(new URL('../src/ui-controller.js', import.meta.url), 'utf8')
     .replace(/^import[\s\S]*?;\n/gm, '').replace(/^export /gm, '');
@@ -55,18 +58,21 @@ function setup(overrides = {}) {
     const nodes = new Map([['chat-manager-content', new Element()], ['chat-manager-status', new Element()]]);
     const toasts = [];
     const timers = [];
-    const index = {};
+    globalThis.SillyTavern = { getContext: () => context };
+    reader.clearIndex();
+    const index = reader.getIndex();
     const settings = { enabled: true, provider: 'ollama', model: 'synthetic', embeddingLevels: { chat: false, message: true, query: true }, includeAlternateSwipes: true };
     let currentOperation = true;
     const token = { settings };
     const globals = {
-        console, Map, Set, WeakMap, WeakSet, Promise, Symbol, CSS: { escape: x => x },
+        console, Map, Set, WeakMap, WeakSet, Promise, Symbol, AbortController, DOMException, CSS: { escape: x => x },
         SillyTavern: { getContext: () => context, libs: { DOMPurify: { sanitize: x => x } } },
         document: { createElement: tag => new Element(tag), getElementById: id => nodes.get(id) || null, querySelector: () => null, removeEventListener() {} },
         setTimeout: fn => { timers.push(fn); return timers.length; }, clearTimeout() {}, requestAnimationFrame() {},
         toastr: Object.fromEntries(['success', 'warning', 'error', 'info'].map(kind => [kind, message => toasts.push({ kind, message })])),
-        ...meta,
-        timestampMs, rankSemanticCandidates,
+        ...meta, ...reader,
+        timestampMs, isVector, iterateVariantBatches, messagePreview,
+        searchArchivePage: options => searchArchivePage({ ...options, embeddingOperation: undefined }),
         persistThreadFocus: meta.setThreadFocus,
         getIndex: () => index, getIndexVersion: () => 1, getEmbeddingSettings: () => settings,
         getHydrationProgress: () => ({ loaded: 0, total: 0 }), isHydrationComplete: () => true,
@@ -209,9 +215,9 @@ test('alternate-only missing coverage queues work, stays incomplete until fulfil
     reader.setMessageEmbedding(entry, 0, 0, [1, 0]);
     assert.equal(sandbox.threadNeedsEmbeddings(entry.fileName), true);
     const result = await sandbox.runEmbeddingGeneration([entry.fileName], { rerender: false, incremental: true });
-    assert.equal(result.queuedSwipeVectors, 1); assert.equal(result.skipped, undefined);
+    assert.equal(result.queuedSwipeVectors, 1); assert.equal(result.skipped, false);
     await sandbox.flushBackgroundSwipeEmbeddings(settings);
-    assert.deepEqual(reader.getMessageEmbedding(entry, msg, 1), [1, 0]);
+    assert.deepEqual(Array.from(reader.getMessageEmbedding(entry, msg, 1)), [1, 0]);
     assert.equal(sandbox.threadNeedsEmbeddings(entry.fileName), false);
     assert.equal(sandbox.getEmbeddingStatus(entry), 'full');
 });
@@ -242,7 +248,7 @@ test('semantic results retain the matched alternate text and render its excerpt'
     vm.runInContext('getSemanticQueryEmbedding = async () => [1, 0]; renderSearchState = () => {};', sandbox);
     await sandbox.performSemanticSearch('swords', 0);
     const result = vm.runInContext('searchState.results[0]', sandbox);
-    assert.equal(result.item, msg); assert.equal(result.matchedText, 'alternate swords'); assert.equal(result.matchedSwipeIndex, 1);
+    assert.notEqual(result.item, msg, 'search retains a compact excerpt, not the full message body'); assert.equal(result.item.filename, msg.filename); assert.equal(result.item.index, msg.index); assert.equal(result.matchedText, 'alternate swords'); assert.equal(result.matchedSwipeIndex, 1);
     const excerpts = [];
     sandbox.excerpts = excerpts;
     vm.runInContext('buildHighlightedExcerpt = text => { excerpts.push(text); return text; };', sandbox);
@@ -278,7 +284,7 @@ test('explicit refresh forwards force revalidation to both thread and alternate-
         const calls = [];
         const { sandbox, settings } = setup({ buildIndex: async (...args) => { calls.push(args); return { changed: false }; }, prioritizeInQueue() {} });
         settings.enabled = false;
-        vm.runInContext(`statsActive = ${stats}; ensureHydrationSubscription = () => {}; ensureSearchModeBadge = () => {}; updateSearchModeBadgeDisplay = () => {}; renderLoading = () => {}; renderThreadCards = () => {}; getCurrentSearchQuery = () => '';`, sandbox);
+        vm.runInContext(`panelOpen = true; statsActive = ${stats}; ensureHydrationSubscription = () => {}; ensureSearchModeBadge = () => {}; updateSearchModeBadgeDisplay = () => {}; renderLoading = () => {}; renderThreadCards = () => {}; getCurrentSearchQuery = () => '';`, sandbox);
         await sandbox.refreshPanel({ forceRevalidate: true });
         assert.equal(calls.length, 1); assert.equal(calls[0][2].forceRevalidate, true);
     }
@@ -308,7 +314,7 @@ test('fresh alternate work drains after a cleared in-flight flush and its alread
     await assert.rejects(oldFlush, /obsolete request/);
     assert.ok(timers.length > timerCount, 'ending obsolete flush schedules a successor for still-pending fresh work');
     timers.at(-1)(); await new Promise(resolve => setImmediate(resolve));
-    assert.deepEqual(reader.getMessageEmbedding(freshEntry, msg, 1), [2, 0]);
+    assert.deepEqual(Array.from(reader.getMessageEmbedding(freshEntry, msg, 1)), [2, 0]);
     assert.equal(calls, 2);
 });
 
@@ -338,7 +344,7 @@ test('dimension recovery clears old vectors and retries a foreground run once, w
     sandbox.invalidateEmbeddingOperations = () => { token = { settings }; };
     const result = await sandbox.runEmbeddingGeneration([entry.fileName], { rerender: false, incremental: true });
     assert.equal(result.superseded, undefined); assert.equal(providerCalls, 2);
-    assert.deepEqual(reader.getMessageEmbedding(entry, entry.messages[0]), [1, 0, 0]);
+    assert.deepEqual(Array.from(reader.getMessageEmbedding(entry, entry.messages[0])), [1, 0, 0]);
     assert.equal(entry.messageEmbeddings.has('99:0'), false);
 });
 
@@ -359,8 +365,9 @@ test('archived AI and embedding actions do not consume retained bodies pending f
     index['target.jsonl'] = { fileName: 'target.jsonl', isLoaded: true, needsHydration: true, messages: [{ index: 0, role: 'user', text: 'stale retained content' }] };
     const button = new Element(); button.dataset.filename = 'target.jsonl';
     await sandbox.handleAITitle({ currentTarget: button, stopPropagation() {} });
-    const result = await sandbox.runEmbeddingGeneration(['target.jsonl'], { rerender: false, incremental: true });
-    assert.equal(aiCalls, 0); assert.equal(providerCalls, 0); assert.equal(result.skipped, true);
+    sandbox.readChatMessages = async () => { throw new Error('Archive refresh failed'); };
+    await assert.rejects(sandbox.runEmbeddingGeneration(['target.jsonl'], { rerender: false, incremental: true }), /Archive refresh failed/);
+    assert.equal(aiCalls, 0); assert.equal(providerCalls, 0);
     assert.equal(sandbox.getEmbeddingStatus(index['target.jsonl']), 'unknown');
 });
 
@@ -409,33 +416,144 @@ test('branch detection coalesces during idle time, reads the latest chat, and ca
 });
 
 for (const mutation of ['request', 'index', 'recipe', 'embedding']) {
-    test(`semantic scoring chunks discard ${mutation} changes before publication`, async () => {
-        const gate = deferred(); let atYield; const yielded = new Promise(resolve => { atYield = resolve; });
-        const { sandbox, index } = setup({ rankSemanticCandidates: options => rankSemanticCandidates({ ...options,
-            chunkSize: 4, yieldControl: async () => { atYield(); await gate.promise; } }) });
-        const msg = { filename:'target.jsonl', index:0, role:'assistant', text:'swords', swipeId:0 };
-        const entry = index[msg.filename] = { messageEmbeddings:new Map(), messages:[msg] };
-        reader.setMessageEmbedding(entry, 0, 0, [1,0]);
-        sandbox.getSearchableMessages = () => Array(20).fill(msg);
+    test(`semantic archive scans discard ${mutation} changes before publication`, async () => {
+        const gate = deferred(); const entered = deferred();
+        const { sandbox, index } = setup({ searchArchivePage: async () => {
+            entered.resolve(); await gate.promise;
+            return { results: [], scanned: 1, pageReferences: [], hasMore: false };
+        } });
+        const msg = { filename: 'target.jsonl', index: 0, role: 'assistant', text: 'swords', swipeId: 0 };
+        const entry = index[msg.filename] = { messageEmbeddings: new Map(), messages: [msg] };
+        reader.setMessageEmbedding(entry, 0, 0, [1, 0]);
         let version = 1; sandbox.getIndexVersion = () => version;
         vm.runInContext('getSemanticQueryEmbedding = async () => [1,0]; renderSearchState = () => { throw new Error("stale publication"); };', sandbox);
-        const pending = sandbox.performSemanticSearch('swords',0);
-        await yielded;
-        if (mutation === 'request') vm.runInContext('latestSearchRequestId++;',sandbox);
+        const pending = sandbox.performSemanticSearch('swords', 0);
+        await entered.promise;
+        if (mutation === 'request') vm.runInContext('latestSearchRequestId++;', sandbox);
         if (mutation === 'index') version++;
         if (mutation === 'recipe') sandbox.getEmbeddingSettings().model = 'changed';
-        if (mutation === 'embedding') reader.setMessageEmbedding(entry,0,0,[0,1]);
+        if (mutation === 'embedding') reader.setMessageEmbedding(entry, 0, 0, [0, 1]);
         gate.resolve(); await pending;
-        assert.equal(vm.runInContext('searchState',sandbox),null);
+        assert.equal(vm.runInContext('searchState', sandbox), null);
     });
 }
 test('query dimension discovery and unrelated selection changes permit semantic publication', async () => {
-    const { sandbox,index } = setup();
-    const msg = { filename:'target.jsonl',index:0,role:'assistant',text:'swords',swipeId:0 };
-    const entry = index[msg.filename] = { messageEmbeddings:new Map(),messages:[msg] };
-    reader.setMessageEmbedding(entry,0,0,[1,0]);
-    sandbox.getSearchableMessages = () => [msg];
-    vm.runInContext('getSemanticQueryEmbedding = async () => { const s = getEmbeddingSettings(); s.dimensions = 2; s.selectedChatsByAvatar = { other: ["large unrelated selection"] }; return [1,0]; }; renderSearchState = () => {};',sandbox);
-    await sandbox.performSemanticSearch('swords',0);
-    assert.equal(vm.runInContext('searchState.results.length',sandbox),1);
+    const result = { item: { filename: 'target.jsonl', index: 0, text: 'swords' }, otherFiles: [] };
+    const { sandbox } = setup({ searchArchivePage: async () => ({ results: [result], scanned: 1, pageReferences: [], hasMore: false }) });
+    vm.runInContext('getSemanticQueryEmbedding = async () => { const s = getEmbeddingSettings(); s.dimensions = 2; s.selectedChatsByAvatar = { other: ["large unrelated selection"] }; return [1,0]; }; renderSearchState = () => {};', sandbox);
+    await sandbox.performSemanticSearch('swords', 0);
+    assert.equal(vm.runInContext('searchState.results.length', sandbox), 1);
 });
+
+test('repeating a semantic query consults the recipe-aware cache instead of retaining the previous query vector', async () => {
+    const { sandbox } = setup();
+    let vector = [1, 0];
+    const seen = [];
+    sandbox.getSemanticQueryEmbedding = async () => vector;
+    sandbox.searchArchivePage = async options => {
+        seen.push(Array.from(options.queryVector));
+        return { results: [], pageReferences: [], hasMore: false, scanned: 1 };
+    };
+    vm.runInContext('renderSearchState = () => {};', sandbox);
+    await sandbox.performSemanticSearch('same query', 0);
+    vector = [0, 1];
+    await sandbox.performSemanticSearch('same query', 0);
+    assert.deepEqual(seen, [[1, 0], [0, 1]]);
+});
+
+test('AI snapshots retain only the consumed recent window and preserve a relative branch marker', async () => {
+    const { sandbox, index, context } = setup();
+    const messages = Array.from({ length: 1000 }, (_, index) => ({ index, role: 'user', text: `message ${index}` }));
+    const entry = index['archive.jsonl'] = { fileName: 'archive.jsonl', isLoaded: true, branchPoint: 985, messages };
+    sandbox.readChatMessages = async () => messages;
+    const summary = await sandbox.captureChatAction(entry.fileName, entry);
+    assert.equal(summary.messages.length, 30);
+    assert.equal(summary.messages[0].text, 'message 970');
+    assert.equal(summary.branchPoint, 15);
+    const title = await sandbox.captureChatAction(entry.fileName, entry, { titleOnly: true });
+    assert.equal(title.messages.length, 15);
+    assert.equal(title.messages[0].text, 'message 985');
+    entry.branchPoint = 20;
+    assert.equal((await sandbox.captureChatAction(entry.fileName, entry)).branchPoint, -1);
+    assert.equal(context.characterId, 0);
+});
+
+test('explicit embedding work hydrates metadata-only chats instead of skipping them', async () => {
+    const { sandbox, index, settings } = setup();
+    settings.embeddingLevels.chat = true;
+    settings.embeddingLevels.message = false;
+    const entry = index['cold.jsonl'] = { fileName: 'cold.jsonl', isLoaded: false, needsHydration: true, messageCount: 1, messages: [] };
+    let reads = 0;
+    sandbox.readChatMessages = async fileName => {
+        assert.equal(fileName, entry.fileName); reads++;
+        const messages = [{ index: 0, role: 'user', text: 'cold saved text' }];
+        index[fileName] = { ...entry, isLoaded: true, needsHydration: false, messages };
+        return messages;
+    };
+    sandbox.getRepresentativeEmbeddingText = current => current.messages.at(-1)?.text || '';
+    const result = await sandbox.runEmbeddingGeneration([entry.fileName], { rerender: false, incremental: true });
+    assert.equal(reads, 1);
+    assert.equal(result.updated, 1);
+    assert.equal(index[entry.fileName].cachedChatEmbeddingHash, 'cold saved text');
+});
+
+
+test('late index completion cannot rebuild a closed panel', async () => {
+    const pending = deferred();
+    const { sandbox } = setup({ buildIndex: () => pending.promise });
+    const paints = [];
+    sandbox.paints = paints;
+    vm.runInContext("panelOpen = true; ensureHydrationSubscription = () => {}; ensureSearchModeBadge = () => {}; updateSearchModeBadgeDisplay = () => {}; renderLoading = () => {}; renderThreadCards = () => paints.push('cards'); getCurrentSearchQuery = () => '';", sandbox);
+    const request = sandbox.refreshPanel();
+    sandbox.closeSidePanel();
+    pending.resolve({ changed: true });
+    await request;
+    assert.deepEqual(paints, []);
+});
+
+test('closing the panel prevents a pending query vector from repopulating its cache', async () => {
+    const pending = deferred();
+    const { sandbox } = setup({ embedText: () => pending.promise });
+    const request = sandbox.getSemanticQueryEmbedding('closing query');
+    sandbox.closeSidePanel();
+    pending.resolve(new Float32Array([1, 0]));
+    await request;
+    assert.equal(vm.runInContext('queryEmbeddingCache.size', sandbox), 0);
+    assert.equal(vm.runInContext('queryEmbeddingInFlight.size', sandbox), 0);
+});
+
+test('closing the panel cancels a pending archived drift scan and discards its completion', async () => {
+    const pending = deferred();
+    const { sandbox, index } = setup({ computeArchiveDriftSummary: () => pending.promise });
+    const entry = index['target.jsonl'] = { fileName: 'target.jsonl', isLoaded: true, messages: [{ index: 0, text: 'a' }, { index: 1, text: 'b' }] };
+    sandbox.entry = entry;
+    vm.runInContext('panelOpen = true;', sandbox);
+    assert.equal(sandbox.getDriftSummary(entry), null);
+    const request = sandbox.refreshDriftSummaries();
+    sandbox.closeSidePanel();
+    pending.resolve({ count: 1, majorCount: 1, positions: [1], firstMsgIndex: 1 });
+    await request;
+    assert.equal(vm.runInContext('driftSummaryCache.has(entry)', sandbox), false);
+    assert.equal(vm.runInContext('pendingDriftFiles.size', sandbox), 0);
+});
+
+for (const handler of ['handleAITitle', 'handleRegenSummary', 'handleAISummaryAndTitle']) {
+    test(`${handler} preserves manual metadata edits made while a cold body is loading`, async () => {
+        const body = deferred();
+        const { sandbox, index } = setup({
+            readChatMessages: () => body.promise,
+            generateTitleForChat: async () => 'AI title',
+            generateSummaryForChat: async () => 'AI summary',
+        });
+        index['archive.jsonl'] = { fileName: 'archive.jsonl', isLoaded: true, branchPoint: null, messages: [] };
+        meta.setChatMeta('archive.jsonl', { displayName: 'Before', summary: 'Before' }, 'alpha.png');
+        const btn = new Element('button'); btn.dataset.filename = 'archive.jsonl';
+        const pending = sandbox[handler]({ currentTarget: btn, stopPropagation() {} });
+        meta.setChatMeta('archive.jsonl', { displayName: 'Manual title', summary: 'Manual summary' }, 'alpha.png');
+        body.resolve([{ role: 'assistant', text: 'Synthetic saved body' }]);
+        await pending;
+        const saved = meta.getChatMeta('archive.jsonl', 'alpha.png');
+        assert.equal(saved.displayName, 'Manual title');
+        assert.equal(saved.summary, 'Manual summary');
+    });
+}

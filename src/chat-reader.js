@@ -3,13 +3,16 @@
  * Never modifies any chat files.
  */
 
-import { consumeCachedChatsForCharacter, putCachedChat, putCachedChats, removeCachedChat } from './cache-store.js';
+import { getCachedChat, iterateCachedChatCatalogs, putCachedChat, putCachedChats, removeCachedChat, flushPendingCacheWrites } from './cache-store.js';
 import { getRepresentativeEmbeddingText } from './embedding-text.js';
 import { timestampMs, localDateBoundary } from './timestamps.js';
 import { resolveActiveChatFilename } from './active-chat.js';
+import { createMessageDescriptor, estimateMessageBodyBytes, sameMessageContent, messagePreview } from './message-descriptors.js';
+import { isVector, toFloat32Vector, vectorByteLength, ByteBudgetLRU } from './vector-utils.js';
+export { messageFingerprint, normalizedMessageFingerprint, sameMessageContent } from './message-descriptors.js';
 
 const MODULE_NAME = 'chat_manager';
-const HYDRATION_BATCH_SIZE = 6;
+const HYDRATION_BATCH_SIZE = 2;
 const HYDRATION_YIELD_MS = 16;
 const FALLBACK_SORT_TIMESTAMP = 0;
 // The host list has no file revision: last_mes survives edits. Limit reuse even
@@ -43,6 +46,181 @@ let progressCallback = null;
 let indexVersion = 0;
 let cachedSearchableMessages = null;
 let cachedSearchableVersion = -1;
+
+export const DEFAULT_BODY_CACHE_BYTES = 96 * 1024 * 1024;
+let bodyCacheBudget = DEFAULT_BODY_CACHE_BYTES;
+let residentBodyBytes = 0;
+let activeBodyFile = null;
+const residentBodies = new Map();
+const messageDescriptors = new WeakMap();
+export const DEFAULT_VECTOR_CACHE_BYTES = 64 * 1024 * 1024;
+const vectorOwners = new Map(); // WeakRefs support detached test/extension entries without retaining bodies.
+const vectorKeysByFile = new Map();
+const residentVectors = new ByteBudgetLRU({
+    maxBytes: DEFAULT_VECTOR_CACHE_BYTES,
+    onEvict(key, item) {
+        vectorKeysByFile.get(item.fileName)?.delete(key);
+        const entry = chatIndex[item.fileName] || vectorOwners.get(item.fileName)?.deref();
+        if (!entry) return;
+        if (item.type === 'chat') {
+            if (entry.chatEmbedding === item.vector) entry.chatEmbedding = null;
+        } else if (entry.messageEmbeddings?.get(item.msgKey) === item.vector) {
+            entry.messageEmbeddings.delete(item.msgKey);
+            entry.messageEmbeddingVersion = (entry.messageEmbeddingVersion || 0) + 1;
+        }
+    },
+});
+
+function vectorKey(fileName, type, msgKey = '') { return `${fileName}\u0000${type}\u0000${msgKey}`; }
+
+function rememberVector(entry, type, msgKey, vector) {
+    const key = vectorKey(entry.fileName, type, msgKey);
+    if (residentVectors.peek(key)?.vector === vector) { residentVectors.get(key); return true; }
+    if (typeof WeakRef === 'function') vectorOwners.set(entry.fileName, new WeakRef(entry));
+    const stored = residentVectors.set(key, { fileName: entry.fileName, msgKey, vector, type }, vectorByteLength(vector));
+    if (stored) {
+        if (!vectorKeysByFile.has(entry.fileName)) vectorKeysByFile.set(entry.fileName, new Set());
+        vectorKeysByFile.get(entry.fileName).add(key);
+    }
+    return stored;
+}
+
+function syncEntryVectorBudget(entry) {
+    for (const key of [...(vectorKeysByFile.get(entry.fileName) || [])]) {
+        const item = residentVectors.peek(key);
+        const current = item?.type === 'chat' ? entry.chatEmbedding : entry.messageEmbeddings?.get(item?.msgKey);
+        if (current !== item?.vector) residentVectors.delete(key);
+    }
+    if (isVector(entry.chatEmbedding)) setChatEmbedding(entry, entry.chatEmbedding, entry.chatEmbeddingHash);
+    for (const [key, vector] of entry.messageEmbeddings || []) {
+        if (!isVector(vector)) continue;
+        const compact = toFloat32Vector(vector);
+        if (rememberVector(entry, 'message', key, compact)) entry.messageEmbeddings.set(key, compact);
+        else entry.messageEmbeddings.delete(key);
+    }
+}
+
+export function setVectorCacheBudget(bytes) {
+    if (!Number.isFinite(bytes) || bytes < 0) throw new RangeError('Vector cache budget must be a nonnegative number of bytes');
+    residentVectors.maxBytes = Math.floor(bytes);
+    return getVectorCacheStats();
+}
+
+export function getVectorCacheStats() {
+    return { budgetBytes: residentVectors.maxBytes, residentBytes: residentVectors.bytes, residentVectors: residentVectors.size };
+}
+
+export function clearResidentVectors({ clearCachedKeys = false } = {}) {
+    residentVectors.clear();
+    vectorKeysByFile.clear();
+    vectorOwners.clear();
+    for (const entry of Object.values(chatIndex)) {
+        entry.chatEmbedding = null;
+        entry.messageEmbeddings = null;
+        if (clearCachedKeys) {
+            entry.cachedMessageEmbeddingKeys = new Set();
+            entry.cachedChatEmbeddingHash = null;
+        }
+    }
+}
+
+export function setChatEmbedding(entry, vector, hash = null) {
+    if (!entry || !isVector(vector)) return false;
+    entry.cachedChatEmbeddingHash = hash;
+    if (vector.length * Float32Array.BYTES_PER_ELEMENT > residentVectors.maxBytes) {
+        residentVectors.delete(vectorKey(entry.fileName, 'chat'));
+        entry.chatEmbedding = null;
+        entry.chatEmbeddingHash = hash;
+        return false;
+    }
+    const compact = toFloat32Vector(vector);
+    if (!rememberVector(entry, 'chat', '', compact)) return false;
+    entry.chatEmbedding = compact;
+    entry.chatEmbeddingHash = hash;
+    return true;
+}
+
+function descriptorsFor(messages) {
+    return (messages || []).map(message => {
+        if (message?.isDescriptor) return message;
+        let descriptor = messageDescriptors.get(message);
+        if (!descriptor) {
+            descriptor = createMessageDescriptor(message);
+            messageDescriptors.set(message, descriptor);
+        }
+        return descriptor;
+    });
+}
+
+function invalidateSearchableCache() {
+    cachedSearchableMessages = null;
+    cachedSearchableVersion = -1;
+}
+
+function activeFileForCache() {
+    const context = globalThis.SillyTavern?.getContext?.();
+    const avatar = context?.characters?.[context.characterId]?.avatar;
+    if (currentCharacterAvatar && avatar !== currentCharacterAvatar) return null;
+    return (context && resolveActiveChatFilename(context, chatIndex)) || activeBodyFile;
+}
+
+function forgetResidentBody(fileName) {
+    const cached = residentBodies.get(fileName);
+    if (cached) residentBodyBytes -= cached.bytes;
+    residentBodies.delete(fileName);
+}
+
+function rememberResidentBody(entry) {
+    forgetResidentBody(entry.fileName);
+    entry.messageDescriptors = descriptorsFor(entry.messages);
+    entry.bodyEmbeddingText = messagePreview(entry.messages.slice(-10).map(message => String(message.text || '').trim().slice(0, 2000)).filter(Boolean).join('\n').slice(0, 2000).trim(), 2000);
+    entry.bodyResident = true;
+    const bytes = estimateMessageBodyBytes(entry.messages);
+    entry.bodyBytes = bytes;
+    residentBodies.set(entry.fileName, { entry, bytes });
+    residentBodyBytes += bytes;
+}
+
+function touchResidentBody(fileName) {
+    const cached = residentBodies.get(fileName);
+    if (!cached) return;
+    residentBodies.delete(fileName);
+    residentBodies.set(fileName, cached);
+}
+
+/** Release cached bodies without changing content revisions or the catalog identity. */
+export function trimBodyCache({ keepActive = true, targetBytes = bodyCacheBudget, keepFile = null } = {}) {
+    const active = keepActive ? activeFileForCache() : null;
+    for (const [fileName, cached] of residentBodies) {
+        if (residentBodyBytes <= Math.max(0, targetBytes)) break;
+        // A live chat may contain unsaved edits. Never evict its indexed body.
+        if (fileName === active || fileName === activeFileForCache() || fileName === keepFile) continue;
+        const entry = chatIndex[fileName];
+        forgetResidentBody(fileName);
+        if (entry !== cached.entry || entry.bodyResident === false) continue;
+        entry.messages = entry.messageDescriptors || descriptorsFor(entry.messages);
+        entry.messageDescriptors = entry.messages;
+        entry.bodyResident = false;
+        invalidateSearchableCache();
+    }
+    return getBodyCacheStats();
+}
+
+export function setBodyCacheBudget(bytes) {
+    if (!Number.isFinite(bytes) || bytes < 0) throw new RangeError('Body cache budget must be a nonnegative number of bytes');
+    bodyCacheBudget = Math.floor(bytes);
+    return trimBodyCache();
+}
+
+export function getBodyCacheStats() {
+    const active = activeFileForCache();
+    return {
+        budgetBytes: bodyCacheBudget, residentBytes: Math.max(0, residentBodyBytes),
+        residentChats: residentBodies.size,
+        pinnedBytes: residentBodies.get(active)?.bytes || 0,
+        catalogChats: Object.keys(chatIndex).length,
+    };
+}
 
 /**
  * @typedef {Object} IndexMessage
@@ -133,13 +311,13 @@ export function ensureMessageEmbeddingMap(entry) {
         const activeSwipe = getMessageActiveSwipeIndex(msg);
         const key = makeMessageEmbeddingKey(msg.index, activeSwipe);
         const legacyValue = entry.messageEmbeddings.get(msg.index);
-        if (Array.isArray(legacyValue) && legacyValue.length > 0) {
+        if (isVector(legacyValue)) {
             migrated.set(key, legacyValue);
         }
     }
     // Keep any already-composite entries from mixed maps.
     for (const [key, value] of entry.messageEmbeddings.entries()) {
-        if (typeof key === 'string' && key.startsWith('m:') && Array.isArray(value) && value.length > 0) {
+        if (typeof key === 'string' && key.startsWith('m:') && isVector(value)) {
             migrated.set(key, value);
         }
     }
@@ -163,7 +341,8 @@ export function getMessageEmbedding(entry, msg, swipeIndex = null) {
     const resolvedSwipe = swipeIndex == null ? getMessageActiveSwipeIndex(msg) : Math.max(0, Math.floor(Number(swipeIndex) || 0));
     const compositeKey = makeMessageEmbeddingKey(msg.index, resolvedSwipe);
     const fromComposite = entry.messageEmbeddings.get(compositeKey);
-    if (Array.isArray(fromComposite) && fromComposite.length > 0) {
+    if (isVector(fromComposite)) {
+        residentVectors.get(vectorKey(entry.fileName, 'message', compositeKey));
         return fromComposite;
     }
 
@@ -171,7 +350,8 @@ export function getMessageEmbedding(entry, msg, swipeIndex = null) {
     // must never borrow this vector just because its own embedding is missing.
     const fromLegacy = resolvedSwipe === getMessageActiveSwipeIndex(msg)
         ? entry.messageEmbeddings.get(msg.index) : null;
-    if (Array.isArray(fromLegacy) && fromLegacy.length > 0) {
+    if (isVector(fromLegacy)) {
+        residentVectors.get(vectorKey(entry.fileName, 'message', msg.index));
         return fromLegacy;
     }
 
@@ -195,13 +375,42 @@ function retainMessageEmbeddings(entry, messages) {
         const swipeCount = Math.max(msg.swipes?.length || 0, getMessageActiveSwipeIndex(msg) + 1);
         for (let swipe = 0; swipe < swipeCount; swipe++) {
             const text = messageVariantText(msg, swipe);
-            if (!text || text !== messageVariantText(previous, swipe)) continue;
+            if (!text) continue;
+            if (previous.isDescriptor) {
+                const descriptor = descriptorsFor([msg])[0];
+                if (previous.swipeHashes?.[swipe] !== descriptor.swipeHashes?.[swipe]) continue;
+            } else if (text !== messageVariantText(previous, swipe)) continue;
             const vector = previousMap.get(makeMessageEmbeddingKey(previous.index, swipe));
             if (vector) retained.set(makeMessageEmbeddingKey(msg.index, swipe), vector);
         }
     }
     compositeEmbeddingMaps.add(retained);
     return retained;
+}
+
+function retainCachedEmbeddingKeys(entry, messages) {
+    const previousKeys = entry.cachedMessageEmbeddingKeys;
+    if (!(previousKeys instanceof Set)) return new Set();
+    const retained = new Set();
+    for (let i = 0; i < messages.length; i++) {
+        const previous = entry.messages?.[i];
+        if (!previous) continue;
+        const oldDescriptor = descriptorsFor([previous])[0];
+        const nextDescriptor = descriptorsFor([messages[i]])[0];
+        for (let swipe = 0; swipe < nextDescriptor.swipeCount; swipe++) {
+            if (oldDescriptor.swipeHashes?.[swipe] !== nextDescriptor.swipeHashes?.[swipe]) continue;
+            if (previousKeys.has(makeMessageEmbeddingKey(previous.index, swipe))) {
+                retained.add(makeMessageEmbeddingKey(messages[i].index, swipe));
+            }
+        }
+    }
+    return retained;
+}
+
+function forgetEntryVectors(fileName) {
+    for (const key of [...(vectorKeysByFile.get(fileName) || [])]) residentVectors.delete(key);
+    vectorKeysByFile.delete(fileName);
+    vectorOwners.delete(fileName);
 }
 
 /**
@@ -212,13 +421,23 @@ function retainMessageEmbeddings(entry, messages) {
  * @param {number[]} vector
  */
 export function setMessageEmbedding(entry, messageIndex, swipeIndex, vector) {
-    if (!entry || !Array.isArray(vector) || vector.length === 0) return;
+    if (!entry || !isVector(vector)) return false;
     const map = ensureMessageEmbeddingMap(entry);
     const key = makeMessageEmbeddingKey(messageIndex, swipeIndex);
-    if (map.get(key) !== vector) {
-        map.set(key, vector);
+    entry.cachedMessageEmbeddingKeys ||= new Set();
+    entry.cachedMessageEmbeddingKeys.add(key);
+    if (vector.length * Float32Array.BYTES_PER_ELEMENT > residentVectors.maxBytes) {
+        residentVectors.delete(vectorKey(entry.fileName, 'message', key));
+        map.delete(key);
+        return false;
+    }
+    const compact = toFloat32Vector(vector);
+    if (!rememberVector(entry, 'message', key, compact)) return false;
+    if (map.get(key) !== compact) {
+        map.set(key, compact);
         entry.messageEmbeddingVersion = (entry.messageEmbeddingVersion || 0) + 1;
     }
+    return true;
 }
 
 /**
@@ -253,7 +472,7 @@ export async function fetchChatList() {
  * @param {string} fileName - The JSONL filename
  * @returns {Promise<Array>} Array of message objects
  */
-export async function fetchChatContent(fileName) {
+export async function fetchChatContent(fileName, { signal } = {}) {
     const context = SillyTavern.getContext();
     if (context.characterId === undefined) return [];
 
@@ -262,6 +481,7 @@ export async function fetchChatContent(fileName) {
 
     const response = await fetch('/api/chats/get', {
         method: 'POST',
+        signal,
         headers: context.getRequestHeaders(),
         body: JSON.stringify({
             ch_name: character.name,
@@ -286,7 +506,7 @@ export async function fetchChatContent(fileName) {
  * @param {string} fileName - Chat filename
  * @returns {IndexMessage[]}
  */
-function parseMessages(chatData, fileName) {
+function parseMessages(chatData, fileName, previousMessages = null) {
     const messages = [];
     // Disk arrays include a header; the host's live chat array does not.
     const offset = chatData[0] && typeof chatData[0].mes !== 'string' ? 1 : 0;
@@ -294,6 +514,22 @@ function parseMessages(chatData, fileName) {
         const msg = chatData[i];
         // Skip metadata-only entries (no 'mes' field)
         if (!msg || typeof msg.mes !== 'string') continue;
+
+        const previous = previousMessages?.[i - offset];
+        const rawBranches = Array.isArray(msg.extra?.branches) ? msg.extra.branches.map(canonicalFilename).filter(Boolean) : [];
+        const rawSwipeId = Number.isFinite(Number(msg.swipe_id)) ? Math.max(0, Math.floor(Number(msg.swipe_id))) : 0;
+        const expectedSwipes = Array.isArray(msg.swipes) && msg.swipes.length ? msg.swipes : (msg.mes.trim() ? [msg.mes] : []);
+        const expectedSwipeId = expectedSwipes.length ? Math.min(rawSwipeId, expectedSwipes.length - 1) : 0;
+        if (previous && !previous.isDescriptor && previous.index === i - offset
+            && previous.text === msg.mes && previous.role === (msg.is_user ? 'user' : 'assistant')
+            && previous.timestamp === (msg.send_date || '') && previous.swipeId === expectedSwipeId
+            && (previous.branches?.length || 0) === rawBranches.length
+            && rawBranches.every((branch, n) => branch === previous.branches[n])
+            && (previous.swipes?.length || 0) === expectedSwipes.length
+            && expectedSwipes.every((swipe, n) => previous.swipes[n] === (n === expectedSwipeId ? msg.mes : (typeof swipe === 'string' ? swipe : '')))) {
+            messages.push(previous);
+            continue;
+        }
 
         const rawSwipes = Array.isArray(msg.swipes) ? msg.swipes : null;
         let swipeId = Number.isFinite(Number(msg.swipe_id)) ? Math.max(0, Math.floor(Number(msg.swipe_id))) : 0;
@@ -322,11 +558,12 @@ function parseMessages(chatData, fileName) {
             text: msg.mes,
             timestamp: msg.send_date || '',
             timestampMs: timestampMs(msg.send_date),
-            branches: Array.isArray(msg.extra?.branches) ? msg.extra.branches.map(canonicalFilename).filter(Boolean) : [],
+            branches: rawBranches,
             swipes: swipes || undefined,
             swipeId,
         });
     }
+    if (previousMessages && messages.length === previousMessages.length && messages.every((message, i) => message === previousMessages[i])) return previousMessages;
     return messages;
 }
 
@@ -526,6 +763,7 @@ function bumpIndexVersion() {
     cachedSearchableMessages = null;
     cachedSearchableVersion = -1;
     indexVersion++;
+    invalidateSearchableCache();
 }
 
 function normalizeEntryShape(entry) {
@@ -554,7 +792,11 @@ function normalizeEntryShape(entry) {
     if (typeof entry.isLoaded !== 'boolean') {
         entry.isLoaded = entry.messages.length > 0;
     }
-    if (!Array.isArray(entry.chatEmbedding)) {
+    if (typeof entry.bodyResident !== 'boolean') {
+        entry.bodyResident = entry.isLoaded && !entry.messages.some(message => message?.isDescriptor);
+    }
+    if (!Array.isArray(entry.messageDescriptors)) entry.messageDescriptors = descriptorsFor(entry.messages);
+    if (!isVector(entry.chatEmbedding)) {
         entry.chatEmbedding = null;
     }
     if (typeof entry.chatEmbeddingHash !== 'string') {
@@ -585,12 +827,13 @@ function messagesEqual(a, b) {
         if (left?.filename !== right?.filename
             || left?.index !== right?.index
             || left?.role !== right?.role
-            || left?.text !== right?.text
+            || !sameMessageContent(left, right)
             || left?.timestamp !== right?.timestamp
             || JSON.stringify(left?.branches || []) !== JSON.stringify(right?.branches || [])
             || getMessageActiveSwipeIndex(left) !== getMessageActiveSwipeIndex(right)) return false;
-        const leftSwipes = left?.swipes;
-        const rightSwipes = right?.swipes;
+        const useHashes = left?.isDescriptor || right?.isDescriptor;
+        const leftSwipes = useHashes ? descriptorsFor([left])[0].swipeHashes : left?.swipes;
+        const rightSwipes = useHashes ? descriptorsFor([right])[0].swipeHashes : right?.swipes;
         if (leftSwipes === rightSwipes) continue;
         if (!Array.isArray(leftSwipes) || !Array.isArray(rightSwipes) || leftSwipes.length !== rightSwipes.length) return false;
         for (let swipe = 0; swipe < leftSwipes.length; swipe++) {
@@ -639,7 +882,7 @@ async function hydrateEntry(fileName, sessionId, persist = true) {
                 continue;
             }
 
-            const messages = parseMessages(chatData, fileName);
+            const messages = parseMessages(chatData, fileName, current.bodyResident !== false ? current.messages : null);
             const firstTs = messages.length > 0 ? messages[0].timestamp : null;
             const lastTs = messages.length > 0 ? messages[messages.length - 1].timestamp : current.lastMessageTimestamp;
 
@@ -657,16 +900,22 @@ async function hydrateEntry(fileName, sessionId, persist = true) {
                 validatedAt: Date.now(),
                 mainChat: mainChatFromData(chatData),
                 messageEmbeddings: retainMessageEmbeddings(current, messages),
+                cachedMessageEmbeddingKeys: retainCachedEmbeddingKeys(current, messages),
             };
+            rememberResidentBody(chatIndex[fileName]);
             if (!current.isLoaded || getRepresentativeEmbeddingText(current) !== getRepresentativeEmbeddingText(chatIndex[fileName])) {
                 chatIndex[fileName].chatEmbedding = null;
                 chatIndex[fileName].chatEmbeddingHash = null;
+                chatIndex[fileName].cachedChatEmbeddingHash = null;
                 chatIndex[fileName].clusterLabel = null;
             }
+            syncEntryVectorBudget(chatIndex[fileName]);
             bumpIndexVersion();
 
             if (persist && currentCharacterAvatar) {
-                putCachedChat(currentCharacterAvatar, fileName, chatIndex[fileName]);
+                await putCachedChat(currentCharacterAvatar, fileName, chatIndex[fileName]);
+                if (sessionId !== hydrationSessionId || !chatIndex[fileName]) return false;
+                trimBodyCache({ keepFile: fileName });
             }
 
             return true;
@@ -706,7 +955,8 @@ function startHydrationLoop() {
                         const entry = chatIndex[batch[i]];
                         if (results[i] && entry?.isLoaded && !entry.needsHydration) hydrated.push({ fileName: batch[i], entry });
                     }
-                    putCachedChats(currentCharacterAvatar, hydrated);
+                    await putCachedChats(currentCharacterAvatar, hydrated);
+                    trimBodyCache();
                 }
                 if (sessionId === hydrationSessionId) emitHydrationUpdate();
                 if (sessionId === hydrationSessionId && hydrationQueue.length > 0) {
@@ -787,7 +1037,11 @@ export async function buildIndex(onProgress, onMetadataReady, options = {}) {
         if (!chatList || !chatList.length) {
             changed = Object.keys(chatIndex).length > 0;
             for (const fileName of Object.keys(chatIndex)) removeCachedChat(character.avatar, fileName);
+            clearResidentVectors();
             chatIndex = {};
+            residentBodies.clear();
+            residentBodyBytes = 0;
+            activeBodyFile = null;
             if (changed) bumpIndexVersion();
             resetHydrationQueue();
             notifyMetadataReady(onMetadataReady, changed);
@@ -853,38 +1107,49 @@ export async function buildIndex(onProgress, onMetadataReady, options = {}) {
                 cacheFiles.push(fileName);
             }
         }
-        if (cacheFiles.length > 0) {
-            await consumeCachedChatsForCharacter(character.avatar, cacheFiles, (fileName, cached) => {
-                const meta = serverChats.get(fileName);
-                return buildSessionId === hydrationSessionId && currentCharacterAvatar === buildAvatar
-                    && chatIndex[fileName] === entriesBeforeCacheRead.get(fileName)
-                    && cached.lastModified === getMetaTimestamp(meta)
-                    && cached.serverSignature === metaSignature(meta) && recentlyValidated(cached);
-            }, (entries) => {
-                if (buildSessionId !== hydrationSessionId || currentCharacterAvatar !== buildAvatar) return false;
-                let restored = false;
-                for (const [fileName, cached] of entries) {
-                    const entry = chatIndex[fileName];
-                    if (entry !== entriesBeforeCacheRead.get(fileName) || !recentlyValidated(cached)) continue;
-                    for (const msg of cached.messages) if (!msg.filename) msg.filename = fileName;
+        // Catalog records contain fingerprints/previews, never complete bodies.
+        // The iterator also projects legacy cache records one at a time.
+        const idbCache = new Map();
+        try {
+            if (cacheFiles.length > 0) {
+                for await (const { fileName, entry } of iterateCachedChatCatalogs(character.avatar, cacheFiles, {
+                    acceptMetadata: (fileName, cached) => {
+                        const metadata = serverChats.get(fileName);
+                        return buildSessionId === hydrationSessionId && currentCharacterAvatar === buildAvatar
+                            && chatIndex[fileName] === entriesBeforeCacheRead.get(fileName)
+                            && cached.lastModified === getMetaTimestamp(metadata)
+                            && cached.serverSignature === metaSignature(metadata) && recentlyValidated(cached);
+                    },
+                })) {
+                    if (buildSessionId !== hydrationSessionId || currentCharacterAvatar !== buildAvatar) {
+                        return getBuildStateResponse(false);
+                    }
+                    if (!Array.isArray(entry.messages)) continue;
+                    for (const msg of entry.messages) {
+                        if (!msg.filename) msg.filename = fileName;
+                    }
+                    idbCache.set(fileName, entry);
+                    const current = chatIndex[fileName];
+                    const metadata = serverChats.get(fileName);
+                    if (!current || current !== entriesBeforeCacheRead.get(fileName)
+                        || entry.lastModified !== getMetaTimestamp(metadata)
+                        || entry.serverSignature !== metaSignature(metadata) || !recentlyValidated(entry)) continue;
                     chatIndex[fileName] = {
-                        ...entry, ...cached, fileName, initialOrder: entry.initialOrder,
-                        firstTimestampMs: normalizeTimestamp(cached.firstMessageTimestamp),
-                        lastTimestampMs: normalizeTimestamp(cached.lastMessageTimestamp),
+                        ...current, ...entry, fileName, initialOrder: current.initialOrder,
+                        firstTimestampMs: normalizeTimestamp(entry.firstMessageTimestamp),
+                        lastTimestampMs: normalizeTimestamp(entry.lastMessageTimestamp),
                         branchPoint: null, isLoaded: true, needsHydration: false,
+                        bodyResident: false, messageDescriptors: entry.messages,
                         chatEmbedding: null, chatEmbeddingHash: null, clusterLabel: null, messageEmbeddings: null,
                     };
-                    // This build owns the restored replacement in the later reconciliation.
                     entriesBeforeCacheRead.set(fileName, chatIndex[fileName]);
                     queuedFiles.delete(fileName);
                     changed = true;
-                    restored = true;
+                    bumpIndexVersion();
                 }
-                if (restored) bumpIndexVersion();
-            });
-            if (buildSessionId !== hydrationSessionId || currentCharacterAvatar !== buildAvatar) {
-                return getBuildStateResponse(false);
             }
+        } catch {
+            // IndexedDB unavailable — proceed without cache
         }
 
         const existingKeys = indexKeysBeforeCacheRead;
@@ -906,21 +1171,40 @@ export async function buildIndex(onProgress, onMetadataReady, options = {}) {
                 && !metadataChanged && recentlyValidated(entry);
             if (reusable) continue;
 
-            // Keep the last successful body visible while revalidating; a
-            // failed request must not turn known-good data into an empty chat.
-            chatIndex[fileName] = {
-                ...entry, lastModified: serverTimestamp, serverSignature: signature,
-                sortTimestamp: metadataChanged ? serverTimestamp : entry.sortTimestamp,
-                needsHydration: true,
-            };
-            markEntryForHydration(fileName);
-            changed = true;
+            const cached = idbCache.get(fileName);
+            if (!options.forceRevalidate && !entry.isLoaded && cached
+                && cached.lastModified === serverTimestamp && cached.serverSignature === signature
+                && recentlyValidated(cached) && Array.isArray(cached.messages)) {
+                chatIndex[fileName] = {
+                    ...entry, ...cached, fileName, initialOrder: entry.initialOrder,
+                    firstTimestampMs: normalizeTimestamp(cached.firstMessageTimestamp),
+                    lastTimestampMs: normalizeTimestamp(cached.lastMessageTimestamp),
+                    branchPoint: null, isLoaded: true, needsHydration: false,
+                    bodyResident: false, messageDescriptors: cached.messages,
+                    chatEmbedding: null, chatEmbeddingHash: null, clusterLabel: null, messageEmbeddings: null,
+                };
+                queuedFiles.delete(fileName);
+                changed = true;
+            } else {
+                // Keep the last successful body visible while revalidating; a
+                // failed request must not turn known-good data into an empty chat.
+                chatIndex[fileName] = {
+                    ...entry, lastModified: serverTimestamp, serverSignature: signature,
+                    sortTimestamp: metadataChanged ? serverTimestamp : entry.sortTimestamp,
+                    needsHydration: true,
+                };
+                if (entry.isLoaded && entry.bodyResident !== false) rememberResidentBody(chatIndex[fileName]);
+                markEntryForHydration(fileName);
+                changed = true;
+            }
         }
 
         // Reconcile queue membership once, including all restored and deleted files.
         for (const deletedKey of existingKeys) {
             if (chatIndex[deletedKey] !== entriesBeforeCacheRead.get(deletedKey)) continue;
             delete chatIndex[deletedKey];
+            forgetResidentBody(deletedKey);
+            forgetEntryVectors(deletedKey);
             queuedFiles.delete(deletedKey);
             removeCachedChat(character.avatar, deletedKey);
             changed = true;
@@ -982,14 +1266,130 @@ export async function loadEntryNow(fileName) {
 
     normalizeEntryShape(entry);
 
-    if (entry.isLoaded && !entry.needsHydration) return true;
+    if (entry.isLoaded && !entry.needsHydration) {
+        if (entry.bodyResident !== false) {
+            touchResidentBody(fileName);
+            return true;
+        }
+        try {
+            const session = hydrationSessionId;
+            const messages = await readChatMessages(fileName);
+            if (session !== hydrationSessionId || !chatIndex[fileName]) return false;
+            const current = chatIndex[fileName];
+            current.messages = messages;
+            rememberResidentBody(current);
+            invalidateSearchableCache();
+            trimBodyCache({ keepFile: fileName });
+            return true;
+        } catch (error) {
+            console.warn(`[${MODULE_NAME}] Failed to load ${fileName}:`, error);
+            return false;
+        }
+    }
 
     queuedFiles.delete(fileName);
     hydrationQueue = hydrationQueue.filter(name => name !== fileName);
 
     const loaded = await hydrateEntry(fileName, hydrationSessionId);
+    if (loaded && chatIndex[fileName]?.bodyResident === false) return loadEntryNow(fileName);
     emitHydrationUpdate();
     return loaded;
+}
+
+function assertBodyReadCurrent(sessionId, avatar, signal) {
+    if (signal?.aborted) throw signal.reason || new DOMException('Aborted', 'AbortError');
+    const context = globalThis.SillyTavern?.getContext?.();
+    const currentAvatar = context?.characters?.[context.characterId]?.avatar;
+    if (sessionId !== hydrationSessionId || avatar !== currentCharacterAvatar || (avatar && currentAvatar !== avatar)) {
+        throw new DOMException('The selected character changed', 'AbortError');
+    }
+}
+
+/**
+ * Read a complete body for one operation. Cold bodies remain ephemeral; callers
+ * keep only IDs/previews after use. No residency or content revision changes are
+ * made for a successful read of an unchanged cached body.
+ */
+export async function readChatMessages(fileName, { signal } = {}) {
+    fileName = canonicalFilename(fileName);
+    const sessionId = hydrationSessionId;
+    const avatar = currentCharacterAvatar;
+    assertBodyReadCurrent(sessionId, avatar, signal);
+    let entry = chatIndex[fileName];
+    if (!entry) throw new Error(`Chat not present in this character's catalog: ${fileName}`);
+    normalizeEntryShape(entry);
+    if (!entry.isLoaded || entry.needsHydration) {
+        const loaded = await hydrateEntry(fileName, sessionId);
+        assertBodyReadCurrent(sessionId, avatar, signal);
+        entry = chatIndex[fileName];
+        if (!loaded || !entry?.isLoaded || entry.needsHydration) {
+            throw new Error(`Could not refresh chat ${fileName}; its previous cached data was preserved`);
+        }
+    }
+    if (entry?.isLoaded && entry.bodyResident !== false) {
+        touchResidentBody(fileName);
+        const messages = entry.messages;
+        trimBodyCache();
+        return messages;
+    }
+
+    await flushPendingCacheWrites();
+    assertBodyReadCurrent(sessionId, avatar, signal);
+    const cached = avatar ? await getCachedChat(avatar, fileName, { signal }) : null;
+    assertBodyReadCurrent(sessionId, avatar, signal);
+    if (chatIndex[fileName] !== entry) return readChatMessages(fileName, { signal });
+    if (cached && Array.isArray(cached.messages) && !cached.messages.some(message => message?.isDescriptor)
+        && cached.lastModified === entry.lastModified && cached.serverSignature === entry.serverSignature
+        && cached.validatedAt === entry.validatedAt) {
+        return cached.messages;
+    }
+
+    // IndexedDB is a cache. If it is unavailable or evicted, authoritative chat
+    // files remain readable and archive memory is still allowed to be bounded.
+    const raw = await fetchChatContent(fileName, { signal });
+    assertBodyReadCurrent(sessionId, avatar, signal);
+    const current = chatIndex[fileName];
+    if (!current) throw new Error(`Chat was removed while reading: ${fileName}`);
+    if (current !== entry) return readChatMessages(fileName, { signal });
+    const messages = parseMessages(raw, fileName);
+    if (!entry.isLoaded || !messagesEqual(entry.messages, messages)) {
+        const firstTs = messages[0]?.timestamp || null;
+        const lastTs = messages.at(-1)?.timestamp || entry.lastMessageTimestamp;
+        const updated = {
+            ...entry, messages, messageCount: messages.length,
+            firstMessageTimestamp: firstTs, lastMessageTimestamp: lastTs,
+            firstTimestampMs: normalizeTimestamp(firstTs), lastTimestampMs: normalizeTimestamp(lastTs),
+            mainChat: mainChatFromData(raw), isLoaded: true, needsHydration: false,
+            validatedAt: Date.now(), branchPoint: null,
+            messageEmbeddings: retainMessageEmbeddings(entry, messages),
+            cachedMessageEmbeddingKeys: retainCachedEmbeddingKeys(entry, messages),
+            chatEmbedding: null, chatEmbeddingHash: null, cachedChatEmbeddingHash: null, clusterLabel: null,
+        };
+        chatIndex[fileName] = updated;
+        syncEntryVectorBudget(updated);
+        rememberResidentBody(updated);
+        bumpIndexVersion();
+        if (avatar) await putCachedChat(avatar, fileName, updated);
+        assertBodyReadCurrent(sessionId, avatar, signal);
+        trimBodyCache();
+        emitHydrationUpdate();
+    }
+    return messages;
+}
+
+/** Complete archive iteration with at most one cold body held by the iterator. */
+export async function* iterateChatBodies({ fileNames, signal } = {}) {
+    const sessionId = hydrationSessionId;
+    const avatar = currentCharacterAvatar;
+    const names = Array.isArray(fileNames) ? [...fileNames] : getSortedEntries().map(entry => entry.fileName);
+    for (const name of names) {
+        assertBodyReadCurrent(sessionId, avatar, signal);
+        const fileName = canonicalFilename(name);
+        if (!chatIndex[fileName]) continue;
+        const messages = await readChatMessages(fileName, { signal });
+        assertBodyReadCurrent(sessionId, avatar, signal);
+        yield { entry: chatIndex[fileName], messages };
+    }
 }
 
 /** Invalidate a locally edited body even when the manager panel is closed. */
@@ -997,6 +1397,7 @@ export function markChatDirty(fileName) {
     const entry = chatIndex[fileName];
     if (!entry) return false;
     chatIndex[fileName] = { ...entry, needsHydration: true };
+    if (entry.isLoaded && entry.bodyResident !== false) rememberResidentBody(chatIndex[fileName]);
     // A same-length edit may not change list metadata, even after a page reload.
     if (currentCharacterAvatar) removeCachedChat(currentCharacterAvatar, fileName);
     markEntryForHydration(fileName);
@@ -1009,6 +1410,8 @@ export function removeChatFromIndex(fileName) {
     const resolved = canonicalFilename(fileName);
     if (!resolved || !chatIndex[resolved]) return false;
     delete chatIndex[resolved];
+    forgetResidentBody(resolved);
+    forgetEntryVectors(resolved);
     queuedFiles.delete(resolved);
     hydrationQueue = hydrationQueue.filter(name => name !== resolved);
     if (currentCharacterAvatar) removeCachedChat(currentCharacterAvatar, resolved);
@@ -1025,6 +1428,7 @@ export function removeChatFromIndex(fileName) {
  */
 export async function updateActiveChat(fileName) {
     if (!fileName || !chatIndex[fileName]) return false;
+    const updateSession = hydrationSessionId;
 
     try {
         // Prefer in-memory chat data over HTTP fetch
@@ -1036,8 +1440,9 @@ export async function updateActiveChat(fileName) {
             chatData = await fetchChatContent(fileName);
         }
 
-        const messages = parseMessages(chatData, fileName);
         const cached = chatIndex[fileName];
+        const messages = parseMessages(chatData, fileName, cached.bodyResident !== false ? cached.messages : null);
+        activeBodyFile = fileName;
         const firstTimestamp = messages.length > 0 ? messages[0].timestamp : null;
         const lastTimestamp = messages.length > 0 ? messages[messages.length - 1].timestamp : null;
         const parsedLastModified = timestampMs(lastTimestamp) ?? NaN;
@@ -1046,6 +1451,12 @@ export async function updateActiveChat(fileName) {
 
         const mainChat = mainChatFromData(chatData, context.chatMetadata);
         if (cached.isLoaded && !cached.needsHydration && (cached.mainChat || null) === mainChat && messagesEqual(cached.messages, messages)) {
+            if (cached.bodyResident === false) {
+                cached.messages = messages;
+                rememberResidentBody(cached);
+                invalidateSearchableCache();
+                trimBodyCache();
+            } else touchResidentBody(fileName);
             queuedFiles.delete(fileName);
             hydrationQueue = hydrationQueue.filter(name => name !== fileName);
             return false;
@@ -1067,18 +1478,24 @@ export async function updateActiveChat(fileName) {
             validatedAt: Date.now(),
             mainChat,
             messageEmbeddings: retainMessageEmbeddings(cached, messages),
+            cachedMessageEmbeddingKeys: retainCachedEmbeddingKeys(cached, messages),
         };
         if (getRepresentativeEmbeddingText(cached) !== getRepresentativeEmbeddingText(updated)) {
             updated.chatEmbedding = null;
             updated.chatEmbeddingHash = null;
+            updated.cachedChatEmbeddingHash = null;
             updated.clusterLabel = null;
         }
         chatIndex[fileName] = updated;
+        syncEntryVectorBudget(updated);
+        rememberResidentBody(updated);
         bumpIndexVersion();
 
         if (currentCharacterAvatar) {
-            putCachedChat(currentCharacterAvatar, fileName, chatIndex[fileName]);
+            await putCachedChat(currentCharacterAvatar, fileName, updated);
         }
+        if (updateSession !== hydrationSessionId || chatIndex[fileName] !== updated) return false;
+        trimBodyCache();
 
         queuedFiles.delete(fileName);
         hydrationQueue = hydrationQueue.filter(name => name !== fileName);
@@ -1145,7 +1562,7 @@ export function computeBranchPoint(baseMessages, candidateMessages) {
         return candidateCache.get(candidateMessages);
     }
 
-    if (candidateMessages[0]?.text !== baseMessages[0]?.text || candidateMessages[0]?.role !== baseMessages[0]?.role) {
+    if (!sameMessageContent(candidateMessages[0], baseMessages[0])) {
         candidateCache.set(candidateMessages, null);
         return null;
     }
@@ -1154,7 +1571,7 @@ export function computeBranchPoint(baseMessages, candidateMessages) {
     let divergeAt = maxCompare;
 
     for (let k = 1; k < maxCompare; k++) {
-        if (candidateMessages[k]?.text !== baseMessages[k]?.text || candidateMessages[k]?.role !== baseMessages[k]?.role) {
+        if (!sameMessageContent(candidateMessages[k], baseMessages[k])) {
             divergeAt = k;
             break;
         }
@@ -1168,7 +1585,7 @@ export function computeBranchPoint(baseMessages, candidateMessages) {
 function computeRelatedBranchPoint(baseMessages, candidateMessages) {
     // Provenance also permits a branch made from an alternate first greeting.
     if (baseMessages.length && candidateMessages.length
-        && (baseMessages[0].text !== candidateMessages[0].text || baseMessages[0].role !== candidateMessages[0].role)) return 0;
+        && !sameMessageContent(baseMessages[0], candidateMessages[0])) return 0;
     return computeBranchPoint(baseMessages, candidateMessages);
 }
 
@@ -1312,7 +1729,11 @@ export function getIndexCharacterAvatar() {
  * Clear the index (e.g., when no character is selected).
  */
 export function clearIndex() {
+    clearResidentVectors();
     chatIndex = {};
+    residentBodies.clear();
+    residentBodyBytes = 0;
+    activeBodyFile = null;
     currentCharacterAvatar = null;
     nextInitialOrder = 0;
     progressCallback = null;
@@ -1505,7 +1926,8 @@ export function getFilteredSortedEntries(filterState, sortState, getChatMetaFn) 
 }
 
 /**
- * Build a flat array of loaded messages for search.
+ * Build a flat array of resident messages for legacy callers. Full archive
+ * searches must use iterateChatBodies so eviction never narrows search recall.
  * Returns a cached array if the index hasn't changed since the last call.
  * @returns {Array}
  */
@@ -1516,7 +1938,7 @@ export function getSearchableMessages() {
 
     const messages = [];
     for (const chatData of Object.values(chatIndex)) {
-        if (!chatData.isLoaded) continue;
+        if (!chatData.isLoaded || chatData.bodyResident === false) continue;
 
         for (const msg of chatData.messages) {
             if (!msg.filename) msg.filename = chatData.fileName;

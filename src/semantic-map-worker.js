@@ -1,4 +1,5 @@
 const EPSILON = 1e-12;
+const isVector = value => Array.isArray(value) || (ArrayBuffer.isView(value) && !(value instanceof DataView));
 
 const state = {
     dims: 0,
@@ -7,6 +8,7 @@ const state = {
     norms: null,
     points2d: null,
     labels: null,
+    projectionBasis: null,
 };
 
 self.onmessage = async (event) => {
@@ -14,6 +16,35 @@ self.onmessage = async (event) => {
     const { type, jobId } = msg;
 
     try {
+        if (type === 'fitProjection') {
+            const vectors = new Float32Array(msg.vectorsFlatBuffer);
+            const count = Math.floor(vectors.length / msg.dims);
+            state.projectionBasis = computeProjectionBasis(vectors, count, msg.dims);
+            state.vectorsFlat = null;
+            state.norms = null;
+            self.postMessage({ type: 'projectionReady', rpcId: msg.rpcId });
+            return;
+        }
+        if (type === 'projectMapChunk') {
+            if (!state.projectionBasis || state.projectionBasis.mean.length !== msg.dims) throw new Error('Projection basis is stale');
+            const vectors = new Float32Array(msg.vectorsFlatBuffer);
+            const projected = projectWithBasis(vectors, Math.floor(vectors.length / msg.dims), msg.dims, state.projectionBasis);
+            self.postMessage({ type: 'chunkProjected', rpcId: msg.rpcId, pointsBuffer: projected.points2d.buffer }, [projected.points2d.buffer]);
+            return;
+        }
+        if (type === 'buildProjectedMap') {
+            const points = new Float32Array(msg.pointsBuffer);
+            const count = points.length / 2;
+            const k = count ? chooseK(points, count, msg.fixedK, msg.maxK || 8) : 0;
+            const result = kMeans2D(points, count, k);
+            const bounds = pointBounds(points);
+            self.postMessage({ type: 'projectedMapReady', rpcId: msg.rpcId, points2dBuffer: points.buffer,
+                labelsBuffer: result.labels.buffer, centroids2dBuffer: result.centroids.buffer,
+                clusterSizesBuffer: result.clusterSizes.buffer, bounds, k },
+                [points.buffer, result.labels.buffer, result.centroids.buffer, result.clusterSizes.buffer]);
+            state.projectionBasis = null;
+            return;
+        }
         if (type === 'buildMapData') {
             handleBuildMapData(msg);
             return;
@@ -26,6 +57,7 @@ self.onmessage = async (event) => {
         self.postMessage({
             type: 'error',
             jobId,
+            rpcId: msg.rpcId,
             message: err instanceof Error ? err.message : String(err),
         });
     }
@@ -76,6 +108,8 @@ function handleBuildMapData(msg) {
         bounds,
         k,
     }, [points2d.buffer, labels.buffer, centroids.buffer, clusterSizes.buffer]);
+    state.points2d = null;
+    state.labels = null;
 }
 
 function handleScoreQuery(msg) {
@@ -86,7 +120,7 @@ function handleScoreQuery(msg) {
         return;
     }
 
-    if (!Array.isArray(queryVector) || queryVector.length !== state.dims) {
+    if (!isVector(queryVector) || queryVector.length !== state.dims) {
         throw new Error(`Query vector dimension mismatch. Expected ${state.dims}, received ${queryVector?.length || 0}.`);
     }
 
@@ -167,7 +201,7 @@ function sampleIndices(n, sampleSize) {
     return out;
 }
 
-function projectPca2D(vectorsFlat, n, dims) {
+function computeProjectionBasis(vectorsFlat, n, dims) {
     const sampleSize = Math.min(n, 4096);
     const sample = sampleIndices(n, sampleSize);
     const mean = new Float64Array(dims);
@@ -186,6 +220,14 @@ function projectPca2D(vectorsFlat, n, dims) {
     const compA = powerIterComponent(vectorsFlat, sample, dims, mean, null);
     const compB = powerIterComponent(vectorsFlat, sample, dims, mean, compA);
 
+    return { mean, compA, compB };
+}
+
+function projectPca2D(vectorsFlat, n, dims) {
+    return projectWithBasis(vectorsFlat, n, dims, computeProjectionBasis(vectorsFlat, n, dims));
+}
+
+function projectWithBasis(vectorsFlat, n, dims, { mean, compA, compB }) {
     const points = new Float32Array(n * 2);
     let minX = Infinity;
     let maxX = -Infinity;
@@ -222,6 +264,15 @@ function projectPca2D(vectorsFlat, n, dims) {
         points2d: points,
         bounds: { minX, maxX, minY, maxY },
     };
+}
+
+function pointBounds(points) {
+    let minX = Infinity, maxX = -Infinity, minY = Infinity, maxY = -Infinity;
+    for (let i = 0; i < points.length; i += 2) {
+        minX = Math.min(minX, points[i]); maxX = Math.max(maxX, points[i]);
+        minY = Math.min(minY, points[i + 1]); maxY = Math.max(maxY, points[i + 1]);
+    }
+    return Number.isFinite(minX) ? { minX, maxX, minY, maxY } : { minX: -1, maxX: 1, minY: -1, maxY: 1 };
 }
 
 function powerIterComponent(vectorsFlat, sample, dims, mean, orthogonalTo = null) {
@@ -366,6 +417,7 @@ function chooseK(points2d, n, fixedK, maxK) {
 }
 
 function kMeans2D(points2d, n, k, opts = {}) {
+    if (n <= 0) return { labels: new Uint16Array(0), centroids: new Float32Array(0), clusterSizes: new Uint32Array(0), inertia: 0 };
     const clusterCount = Math.max(1, Math.min(n, Math.floor(k)));
     const rng = mulberry32(seedFromPoints(points2d, n, clusterCount));
     const { centroidsX, centroidsY } = initKMeansPlusPlus(points2d, n, clusterCount, rng);

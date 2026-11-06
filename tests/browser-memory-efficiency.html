@@ -36,7 +36,8 @@ document.getElementById('run').onclick = async () => {
         await transaction(db, 'chats', 'readwrite', tx => tx.objectStore('chats').put({ key:'fixture:legacy', messages:[{text:'preserved legacy'}] }));
         db.close();
         const original = await (await fetch('../src/cache-store.js')).text();
-        const source = original.replace("const DB_NAME = 'chat_manager_cache';", `const DB_NAME = ${JSON.stringify(dbName)};`);
+        const source = original.replace("const DB_NAME = 'chat_manager_cache';", `const DB_NAME = ${JSON.stringify(dbName)};`)
+            .replace(/from '(\.\/[^']+)'/g, (_match, relative) => `from '${new URL(`../src/${relative.slice(2)}`, import.meta.url).href}'`);
         assert(source !== original, 'cache fixture uses a unique isolated database');
         moduleURL = URL.createObjectURL(new Blob([source], {type:'text/javascript'}));
         const cache = await import(moduleURL);
@@ -58,7 +59,7 @@ document.getElementById('run').onclick = async () => {
         });
         assert(legacy.messages[0].text === 'preserved legacy', 'v2 body survives the schema upgrade');
         const names = Array.from({length:121}, (_, i) => `fresh-${i}`);
-        cache.putCachedChats('fixture', [...names, 'expired'].map(fileName => ({fileName, entry:{
+        await cache.putCachedChats('fixture', [...names, 'expired'].map(fileName => ({fileName, entry:{
             lastModified:1, serverSignature:'current', validatedAt:Date.now() - (fileName === 'expired' ? 90_000 : 0),
             messageCount:1, messages:[{text:fileName}],
         }})));

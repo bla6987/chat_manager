@@ -3,11 +3,11 @@
  */
 
 import {
-    buildIndex, getHydrationProgress, getIndex, getSearchableMessages, getSortedEntries,
+    buildIndex, getHydrationProgress, getIndex, getSortedEntries,
     getFilteredSortedEntries, getIndexVersion,
     isHydrationComplete, onHydrationUpdate, prioritizeInQueue, prioritizeHydrationFiles, runDeferredBranchDetection,
-    getSiblingBranchContextForThread,
-    ensureMessageEmbeddingMap, getMessageActiveSwipeIndex, getMessageEmbedding, setMessageEmbedding, makeMessageEmbeddingKey,
+    readChatMessages, trimBodyCache,
+    ensureMessageEmbeddingMap, getMessageActiveSwipeIndex, getMessageEmbedding, setMessageEmbedding, setChatEmbedding, clearResidentVectors, makeMessageEmbeddingKey,
 } from './chat-reader.js';
 import {
     getDisplayName, getSummary,
@@ -22,7 +22,7 @@ import {
     isEmbeddingChatSelected, setEmbeddingChatSelected,
 } from './metadata-store.js';
 import {
-    updateBranchContextInjection, clearBranchContextInjection, formatBranchContextForSummary,
+    updateBranchContextInjection, clearBranchContextInjection, formatBranchContextForSummary, getSiblingMessagesAsync,
 } from './branch-context.js';
 import {
     generateTitleForChat, generateSummaryForChat,
@@ -52,12 +52,17 @@ import {
     captureEmbeddingOperation, isEmbeddingOperationCurrent, invalidateEmbeddingOperations, isStaleEmbeddingOperationError,
     onEmbeddingDimensionsInvalidated,
 } from './embedding-service.js';
-import { clusterColor, findOptimalK, findOptimalKAsync, kMeans, kMeansAsync, topicShiftScores } from './semantic-engine.js';
-import { rankSemanticCandidates } from './semantic-search.js';
+import { clusterColor, cosineSimilarity, findOptimalKAsync, kMeansAsync } from './semantic-engine.js';
 import { resolveActiveChatFilename } from './active-chat.js';
 import { getRepresentativeEmbeddingText } from './embedding-text.js';
 import { navigateToChat } from './chat-navigation.js';
 import { timestampMs } from './timestamps.js';
+import { isVector } from './vector-utils.js';
+import { iterateVariantBatches } from './archive-data.js';
+import { searchArchivePage } from './archive-search.js';
+import { computeArchiveClusters } from './archive-clusters.js';
+import { computeArchiveDriftSummary } from './archive-drift.js';
+import { messagePreview } from './message-descriptors.js';
 
 const MODULE_NAME = 'chat_manager';
 const HYBRID_SEARCH_MIN_CHARS = 5;
@@ -136,6 +141,9 @@ const clusterVectorIds = new WeakMap();
 let nextClusterInputId = 1;
 let queryEmbeddingEpoch = 0;
 let driftSummaryCache = new WeakMap();
+const pendingDriftFiles = new Set();
+let driftWorkTimer = null;
+let driftWorkController = null;
 
 // A view can discover provider dimension drift before a foreground run does.
 // Retire every transient vector with the persistent cache in that same event.
@@ -146,7 +154,7 @@ onEmbeddingDimensionsInvalidated(() => clearInMemoryEmbeddings({ rerender: false
  * @type {{ query: string, lowerQuery: string, searchable: Array, position: number, results: Array, totalMatches: number, exhausted?: boolean, mode?: 'keyword'|'semantic' } | null}
  */
 let searchState = null;
-let activeSearchRequestId = null;
+let searchPageAbort = null;
 let searchRefreshPending = false;
 /** @type {null|'keyword'|'semantic'} — null = auto, otherwise forced mode */
 let searchModeOverride = null;
@@ -205,7 +213,8 @@ function _invalidateDomCache() {
 
 export function resetSearchState() {
     cancelSearchRefresh();
-    activeSearchRequestId = null;
+    searchPageAbort?.abort();
+    searchPageAbort = null;
     latestSearchRequestId += 1;
     searchState = null;
     setSearchModeBadge('keyword');
@@ -235,8 +244,7 @@ function canSemanticSearch() {
     const settings = getEmbeddingSettings();
     return isEmbeddingLevelOn(settings, 'message')
         && isEmbeddingLevelOn(settings, 'query')
-        && isEmbeddingConfigured()
-        && hasMessageEmbeddings();
+        && isEmbeddingConfigured();
 }
 
 function ensureSearchModeBadge() {
@@ -308,7 +316,7 @@ function setSearchModeBadge(mode) {
 
 function hasMessageEmbeddings() {
     const entries = Object.values(getIndex());
-    return entries.some(entry => entry.messageEmbeddings instanceof Map && entry.messageEmbeddings.size > 0);
+    return entries.some(entry => (entry.messageEmbeddings instanceof Map && entry.messageEmbeddings.size > 0) || entry.cachedMessageEmbeddingKeys?.size > 0);
 }
 
 function isEmbeddingLevelOn(settings, level) {
@@ -434,11 +442,15 @@ function shouldRedetectK(chatCount) {
 async function runDebouncedRecluster() {
     clearReclusterTimer();
     const index = getIndex();
-    const chatCount = Object.values(index).filter(entry => Array.isArray(entry.chatEmbedding) && entry.chatEmbedding.length > 0).length;
+    const chatCount = Object.values(index).filter(entry => hasChatEmbedding(entry) || entry.cachedChatEmbeddingHash).length;
     const reuseK = !shouldRedetectK(chatCount);
     const fixedK = reuseK ? lastClusterK : null;
 
-    const result = await recomputeEmbeddingClusters({ fixedK });
+    let result;
+    try { result = await recomputeEmbeddingClusters({ fixedK }); } catch (error) {
+        if (error?.name !== 'AbortError' && !isStaleEmbeddingOperationError(error)) console.warn(`[${MODULE_NAME}] Clustering failed:`, error);
+        return;
+    }
     pendingClusterChanges = 0;
     lastClusterResult = result.clusterCount;
     refreshAfterEmbeddingUpdate();
@@ -461,47 +473,83 @@ function scheduleDebouncedRecluster(changedCount) {
     return false;
 }
 
+function driftCacheToken(entry) {
+    return `${captureEmbeddingOperation().epoch}:${entry.cachedMessageEmbeddingKeys?.size || 0}`;
+}
+
 function getDriftSummary(entry) {
-    if (!entry || !(entry.messageEmbeddings instanceof Map) || entry.messageEmbeddings.size < 2) return null;
-    if (!Array.isArray(entry.messages) || entry.messages.length < 2) return null;
-
+    if (!entry?.isLoaded || entry.needsHydration || (entry.messages?.length || 0) < 2) return null;
+    if (!isEmbeddingLevelOn(getEmbeddingSettings(), 'message')) return null;
+    const token = driftCacheToken(entry);
     const cached = driftSummaryCache.get(entry);
-    if (cached && cached.map === entry.messageEmbeddings && cached.version === entry.messageEmbeddingVersion) return cached.value;
-
-    const vectors = [];
-    const msgIndices = [];
-    for (const msg of entry.messages) {
-        const vector = getMessageEmbedding(entry, msg);
-        if (!Array.isArray(vector) || vector.length === 0) continue;
-        vectors.push(vector);
-        msgIndices.push(msg.index);
-    }
-
-    if (vectors.length < 2) return null;
-
-    const scores = topicShiftScores(vectors);
-    const majorPositions = [];
-    const moderatePositions = [];
-
-    for (let i = 0; i < scores.length; i++) {
-        const score = scores[i];
-        const transitionMsg = msgIndices[i + 1] ?? msgIndices[i];
-        if (score > 0.4) {
-            majorPositions.push(transitionMsg);
-        } else if (score > 0.3) {
-            moderatePositions.push(transitionMsg);
+    if (cached?.token === token) {
+        if (pendingDriftFiles.has(entry.fileName) && panelOpen && !isAnyViewActive() && !driftWorkTimer && !driftWorkController) {
+            driftWorkTimer = setTimeout(() => { driftWorkTimer = null; void refreshDriftSummaries(); }, 80);
         }
+        return cached.value;
     }
+    if (!panelOpen || isAnyViewActive()) return null;
+    driftSummaryCache.set(entry, { token, value: null });
+    pendingDriftFiles.add(entry.fileName);
+    if (!driftWorkTimer && !driftWorkController) {
+        driftWorkTimer = setTimeout(() => {
+            driftWorkTimer = null;
+            void refreshDriftSummaries();
+        }, 80);
+    }
+    return null;
+}
 
-    const all = [...majorPositions, ...moderatePositions];
-    const summary = all.length === 0 ? null : {
-        count: all.length,
-        majorCount: majorPositions.length,
-        positions: all.slice(0, 5),
-        firstMsgIndex: all[0],
-    };
-    driftSummaryCache.set(entry, { map: entry.messageEmbeddings, version: entry.messageEmbeddingVersion, value: summary });
-    return summary;
+function cancelDriftWork() {
+    if (driftWorkTimer) clearTimeout(driftWorkTimer);
+    driftWorkTimer = null;
+    driftWorkController?.abort();
+    driftWorkController = null;
+    pendingDriftFiles.clear();
+    driftSummaryCache = new WeakMap();
+}
+
+function patchDriftBadge(fileName, summary) {
+    const card = _getContent()?.querySelector(`.chat-manager-card[data-filename="${CSS.escape(fileName)}"]`);
+    const meta = card?.querySelector('.chat-manager-card-meta');
+    if (!meta) return;
+    meta.querySelector('.chat-manager-drift-jump')?.remove();
+    if (!summary) return;
+    const button = document.createElement('button');
+    button.type = 'button';
+    button.className = 'chat-manager-drift-jump';
+    button.dataset.filename = fileName;
+    button.dataset.msgIndex = String(summary.firstMsgIndex);
+    button.title = `Topic shifts near messages: ${summary.positions.join(', ')}`;
+    button.textContent = `${summary.count} topic shift${summary.count !== 1 ? 's' : ''}`;
+    button.addEventListener('click', handleJumpToGraphMessage);
+    meta.appendChild(button);
+}
+
+async function refreshDriftSummaries() {
+    if (driftWorkController || !panelOpen || isAnyViewActive()) return;
+    const controller = new AbortController();
+    driftWorkController = controller;
+    try {
+        while (pendingDriftFiles.size && panelOpen && !isAnyViewActive() && !controller.signal.aborted) {
+            const fileName = pendingDriftFiles.values().next().value;
+            pendingDriftFiles.delete(fileName);
+            const entry = getIndex()[fileName];
+            if (!entry || entry.needsHydration) continue;
+            const token = driftCacheToken(entry);
+            try {
+                const value = await computeArchiveDriftSummary(fileName, { signal: controller.signal });
+                if (controller.signal.aborted || !panelOpen || getIndex()[fileName] !== entry || driftCacheToken(entry) !== token) continue;
+                driftSummaryCache.set(entry, { token, value });
+                if (!isAnyViewActive()) patchDriftBadge(fileName, value);
+            } catch (error) {
+                driftSummaryCache.delete(entry);
+                if (error?.name !== 'AbortError' && !isStaleEmbeddingOperationError(error)) console.warn(`[${MODULE_NAME}] Topic shift scan failed:`, error);
+            }
+        }
+    } finally {
+        if (driftWorkController === controller) driftWorkController = null;
+    }
 }
 
 function queueEmbeddingRun(task) {
@@ -542,93 +590,6 @@ function clampPositiveInt(value, fallback) {
     return Math.max(1, Math.floor(numeric));
 }
 
-function collectMessageVariantsForEmbedding(msg, settings, mode = 'all') {
-    const variants = [];
-    const activeSwipeIndex = getMessageActiveSwipeIndex(msg);
-    const activeText = typeof msg?.text === 'string' ? msg.text.trim() : '';
-    const includeAlternates = getEmbeddingOption(settings, 'includeAlternateSwipes', false) === true;
-    const maxSwipesPerMessage = clampPositiveInt(getEmbeddingOption(settings, 'maxSwipesPerMessage', 8), 8);
-    const rawSwipes = Array.isArray(msg?.swipes) ? msg.swipes : [];
-
-    const shouldIncludeActive = mode === 'all' || mode === 'active';
-    const shouldIncludeAlternates = includeAlternates && (mode === 'all' || mode === 'alternate');
-
-    if (shouldIncludeActive && activeText.length > 0) {
-        variants.push({
-            swipeIndex: activeSwipeIndex,
-            text: activeText,
-            isActive: true,
-        });
-    }
-
-    if (!shouldIncludeAlternates || rawSwipes.length === 0) {
-        return variants;
-    }
-
-    const limit = Math.min(rawSwipes.length, maxSwipesPerMessage);
-    for (let swipeIndex = 0; swipeIndex < limit; swipeIndex++) {
-        if (swipeIndex === activeSwipeIndex) continue;
-        const swipeText = typeof rawSwipes[swipeIndex] === 'string' ? rawSwipes[swipeIndex].trim() : '';
-        if (!swipeText) continue;
-        variants.push({
-            swipeIndex,
-            text: swipeText,
-            isActive: false,
-        });
-    }
-
-    return variants;
-}
-
-function getMessageEmbeddingCandidates(entries, settings, mode = 'all', messageWindowLimit = null) {
-    const candidates = [];
-    for (const entry of entries) {
-        if (!entry?.isLoaded || entry.needsHydration || !Array.isArray(entry.messages) || entry.messages.length === 0) continue;
-        ensureMessageEmbeddingMap(entry);
-
-        const messages = Number.isFinite(messageWindowLimit) && messageWindowLimit > 0
-            ? entry.messages.slice(-Math.floor(messageWindowLimit))
-            : entry.messages;
-        for (const msg of messages) {
-            const variants = collectMessageVariantsForEmbedding(msg, settings, mode);
-            for (const variant of variants) {
-                const existingVector = getMessageEmbedding(entry, msg, variant.swipeIndex);
-                if (Array.isArray(existingVector) && existingVector.length > 0) continue;
-
-                const key = makeMessageEmbeddingKey(msg.index, variant.swipeIndex);
-                candidates.push({
-                    entry,
-                    msgIndex: msg.index,
-                    swipeIndex: variant.swipeIndex,
-                    key,
-                    text: variant.text,
-                    hash: hashEmbeddingText(variant.text),
-                    isActive: variant.isActive,
-                });
-            }
-        }
-    }
-    return candidates;
-}
-
-async function restoreCachedCandidates(candidates, apply, options = {}) {
-    const chunkSize = 50;
-    const pending = [];
-    for (let offset = 0; offset < candidates.length; offset += chunkSize) {
-        if (options.shouldDefer?.()) return { pending, deferred: true };
-        const chunk = candidates.slice(offset, offset + chunkSize);
-        const cached = await getCachedEmbeddingsForTexts(chunk.map(item => item.text));
-        for (let i = 0; i < chunk.length; i++) {
-            if (Array.isArray(cached[i]) && cached[i].length > 0) {
-                apply(chunk[i], cached[i]);
-            } else {
-                pending.push(chunk[i]);
-            }
-        }
-    }
-    return { pending, deferred: false };
-}
-
 function deferAutomaticRun(targetFileNames, options) {
     if (!options.automatic) return;
     if (options.incremental) {
@@ -640,17 +601,34 @@ function deferAutomaticRun(targetFileNames, options) {
 }
 
 function hasChatEmbedding(entry) {
-    return Array.isArray(entry?.chatEmbedding) && entry.chatEmbedding.length > 0;
+    return isVector(entry?.chatEmbedding) && entry.chatEmbedding.length > 0;
+}
+
+function hasStoredChatEmbedding(entry) {
+    const text = getRepresentativeEmbeddingText(entry);
+    if (!text) return true;
+    const hash = hashEmbeddingText(text);
+    return (hasChatEmbedding(entry) && entry.chatEmbeddingHash === hash) || entry.cachedChatEmbeddingHash === hash;
 }
 
 function hasMessageEmbeddingsForAllTextMessages(entry, settings = getEmbeddingSettings()) {
-    if (!entry?.isLoaded || !Array.isArray(entry.messages) || entry.messages.length === 0) return false;
-    if (!(entry.messageEmbeddings instanceof Map)) return false;
-
+    if (!entry?.isLoaded || !Array.isArray(entry.messages) || !entry.messages.length) return false;
+    const known = entry.cachedMessageEmbeddingKeys;
     for (const msg of entry.messages) {
-        for (const variant of collectMessageVariantsForEmbedding(msg, settings)) {
-            const vector = getMessageEmbedding(entry, msg, variant.swipeIndex);
-            if (!Array.isArray(vector) || vector.length === 0) return false;
+        const active = getMessageActiveSwipeIndex(msg);
+        const variants = [];
+        if (msg.isDescriptor ? msg.textLength > 0 : typeof msg.text === 'string' && msg.text.trim()) variants.push(active);
+        if (settings.includeAlternateSwipes === true) {
+            const count = Math.min(msg.swipeCount ?? msg.swipes?.length ?? 0, clampPositiveInt(settings.maxSwipesPerMessage, 8));
+            for (let swipe = 0; swipe < count; swipe++) {
+                if (swipe === active) continue;
+                if (msg.isDescriptor ? msg.swipeLengths?.[swipe] > 0 : typeof msg.swipes?.[swipe] === 'string' && msg.swipes[swipe].trim()) variants.push(swipe);
+            }
+        }
+        for (const swipe of variants) {
+            if (known?.has(makeMessageEmbeddingKey(msg.index, swipe))) continue;
+            const vector = getMessageEmbedding(entry, msg, swipe);
+            if (!isVector(vector) || !vector.length) return false;
         }
     }
     return true;
@@ -666,7 +644,7 @@ function threadNeedsEmbeddings(fileName) {
     const messageLevelEnabled = isEmbeddingLevelOn(settings, 'message');
     if (!chatLevelEnabled && !messageLevelEnabled) return false;
 
-    if (chatLevelEnabled && !hasChatEmbedding(entry)) return true;
+    if (chatLevelEnabled && !hasStoredChatEmbedding(entry)) return true;
     if (messageLevelEnabled && !hasMessageEmbeddingsForAllTextMessages(entry)) return true;
     return false;
 }
@@ -683,7 +661,7 @@ function getEmbeddingStatus(entry) {
 
     if (chatOn) {
         enabledCount++;
-        if (hasChatEmbedding(entry)) satisfiedCount++;
+        if (hasStoredChatEmbedding(entry)) satisfiedCount++;
     }
     if (msgOn) {
         enabledCount++;
@@ -694,7 +672,7 @@ function getEmbeddingStatus(entry) {
     if (satisfiedCount > 0) return 'partial';
 
     // Check for any partial message embeddings
-    if (msgOn && entry.messageEmbeddings instanceof Map && entry.messageEmbeddings.size > 0) return 'partial';
+    if (msgOn && ((entry.messageEmbeddings instanceof Map && entry.messageEmbeddings.size > 0) || entry.cachedMessageEmbeddingKeys?.size > 0)) return 'partial';
 
     return 'none';
 }
@@ -711,7 +689,7 @@ function embStatusTitle(status) {
 function getClusterInputs() {
     const index = getIndex();
     const entries = Object.values(index);
-    const embeddedEntries = entries.filter(entry => Array.isArray(entry.chatEmbedding) && entry.chatEmbedding.length > 0);
+    const embeddedEntries = entries.filter(entry => isVector(entry.chatEmbedding) && entry.chatEmbedding.length > 0);
     const signature = embeddedEntries.map(entry => {
         const vector = entry.chatEmbedding;
         if (!clusterVectorIds.has(vector)) clusterVectorIds.set(vector, nextClusterInputId++);
@@ -744,7 +722,38 @@ async function computeClusterLabels(vectors, fixedK) {
     return { labels, k };
 }
 
+async function recomputeArchiveEmbeddingClusters(entries, options) {
+    const operation = captureEmbeddingOperation();
+    const fixedK = Number.isFinite(options.fixedK) && options.fixedK > 0 ? Math.floor(options.fixedK) : null;
+    const signature = entries.map(entry => `${entry.fileName}:${hashEmbeddingText(getRepresentativeEmbeddingText(entry))}:${entry.cachedChatEmbeddingHash || entry.chatEmbeddingHash || ''}`).join('\u0001');
+    const version = getIndexVersion();
+    const key = `archive:${operation.epoch}:${version}:${fixedK ?? 'auto'}:${signature}`;
+    let result = clusterResultCache?.key === key ? clusterResultCache : null;
+    const cached = Boolean(result);
+    if (!result) {
+        let computation = clusterComputationsInFlight.get(key);
+        if (!computation) {
+            computation = computeArchiveClusters({ fileNames: entries.map(entry => entry.fileName), fixedK, embeddingOperation: operation });
+            clusterComputationsInFlight.set(key, computation);
+            computation.finally(() => {
+                if (clusterComputationsInFlight.get(key) === computation) clusterComputationsInFlight.delete(key);
+            }).catch(() => {});
+        }
+        result = await computation;
+        if (!isEmbeddingOperationCurrent(operation) || getIndexVersion() !== version) throw new DOMException('Embedding or chat content changed', 'AbortError');
+        clusterResultCache = { ...result, key, kind: 'archive' };
+    }
+    for (const entry of Object.values(getIndex())) entry.clusterLabel = result.labelsByFile.get(entry.fileName) ?? null;
+    lastClusterK = result.k;
+    lastClusterChatCount = result.embeddedCount;
+    return { clusterCount: result.clusterCount, k: result.k, embeddedCount: result.embeddedCount, ...(cached ? { cached: true } : {}) };
+}
+
 export async function recomputeEmbeddingClusters(options = {}) {
+    const archiveEntries = Object.values(getIndex());
+    if (clusterResultCache?.kind === 'archive' || archiveEntries.some(entry => entry.cachedChatEmbeddingHash && !hasChatEmbedding(entry))) {
+        return recomputeArchiveEmbeddingClusters(archiveEntries, options);
+    }
     const { entries, embeddedEntries, signature } = getClusterInputs();
     const fixedK = Number.isFinite(options.fixedK) && options.fixedK > 0 ? Math.floor(options.fixedK) : null;
     const cacheKey = `${signature}\u0002${fixedK ?? 'auto'}`;
@@ -847,82 +856,88 @@ function requireCurrentEmbeddingRun(operation, entry = null) {
     }
 }
 
+/** Queue only file identifiers. Text and vectors are read in bounded batches on demand. */
 function queueBackgroundSwipeCandidates(candidates, settings, operation) {
-    if (!Array.isArray(candidates) || candidates.length === 0) return;
-    for (const candidate of candidates) {
-        if (!candidate?.entry || !candidate?.key) continue;
-        const dedupKey = `${candidate.entry.fileName}:${candidate.key}`;
-        pendingBackgroundSwipeCandidates.set(dedupKey, { ...candidate, operation });
+    for (const candidate of candidates || []) {
+        const fileName = typeof candidate === 'string' ? candidate : candidate?.entry?.fileName;
+        if (fileName) pendingBackgroundSwipeCandidates.set(fileName, { fileName, operation });
     }
-    scheduleBackgroundSwipeEmbeddings(settings);
+    if (pendingBackgroundSwipeCandidates.size && !generationActive) scheduleBackgroundSwipeEmbeddings(settings);
 }
 
 function scheduleBackgroundSwipeEmbeddings(settings) {
+    if (generationActive) return;
     const delayMs = clampPositiveInt(getEmbeddingOption(settings, 'swipeBackgroundDelayMs', SWIPE_BACKGROUND_EMBED_DELAY_MS), SWIPE_BACKGROUND_EMBED_DELAY_MS);
-    if (backgroundSwipeEmbedTimer) {
-        clearTimeout(backgroundSwipeEmbedTimer);
-    }
+    if (backgroundSwipeEmbedTimer) clearTimeout(backgroundSwipeEmbedTimer);
     backgroundSwipeEmbedTimer = setTimeout(() => {
         backgroundSwipeEmbedTimer = null;
-        void flushBackgroundSwipeEmbeddings(settings, true).catch((err) => {
-            if (isStaleEmbeddingOperationError(err) && err.reason === 'dimensions') {
-                clearInMemoryEmbeddings({ rerender: true });
-            }
-            if (err === staleEmbeddingRun || isStaleEmbeddingOperationError(err)) return;
+        void queueEmbeddingRun(() => flushBackgroundSwipeEmbeddings(settings, true)).catch((err) => {
+            if (isStaleEmbeddingOperationError(err) && err.reason === 'dimensions') clearInMemoryEmbeddings({ rerender: true });
+            if (err === staleEmbeddingRun || isStaleEmbeddingOperationError(err) || err?.name === 'AbortError') return;
             console.warn(`[${MODULE_NAME}] Background swipe embedding failed:`, err);
         });
     }, delayMs);
 }
 
+/** Restore/generate at most one input batch, releasing it before the next read. */
+async function processEmbeddingCandidateBatch(candidates, level, operation, options = {}) {
+    if (!candidates.length) return { applied: 0, changed: 0, deferred: false };
+    if (options.shouldDefer?.()) return { applied: 0, changed: 0, deferred: true };
+    const cached = await getCachedEmbeddingsForTexts(candidates.map(item => item.text));
+    requireCurrentEmbeddingRun(operation);
+    let applied = 0;
+    let changed = 0;
+    const apply = (item, vector) => {
+        requireCurrentEmbeddingRun(operation, item.entry);
+        if (!isVector(vector) || !vector.length) return;
+        if (level === 'chat') {
+            const previousHash = item.entry.chatEmbeddingHash || item.entry.cachedChatEmbeddingHash;
+            setChatEmbedding(item.entry, vector, item.hash);
+            if (previousHash !== item.hash) changed++;
+        } else {
+            setMessageEmbedding(item.entry, item.msgIndex, item.swipeIndex, vector);
+        }
+        applied++;
+        options.onApplied?.();
+    };
+    const pending = [];
+    for (let index = 0; index < candidates.length; index++) {
+        if (isVector(cached[index]) && cached[index].length) apply(candidates[index], cached[index]);
+        else pending.push(candidates[index]);
+    }
+    if (options.shouldDefer?.()) return { applied, changed, deferred: true };
+    if (pending.length && !options.cacheOnly) {
+        // Both the candidate count and aggregate text length are bounded by the
+        // source iterator. The provider persists each sub-batch before returning.
+        const vectors = await embedTexts(pending.map(item => item.text), { level });
+        for (let index = 0; index < pending.length; index++) apply(pending[index], vectors[index]);
+    }
+    return { applied, changed, deferred: false };
+}
+
 async function flushBackgroundSwipeEmbeddings(settings, rerender = false) {
-    if (backgroundSwipeEmbedActive) return;
-    if (pendingBackgroundSwipeCandidates.size === 0) return;
-
+    if (backgroundSwipeEmbedActive || generationActive || !pendingBackgroundSwipeCandidates.size) return;
     backgroundSwipeEmbedActive = true;
-    const batchSize = clampPositiveInt(getEmbeddingOption(settings, 'swipeBackgroundBatchSize', 24), 24);
-
+    const batchSize = Math.min(50, clampPositiveInt(getEmbeddingOption(settings, 'swipeBackgroundBatchSize', 24), 24));
     try {
-        while (pendingBackgroundSwipeCandidates.size > 0) {
-            const batch = takeMapBatch(pendingBackgroundSwipeCandidates, batchSize)
-                .filter(item => isEmbeddingOperationCurrent(item.operation) && getIndex()[item.entry.fileName] === item.entry);
-            if (batch.length === 0) continue;
-
-            const cached = await getCachedEmbeddingsForTexts(batch.map(item => item.text));
-            const pending = [];
-            for (let i = 0; i < batch.length; i++) {
-                const item = batch[i];
-                const cachedVec = cached[i];
-                if (!isEmbeddingOperationCurrent(item.operation) || getIndex()[item.entry.fileName] !== item.entry) continue;
-                if (Array.isArray(cachedVec) && cachedVec.length > 0) {
-                    setMessageEmbedding(item.entry, item.msgIndex, item.swipeIndex, cachedVec);
-                } else {
-                    pending.push(item);
-                }
-            }
-
-            if (pending.length > 0) {
-                const vectors = await embedTexts(
-                    pending.map(item => item.text),
-                    { level: 'message' },
-                );
-                for (let i = 0; i < pending.length; i++) {
-                    const item = pending[i];
-                    if (isEmbeddingOperationCurrent(item.operation) && getIndex()[item.entry.fileName] === item.entry) {
-                        setMessageEmbedding(item.entry, item.msgIndex, item.swipeIndex, vectors[i]);
-                    }
+        while (pendingBackgroundSwipeCandidates.size && !generationActive) {
+            const [task] = takeMapBatch(pendingBackgroundSwipeCandidates, 1);
+            if (!isEmbeddingOperationCurrent(task.operation) || !getIndex()[task.fileName]) continue;
+            for await (const items of iterateVariantBatches({ fileNames: [task.fileName], settings, mode: 'alternate', batchSize })) {
+                requireCurrentEmbeddingRun(task.operation);
+                const batch = items.filter(item => !isVector(getMessageEmbedding(item.entry, { index: item.msgIndex, swipeId: item.activeSwipeIndex }, item.swipeIndex)))
+                    .map(item => ({ ...item, text: item.text.trim() }));
+                const result = await processEmbeddingCandidateBatch(batch, 'message', task.operation, { shouldDefer: () => generationActive });
+                if (result.deferred || generationActive) {
+                    pendingBackgroundSwipeCandidates.set(task.fileName, task);
+                    break;
                 }
             }
         }
     } finally {
         backgroundSwipeEmbedActive = false;
-        // A fresh run may have queued work while an obsolete provider request
-        // was unwinding. Its timer cannot drain until this active flush ends.
-        if (pendingBackgroundSwipeCandidates.size > 0 && !backgroundSwipeEmbedTimer) {
-            scheduleBackgroundSwipeEmbeddings(getEmbeddingSettings());
-        }
-        if (rerender) {
-            refreshAfterEmbeddingUpdate();
-        }
+        if (pendingBackgroundSwipeCandidates.size && !backgroundSwipeEmbedTimer && !generationActive) scheduleBackgroundSwipeEmbeddings(getEmbeddingSettings());
+        if (rerender) refreshAfterEmbeddingUpdate();
     }
 }
 
@@ -943,7 +958,7 @@ async function runEmbeddingGeneration(targetFileNames = null, options = {}) {
     try {
         return await runEmbeddingGenerationWork(targetFileNames, options);
     } catch (error) {
-        if (error !== staleEmbeddingRun && !isStaleEmbeddingOperationError(error)) throw error;
+        if (error !== staleEmbeddingRun && !isStaleEmbeddingOperationError(error) && error?.name !== 'AbortError') throw error;
         if (isStaleEmbeddingOperationError(error) && error.reason === 'dimensions') {
             clearInMemoryEmbeddings({ rerender: false });
             if (!options.dimensionRetry) {
@@ -995,145 +1010,106 @@ async function runEmbeddingGenerationWork(targetFileNames = null, options = {}) 
         : Object.values(index);
     const scopedEntries = options.ignoreScope ? sourceEntries : getScopeFilteredEntries(sourceEntries, settings);
 
-    const chatCandidates = chatLevelEnabled
-        ? scopedEntries
-            .filter(entry => entry.isLoaded && !entry.needsHydration)
-            .map(entry => {
-                const text = getRepresentativeEmbeddingText(entry);
-                return {
-                    entry,
-                    text,
-                    hash: text ? hashEmbeddingText(text) : null,
-                };
-            })
-            .filter(item => item.text.length > 0 && (!hasChatEmbedding(item.entry) || item.entry.chatEmbeddingHash !== item.hash))
-        : [];
-
     const messageEntries = Array.isArray(options.messageTargetFileNames)
         ? scopedEntries.filter(entry => options.messageTargetFileNames.includes(entry.fileName))
         : scopedEntries;
-    const messageCandidates = messageLevelEnabled && options.restoreMessageVectors !== false
-        ? getMessageEmbeddingCandidates(messageEntries, settings, 'active', options.messageWindowLimit)
-        : [];
-    const alternateSwipeCandidates = messageLevelEnabled && options.includeAlternateSwipes !== false && settings.includeAlternateSwipes === true
-        ? getMessageEmbeddingCandidates(scopedEntries, settings, 'alternate')
-        : [];
-    const totalWork = chatCandidates.length + messageCandidates.length;
-    if (totalWork === 0 && (options.cacheOnly === true || alternateSwipeCandidates.length === 0)) {
-        let clusters = getCurrentClusterCount();
-        if (!options.incremental) {
-            const clusterResult = await recomputeEmbeddingClusters();
-            clusters = clusterResult.clusterCount;
-            lastClusterResult = clusters;
-        }
-        if (options.rerender !== false) refreshAfterEmbeddingUpdate();
-        return { updated: 0, total: 0, clusters, skipped: true, messageVectors: 0, queuedSwipeVectors: 0 };
-    }
-
+    const eligible = entry => entry && (!options.automatic || (entry.isLoaded && !entry.needsHydration));
+    const messageFiles = messageEntries.filter(eligible).map(entry => entry.fileName);
+    const chatEntries = chatLevelEnabled ? scopedEntries.filter(eligible) : [];
+    const totalEstimate = chatEntries.length + (messageLevelEnabled && options.restoreMessageVectors !== false
+        ? messageEntries.reduce((sum, entry) => sum + Math.min(entry.messageCount || entry.messages?.length || 0, options.messageWindowLimit || Infinity), 0) : 0);
     const onProgress = typeof options.onProgress === 'function' ? options.onProgress : null;
     const cacheOnly = options.cacheOnly === true;
     let completed = 0;
     let changedChatEmbeddings = 0;
-    if (onProgress) onProgress(0, totalWork);
+    let chatVectors = 0;
+    let messageVectors = 0;
+    let deferred = false;
+    onProgress?.(0, totalEstimate);
+    const batchOptions = {
+        cacheOnly,
+        shouldDefer: options.automatic ? () => generationActive : null,
+        onApplied: () => { completed++; onProgress?.(completed, Math.max(completed, totalEstimate)); },
+    };
 
-    let pendingChats = [];
-    if (chatCandidates.length > 0) {
-        const restored = await restoreCachedCandidates(chatCandidates, (item, cached) => {
-            requireCurrentEmbeddingRun(operation, item.entry);
-            const previousHash = item.entry.chatEmbeddingHash || null;
-            item.entry.chatEmbedding = cached;
-            item.entry.chatEmbeddingHash = item.hash;
-            if (previousHash !== item.hash) changedChatEmbeddings += 1;
-            completed += 1;
-            if (onProgress) onProgress(completed, totalWork);
-        }, { shouldDefer: options.automatic ? () => generationActive : null });
-        pendingChats = restored.pending;
-        if (restored.deferred) {
-            deferAutomaticRun(targetFileNames, options);
-            return { updated: 0, total: totalWork, clusters: getCurrentClusterCount(), skipped: true, deferred: true, messageVectors: completed, queuedSwipeVectors: 0 };
+    // Chat summaries are small, but the number of chats is unbounded. Do not
+    // retain an all-archive pending-text or result-vector array.
+    let chatBatch = [];
+    let chatChars = 0;
+    const flushChats = async () => {
+        const result = await processEmbeddingCandidateBatch(chatBatch, 'chat', operation, batchOptions);
+        chatVectors += result.applied;
+        changedChatEmbeddings += result.changed;
+        deferred = result.deferred;
+        chatBatch = [];
+        chatChars = 0;
+    };
+    for (const originalEntry of chatEntries) {
+        let entry = getIndex()[originalEntry.fileName];
+        if (!entry) continue;
+        if (!entry.isLoaded || entry.needsHydration) {
+            await readChatMessages(entry.fileName);
+            entry = getIndex()[entry.fileName];
         }
+        requireCurrentEmbeddingRun(operation, entry);
+        const text = getRepresentativeEmbeddingText(entry);
+        if (!text) continue;
+        const hash = hashEmbeddingText(text);
+        if (hasChatEmbedding(entry) && entry.chatEmbeddingHash === hash) continue;
+        if (chatBatch.length && (chatBatch.length >= 50 || chatChars + text.length > 262144)) {
+            await flushChats();
+            if (deferred) break;
+        }
+        chatBatch.push({ entry, text, hash });
+        chatChars += text.length;
     }
+    if (!deferred && chatBatch.length) await flushChats();
 
-    if (options.automatic && generationActive) {
-        deferAutomaticRun(targetFileNames, options);
-        return { updated: 0, total: totalWork, clusters: getCurrentClusterCount(), skipped: true, deferred: true, messageVectors: completed, queuedSwipeVectors: 0 };
-    }
-    if (pendingChats.length > 0 && !cacheOnly) {
-        const vectors = await embedTexts(
-            pendingChats.map(item => item.text),
-            {
-                level: 'chat',
-                onProgress: (done, pendingTotal) => {
-                    if (!onProgress) return;
-                    onProgress(completed + done, completed + pendingTotal + messageCandidates.length);
-                },
-            },
-        );
-
-        for (let i = 0; i < pendingChats.length; i++) {
-            const item = pendingChats[i];
-            requireCurrentEmbeddingRun(operation, item.entry);
-            const previousHash = item.entry.chatEmbeddingHash || null;
-            item.entry.chatEmbedding = vectors[i];
-            item.entry.chatEmbeddingHash = item.hash;
-            if (previousHash !== item.hash) {
-                changedChatEmbeddings += 1;
+    if (!deferred && messageLevelEnabled && options.restoreMessageVectors !== false && messageFiles.length) {
+        for await (const items of iterateVariantBatches({ fileNames: messageFiles, settings, mode: 'active', messageWindowLimit: options.messageWindowLimit, batchSize: 50 })) {
+            requireCurrentEmbeddingRun(operation);
+            const candidates = [];
+            for (const item of items) {
+                requireCurrentEmbeddingRun(operation, item.entry);
+                const existing = getMessageEmbedding(item.entry, { index: item.msgIndex, swipeId: item.activeSwipeIndex }, item.swipeIndex);
+                if (isVector(existing) && existing.length) continue;
+                candidates.push({ ...item, text: item.text.trim() });
             }
-        }
-        completed += pendingChats.length;
-        if (onProgress) onProgress(completed, totalWork);
-    }
-
-    let pendingMessages = [];
-    if (messageCandidates.length > 0) {
-        const restored = await restoreCachedCandidates(messageCandidates, (item, cached) => {
-            requireCurrentEmbeddingRun(operation, item.entry);
-            setMessageEmbedding(item.entry, item.msgIndex, item.swipeIndex, cached);
-            completed += 1;
-            if (onProgress) onProgress(completed, totalWork);
-        }, { shouldDefer: options.automatic ? () => generationActive : null });
-        pendingMessages = restored.pending;
-        if (restored.deferred) {
-            deferAutomaticRun(targetFileNames, options);
-            return { updated: 0, total: totalWork, clusters: getCurrentClusterCount(), skipped: true, deferred: true, messageVectors: completed, queuedSwipeVectors: 0 };
+            const result = await processEmbeddingCandidateBatch(candidates, 'message', operation, batchOptions);
+            messageVectors += result.applied;
+            if (result.deferred) { deferred = true; break; }
         }
     }
-
-    if (options.automatic && generationActive) {
+    if (deferred) {
         deferAutomaticRun(targetFileNames, options);
-        return { updated: 0, total: totalWork, clusters: getCurrentClusterCount(), skipped: true, deferred: true, messageVectors: completed, queuedSwipeVectors: 0 };
-    }
-    if (pendingMessages.length > 0 && !cacheOnly) {
-        const vectors = await embedTexts(
-            pendingMessages.map(item => item.text),
-            {
-                level: 'message',
-                onProgress: (done) => {
-                    if (!onProgress) return;
-                    onProgress(completed + done, totalWork);
-                },
-            },
-        );
-
-        for (let i = 0; i < pendingMessages.length; i++) {
-            const item = pendingMessages[i];
-            requireCurrentEmbeddingRun(operation, item.entry);
-            setMessageEmbedding(item.entry, item.msgIndex, item.swipeIndex, vectors[i]);
-        }
-        completed += pendingMessages.length;
-        if (onProgress) onProgress(completed, totalWork);
+        return { updated: chatVectors, total: chatVectors, clusters: getCurrentClusterCount(), skipped: false, deferred: true, messageVectors, queuedSwipeVectors: 0 };
     }
 
-    if (!cacheOnly && alternateSwipeCandidates.length > 0) {
+    let queuedSwipeVectors = 0;
+    if (!cacheOnly && messageLevelEnabled && options.includeAlternateSwipes !== false && settings.includeAlternateSwipes === true) {
         requireCurrentEmbeddingRun(operation);
-        queueBackgroundSwipeCandidates(alternateSwipeCandidates, settings, operation);
+        const swipeFiles = [];
+        for (const originalEntry of scopedEntries) {
+            const entry = getIndex()[originalEntry.fileName];
+            if (!entry?.isLoaded || entry.needsHydration) continue;
+            let count = 0;
+            for (const msg of entry.messages || []) {
+                const active = getMessageActiveSwipeIndex(msg);
+                const length = Math.min(msg.swipeCount ?? msg.swipes?.length ?? 0, clampPositiveInt(settings.maxSwipesPerMessage, 8));
+                for (let swipe = 0; swipe < length; swipe++) {
+                    if (swipe !== active && !isVector(getMessageEmbedding(entry, msg, swipe))) count++;
+                }
+            }
+            if (count) swipeFiles.push(entry.fileName);
+            queuedSwipeVectors += count;
+        }
+        queueBackgroundSwipeCandidates(swipeFiles, settings, operation);
     }
 
     requireCurrentEmbeddingRun(operation);
     queryEmbeddingCache.clear();
     queryEmbeddingInFlight.clear();
     queryEmbeddingEpoch++;
-
     let clusters = getCurrentClusterCount();
     let reclusterTriggered = false;
     if (options.incremental) {
@@ -1146,18 +1122,12 @@ async function runEmbeddingGenerationWork(targetFileNames = null, options = {}) 
         clusters = clusterResult.clusterCount;
         lastClusterResult = clusters;
     }
-
-    if (options.rerender !== false && !reclusterTriggered) {
-        refreshAfterEmbeddingUpdate();
-    }
-
+    if (options.rerender !== false && !reclusterTriggered) refreshAfterEmbeddingUpdate();
+    onProgress?.(completed, completed);
     return {
-        updated: chatCandidates.length,
-        total: chatCandidates.length,
-        clusters,
-        changedEmbeddings: changedChatEmbeddings,
-        messageVectors: messageCandidates.length,
-        queuedSwipeVectors: alternateSwipeCandidates.length,
+        updated: chatVectors, total: chatVectors, clusters,
+        changedEmbeddings: changedChatEmbeddings, messageVectors, queuedSwipeVectors,
+        skipped: completed === 0 && queuedSwipeVectors === 0,
     };
 }
 
@@ -1187,10 +1157,13 @@ export function clearInMemoryEmbeddings(options = {}) {
     queryEmbeddingInFlight.clear();
     queryEmbeddingEpoch++;
     clusterResultCache = null;
-    driftSummaryCache = new WeakMap();
+    cancelDriftWork();
 
+    clearResidentVectors();
     const index = getIndex();
     for (const entry of Object.values(index)) {
+        entry.cachedMessageEmbeddingKeys = null;
+        entry.cachedChatEmbeddingHash = null;
         entry.chatEmbedding = null;
         entry.chatEmbeddingHash = null;
         entry.clusterLabel = null;
@@ -1273,8 +1246,11 @@ export function setEmbeddingGenerationActive(active) {
         embedBootstrapTimer = null;
         if (embedIncrementalTimer) clearTimeout(embedIncrementalTimer);
         embedIncrementalTimer = null;
+        if (backgroundSwipeEmbedTimer) clearTimeout(backgroundSwipeEmbedTimer);
+        backgroundSwipeEmbedTimer = null;
         return;
     }
+    if (pendingBackgroundSwipeCandidates.size) scheduleBackgroundSwipeEmbeddings(getEmbeddingSettings());
     const shouldBootstrap = deferredBootstrapRequested;
     const bootstrapFile = deferredBootstrapFile;
     deferredBootstrapFile = null;
@@ -1673,7 +1649,7 @@ export function toggleStats() {
 /**
  * Toggle branch context injection on/off.
  */
-export function toggleBranchContext() {
+export async function toggleBranchContext() {
     branchContextActive = !branchContextActive;
     setBranchContextEnabled(branchContextActive);
 
@@ -1682,12 +1658,20 @@ export function toggleBranchContext() {
 
     if (branchContextActive) {
         const activeFile = getActiveFilename();
-        const result = updateBranchContextInjection(activeFile);
-        updateBranchContextStatusUI(result);
+        await refreshBranchContextStatus(activeFile);
     } else {
         clearBranchContextInjection();
         const indicator = document.getElementById('chat-manager-branch-context-indicator');
         if (indicator) indicator.style.display = 'none';
+    }
+}
+
+async function refreshBranchContextStatus(activeFile) {
+    try {
+        const result = await updateBranchContextInjection(activeFile);
+        if (!result?.stale && branchContextActive && getActiveFilename() === activeFile) updateBranchContextStatusUI(result);
+    } catch (error) {
+        if (error?.name !== 'AbortError') console.warn(`[${MODULE_NAME}] Branch context could not refresh:`, error);
     }
 }
 
@@ -1874,7 +1858,7 @@ function getLastMessageFallback(entry) {
     }
 
     const lastMsg = entry.messages[entry.messages.length - 1];
-    return typeof lastMsg?.text === 'string' ? lastMsg.text.trim() : '';
+    return typeof lastMsg?.text === 'string' && lastMsg.text ? messagePreview(lastMsg.text.trim(), 240) : (lastMsg?.preview || '');
 }
 
 function getSummaryDisplay(entry) {
@@ -1946,8 +1930,7 @@ function scheduleBranchDetection() {
         runDeferredBranchDetection(activeFile);
         patchBranchIndicators();
         if (branchContextActive) {
-            const result = updateBranchContextInjection(activeFile);
-            updateBranchContextStatusUI(result);
+            void refreshBranchContextStatus(activeFile);
         }
     };
     task.idle = typeof globalThis.requestIdleCallback === 'function';
@@ -1968,13 +1951,14 @@ function scheduleSearchRefresh() {
         clearTimeout(refreshSearchFromHydrationTimer);
         refreshSearchFromHydrationTimer = null;
     }
-    // Finish the active scan, then coalesce indexing batches into one refresh.
-    if (activeSearchRequestId !== null || !isHydrationComplete()) return;
+    // An archive scan already reads cold chats on demand. Let it finish before
+    // refreshing, and coalesce indexing batches until the archive is ready.
+    if (searchPageAbort || !isHydrationComplete()) return;
 
     refreshSearchFromHydrationTimer = setTimeout(() => {
         refreshSearchFromHydrationTimer = null;
         if (!searchRefreshPending || !panelOpen || isAnyViewActive()) return;
-        if (activeSearchRequestId !== null || !isHydrationComplete()) return;
+        if (searchPageAbort || !isHydrationComplete()) return;
 
         const latestQuery = getCurrentSearchQuery();
         searchRefreshPending = false;
@@ -2119,6 +2103,7 @@ function closeSidePanel() {
     deactivateTimeline();
     deactivateSemanticMap();
     deactivateGraphView();
+    releaseClosedPanelData();
 }
 
 // ── Popup ──
@@ -2158,6 +2143,18 @@ function closePopup() {
     deactivateTimeline();
     deactivateSemanticMap();
     deactivateGraphView();
+    releaseClosedPanelData();
+}
+
+function releaseClosedPanelData() {
+    const content = document.getElementById('chat-manager-content');
+    if (content) content.innerHTML = '';
+    trimBodyCache({ keepActive: true, targetBytes: 0 });
+    queryEmbeddingCache.clear();
+    queryEmbeddingInFlight.clear();
+    queryEmbeddingEpoch++;
+    cancelDriftWork();
+    _invalidateDomCache();
 }
 
 /**
@@ -2197,6 +2194,8 @@ function deactivateTimeline() {
 // ──────────────────────────────────────────────
 
 export async function refreshPanel(options = {}) {
+    if (!panelOpen) return;
+    const refreshRequestId = panelOpenRequestId;
     const buildOptions = { forceRevalidate: options.forceRevalidate === true };
     const context = SillyTavern.getContext();
     ensureHydrationSubscription();
@@ -2329,6 +2328,7 @@ export async function refreshPanel(options = {}) {
     };
 
     const renderFromLatestIndex = () => {
+        if (!panelOpen || refreshRequestId !== panelOpenRequestId || isAnyViewActive()) return;
         const query = getCurrentSearchQuery();
         if (query.length >= 2) {
             performSearch(query);
@@ -2357,7 +2357,7 @@ export async function refreshPanel(options = {}) {
         }
         renderedFromMetadata = true;
         prioritizeHydrationFiles([getActiveFilename(), ...getVisibleEntryFileNames().slice(0, 12)]);
-        if (!panelOpen || isAnyViewActive()) return;
+        if (!panelOpen || refreshRequestId !== panelOpenRequestId || isAnyViewActive()) return;
         if (!hasCache || buildState?.changed) {
             renderFromLatestIndex();
         }
@@ -2368,7 +2368,7 @@ export async function refreshPanel(options = {}) {
         searchState = null;
     }
 
-    if (!renderedFromMetadata && !isAnyViewActive()) {
+    if (panelOpen && refreshRequestId === panelOpenRequestId && !renderedFromMetadata && !isAnyViewActive()) {
         renderFromLatestIndex();
     }
 }
@@ -3402,143 +3402,125 @@ export function finalizeSemanticResults(aggregated, limit = HYBRID_SEARCH_LIMIT)
         });
 }
 
-async function performSemanticSearch(trimmed, requestId) {
+async function performArchiveSearch(trimmed, requestId, mode, pageIndex = 0) {
     const container = document.getElementById('chat-manager-content');
     const status = document.getElementById('chat-manager-status');
     if (!container) return;
-
-    const lowerQuery = trimmed.toLowerCase();
-    const searchable = getSearchableMessages();
-    const index = getIndex();
-    const embeddingSettings = getEmbeddingSettings();
-    const showAlternateMatches = embeddingSettings.showAlternateSwipesInResults === true;
-    const indexVersion = getIndexVersion();
-    const epoch = queryEmbeddingEpoch;
-    // Dimensions are learned during the query request; unrelated per-character
-    // selection/settings maps do not change scores for this captured index.
-    const searchRecipe = settings => JSON.stringify([
-        getQueryEmbeddingKey(trimmed, settings), settings.enabled === true,
-        settings.embeddingLevels?.query === true, settings.embeddingLevels?.message === true,
-        settings.includeAlternateSwipes === true, settings.showAlternateSwipesInResults === true,
-        clampPositiveInt(getEmbeddingOption(settings, 'maxSwipesPerMessage', 8), 8),
-    ]);
-    const recipe = searchRecipe(embeddingSettings);
-    const embeddingVersions = new Map();
-    let embeddingsCurrent = true;
-    const isCurrent = () => embeddingsCurrent && requestId === latestSearchRequestId
-        && index === getIndex() && indexVersion === getIndexVersion()
-        && epoch === queryEmbeddingEpoch && recipe === searchRecipe(getEmbeddingSettings());
-    const queryVector = await getSemanticQueryEmbedding(trimmed);
-    if (!isCurrent()) return;
-    function* candidates() {
-        for (const msg of searchable) {
-            yield { vector: null };
-            const entry = index[msg.filename];
-            if (!entry || !(entry.messageEmbeddings instanceof Map)) continue;
-            if (!embeddingVersions.has(entry)) embeddingVersions.set(entry, entry.messageEmbeddingVersion);
-            else if (embeddingVersions.get(entry) !== entry.messageEmbeddingVersion) {
-                embeddingsCurrent = false;
-                return;
+    const previous = searchState?.archive && searchState.query === trimmed && searchState.mode === mode ? searchState : null;
+    const version = getIndexVersion();
+    if (previous && previous.indexVersion !== version) pageIndex = 0;
+    const history = pageIndex > 0 && previous ? previous.history.slice(0, pageIndex) : [];
+    const excluded = new Map();
+    for (const page of history) for (const item of page) {
+        if (!excluded.has(item.hash)) excluded.set(item.hash, []);
+        excluded.get(item.hash).push(item.reference);
+    }
+    searchPageAbort?.abort();
+    const controller = new AbortController();
+    searchPageAbort = controller;
+    try {
+        const embeddingOperation = mode === 'semantic' ? captureEmbeddingOperation() : null;
+        const searchIndex = mode === 'semantic' ? getIndex() : null;
+        const searchVersion = getIndexVersion();
+        const searchRecipe = settings => JSON.stringify([
+            getQueryEmbeddingKey(trimmed, settings), settings.enabled === true,
+            settings.embeddingLevels?.query === true, settings.embeddingLevels?.message === true,
+            settings.includeAlternateSwipes === true, settings.showAlternateSwipesInResults === true,
+            clampPositiveInt(getEmbeddingOption(settings, 'maxSwipesPerMessage', 8), 8),
+        ]);
+        const recipe = mode === 'semantic' ? searchRecipe(getEmbeddingSettings()) : null;
+        // Numeric revisions do not retain evicted chat bodies or vector maps.
+        const embeddingVersions = mode === 'semantic'
+            ? new Map(Object.entries(searchIndex).map(([file, entry]) => [file, entry.messageEmbeddingVersion])) : null;
+        const semanticInputsCurrent = () => {
+            if (mode !== 'semantic') return true;
+            const current = getIndex();
+            if (searchIndex !== current || searchVersion !== getIndexVersion()
+                || recipe !== searchRecipe(getEmbeddingSettings()) || !isEmbeddingOperationCurrent(embeddingOperation)) return false;
+            for (const [file, revision] of embeddingVersions) {
+                if (current[file]?.messageEmbeddingVersion !== revision) return false;
             }
-            const variants = collectMessageVariantsForEmbedding(msg, embeddingSettings, showAlternateMatches ? 'all' : 'active');
-            const activeSwipeIndex = getMessageActiveSwipeIndex(msg);
-            const textLower = msg.textLower || (msg.textLower = msg.text.toLowerCase());
-            const key = `${msg.index}:${textLower}`;
-            for (const variant of variants) {
-                const vector = getMessageEmbedding(entry, msg, variant.swipeIndex);
-                // Yield even for missing vectors so sparse indexes remain cooperative.
-                if (!Array.isArray(vector) || vector.length === 0) {
-                    yield { vector: null };
-                    continue;
-                }
-                const lower = variant.isActive ? textLower : variant.text.toLowerCase();
-                yield { key, item: msg, vector, text: variant.text, swipeIndex: variant.swipeIndex,
-                    activeSwipeIndex, keywordScore: lower.includes(lowerQuery) ? 1 : 0,
-                    matchIndex: lower.indexOf(lowerQuery) };
-            }
+            return true;
+        };
+        const queryVector = mode === 'semantic' ? await getSemanticQueryEmbedding(trimmed) : null;
+        if (embeddingOperation && !isEmbeddingOperationCurrent(embeddingOperation)) throw new DOMException('Embedding settings changed', 'AbortError');
+        if (requestId !== latestSearchRequestId || controller.signal.aborted) return;
+        if (status) status.textContent = 'Searching saved conversations…';
+        const settings = getEmbeddingSettings();
+        const page = await searchArchivePage({
+            query: trimmed, mode, queryVector, settings, excluded, embeddingOperation,
+            limit: mode === 'semantic' ? HYBRID_SEARCH_LIMIT : RESULTS_PAGE_SIZE,
+            signal: controller.signal,
+            onProgress: scanned => {
+                if (requestId === latestSearchRequestId && status) status.textContent = `Searching saved conversations… ${scanned.toLocaleString()} messages checked`;
+            },
+        });
+        if (requestId !== latestSearchRequestId || controller.signal.aborted || !semanticInputsCurrent()) return;
+        if (mode === 'semantic' && !page.scanned && searchModeOverride !== 'semantic') {
+            return performArchiveSearch(trimmed, requestId, 'keyword');
+        }
+        history[pageIndex] = page.pageReferences;
+        searchState = {
+            archive: true, query: trimmed, lowerQuery: trimmed.toLowerCase(), mode,
+            queryVector, results: page.results, history, pageIndex,
+            indexVersion: getIndexVersion(), totalMatches: pageIndex * RESULTS_PAGE_SIZE + page.results.length,
+            limitedResults: mode === 'semantic' && page.hasMore,
+            exhausted: mode === 'semantic' || !page.hasMore,
+            showAlternateMatches: settings.showAlternateSwipesInResults === true,
+        };
+        setSearchModeBadge(mode);
+        renderSearchState(container, status, trimmed);
+    } finally {
+        // A superseded request must not release a newer scan's refresh guard.
+        if (searchPageAbort === controller) {
+            searchPageAbort = null;
+            if (searchRefreshPending) scheduleSearchRefresh();
         }
     }
-    const ranked = await rankSemanticCandidates({ candidates, queryVector, isCurrent, limit: HYBRID_SEARCH_LIMIT });
-    if (!ranked || !isCurrent()) return;
-    // Background swipe attachment bumps an entry version rather than indexVersion.
-    // Validate every participating entry before publishing the two-pass result.
-    for (const [entry, version] of embeddingVersions) {
-        if (entry.messageEmbeddingVersion !== version) return;
-    }
-    const { totalMatches, results: limited } = ranked;
-
-    searchState = {
-        query: trimmed,
-        lowerQuery,
-        searchable,
-        position: searchable.length,
-        results: limited,
-        totalMatches,
-        exhausted: true,
-        mode: 'semantic',
-        showAlternateMatches,
-    };
-
-    setSearchModeBadge('semantic');
-    renderSearchState(container, status, trimmed);
 }
 
-function performKeywordSearch(trimmed) {
-    const container = document.getElementById('chat-manager-content');
-    const status = document.getElementById('chat-manager-status');
-    if (!container) return;
+async function performSemanticSearch(trimmed, requestId) {
+    return performArchiveSearch(trimmed, requestId, 'semantic');
+}
 
-    const lowerQuery = trimmed.toLowerCase();
-    searchState = {
-        query: trimmed,
-        lowerQuery,
-        searchable: getSearchableMessages(),
-        position: 0,
-        results: [],
-        totalMatches: 0,
-        exhausted: false,
-        mode: 'keyword',
-        dedupMap: new Map(), // key → index in results (for deduplication)
-    };
-
-    searchMoreResults(RESULTS_PAGE_SIZE);
-    setSearchModeBadge('keyword');
-    renderSearchState(container, status, trimmed);
+async function performKeywordSearch(trimmed, requestId = latestSearchRequestId) {
+    return performArchiveSearch(trimmed, requestId, 'keyword');
 }
 
 export async function performSearch(query) {
     cancelSearchRefresh();
+    searchPageAbort?.abort();
     const requestId = ++latestSearchRequestId;
-    activeSearchRequestId = requestId;
-    try {
-        const container = document.getElementById('chat-manager-content');
-        if (!container) return;
+    const container = document.getElementById('chat-manager-content');
+    if (!container) return;
 
-        if (!query || query.trim().length < 2) {
-            searchState = null;
-            setSearchModeBadge('keyword');
-            renderThreadCards();
+    if (!query || query.trim().length < 2) {
+        searchState = null;
+        setSearchModeBadge('keyword');
+        renderThreadCards();
+        return;
+    }
+
+    const trimmed = query.trim();
+
+    if (shouldUseSemanticSearch(trimmed)) {
+        try {
+            await performSemanticSearch(trimmed, requestId);
             return;
+        } catch (err) {
+            if (err?.name === 'AbortError' || requestId !== latestSearchRequestId) return;
+            console.warn(`[${MODULE_NAME}] Semantic search failed, falling back to keyword:`, err);
         }
+    }
 
-        const trimmed = query.trim();
-
-        if (shouldUseSemanticSearch(trimmed)) {
-            try {
-                await performSemanticSearch(trimmed, requestId);
-                return;
-            } catch (err) {
-                console.warn(`[${MODULE_NAME}] Semantic search failed, falling back to keyword:`, err);
-            }
-        }
-
-        if (requestId !== latestSearchRequestId) return;
-        performKeywordSearch(trimmed);
-    } finally {
-        if (activeSearchRequestId === requestId) {
-            activeSearchRequestId = null;
-            if (searchRefreshPending) scheduleSearchRefresh();
-        }
+    if (requestId !== latestSearchRequestId) return;
+    try {
+        await performKeywordSearch(trimmed, requestId);
+    } catch (err) {
+        if (err?.name === 'AbortError' || requestId !== latestSearchRequestId) return;
+        console.warn(`[${MODULE_NAME}] Archive search failed:`, err);
+        const status = document.getElementById('chat-manager-status');
+        if (status) status.textContent = 'Search could not finish. Retry when the conversation archive is available.';
     }
 }
 
@@ -3553,51 +3535,19 @@ function setSearchStatus(queryText) {
             for (const f of r.otherFiles) threadSet.add(f);
         }
     }
-    const countLabel = searchState.exhausted
+    if (searchState.archive && searchState.mode === 'keyword') {
+        const start = searchState.results.length ? searchState.pageIndex * RESULTS_PAGE_SIZE + 1 : 0;
+        const end = searchState.pageIndex * RESULTS_PAGE_SIZE + searchState.results.length;
+        status.textContent = withIndexingSuffix(`Results ${start}–${end}${searchState.exhausted ? '' : ' · more available'} for: ${queryText}`);
+        return;
+    }
+    const countLabel = searchState.limitedResults ? `Top ${searchState.results.length} matches` : searchState.exhausted
         ? `Found ${searchState.totalMatches} match${searchState.totalMatches !== 1 ? 'es' : ''}`
         : `Found ${searchState.totalMatches}+ match${searchState.totalMatches !== 1 ? 'es' : ''}`;
 
     status.textContent = withIndexingSuffix(
         `${countLabel} across ${threadSet.size}${searchState.exhausted ? '' : '+'} thread${threadSet.size !== 1 ? 's' : ''} for: ${queryText}`,
     );
-}
-
-/**
- * Search forward from the current position until we find `count` more matches or exhaust all messages.
- */
-function searchMoreResults(count) {
-    if (!searchState || searchState.exhausted) return;
-
-    const { lowerQuery, searchable, dedupMap } = searchState;
-    let found = 0;
-
-    while (searchState.position < searchable.length && found < count) {
-        const msg = searchable[searchState.position];
-        const textLower = msg.textLower || (msg.textLower = msg.text.toLowerCase());
-        const matchIndex = textLower.indexOf(lowerQuery);
-        if (matchIndex !== -1) {
-            const dedupKey = `${msg.index}:${textLower}`;
-            const existingIdx = dedupMap?.get(dedupKey);
-            if (existingIdx != null) {
-                // Duplicate — append filename to existing result's otherFiles
-                const existing = searchState.results[existingIdx];
-                if (!existing.otherFiles) existing.otherFiles = [];
-                if (existing.item.filename !== msg.filename && !existing.otherFiles.includes(msg.filename)) {
-                    existing.otherFiles.push(msg.filename);
-                }
-            } else {
-                if (dedupMap) dedupMap.set(dedupKey, searchState.results.length);
-                searchState.results.push({ item: msg, matchIndex, otherFiles: [] });
-                searchState.totalMatches++;
-                found++;
-            }
-        }
-        searchState.position++;
-    }
-
-    if (searchState.position >= searchable.length) {
-        searchState.exhausted = true;
-    }
 }
 
 /**
@@ -3707,24 +3657,36 @@ function renderSearchPage(container, fromIndex) {
     // Add load more button if there are more results already found, or more to search
     const displayedUpTo = end;
     const hasMoreFound = displayedUpTo < searchState.results.length;
-    const canSearchMore = !searchState.exhausted;
 
-    if (hasMoreFound || canSearchMore) {
+    if (searchState.archive && searchState.mode === 'keyword') {
+        const current = searchState;
+        const addPageButton = (label, pageIndex) => {
+            const button = document.createElement('button');
+            button.className = 'chat-manager-btn chat-manager-load-more';
+            button.textContent = label;
+            button.addEventListener('click', async () => {
+                if (searchState !== current) return;
+                button.disabled = true;
+                try {
+                    await performArchiveSearch(current.query, latestSearchRequestId, current.mode, pageIndex);
+                } catch (err) {
+                    if (err?.name !== 'AbortError') {
+                        console.warn(`[${MODULE_NAME}] Search page failed:`, err);
+                        button.disabled = false;
+                        button.textContent = 'Retry page';
+                    }
+                }
+            });
+            container.appendChild(button);
+        };
+        if (current.pageIndex > 0) addPageButton('Previous results', current.pageIndex - 1);
+        if (!current.exhausted) addPageButton('Next results', current.pageIndex + 1);
+    } else if (hasMoreFound) {
         const loadMoreBtn = document.createElement('button');
         loadMoreBtn.className = 'chat-manager-btn chat-manager-load-more';
 
-        if (searchState.exhausted) {
-            loadMoreBtn.textContent = `Load more (${searchState.results.length - displayedUpTo} remaining)`;
-        } else {
-            loadMoreBtn.textContent = 'Load more results...';
-        }
-
+        loadMoreBtn.textContent = `Load more (${searchState.results.length - displayedUpTo} remaining)`;
         loadMoreBtn.addEventListener('click', () => {
-            // If we need more results beyond what we've found, search for more
-            if (displayedUpTo >= searchState.results.length && !searchState.exhausted) {
-                searchMoreResults(RESULTS_PAGE_SIZE);
-            }
-
             // Update status
             const status = document.getElementById('chat-manager-status');
             if (status) setSearchStatus(searchState.query);
@@ -3925,20 +3887,38 @@ function handleEditDisplayName(e) {
     });
 }
 
-function captureChatAction(filename, entry) {
+async function captureChatAction(filename, entry, { titleOnly = false } = {}) {
     const context = SillyTavern.getContext();
     const avatar = context.characters?.[context.characterId]?.avatar;
     if (!avatar) throw new Error('No character selected');
-    const messages = filename === getActiveFilename() && Array.isArray(context.chat)
-        ? context.chat.filter(msg => typeof msg?.mes === 'string').map(msg => ({
-            role: msg.is_user ? 'user' : 'assistant', text: msg.mes,
-        }))
-        : entry.messages.map(msg => ({ role: msg.role, text: msg.text }));
-    return {
-        avatar, filename, messages, characterName: context.name2 || 'Character',
-        branchPoint: entry.branchPoint,
-        siblingContext: getSummarySiblingContextText(filename, context.name2),
+    const characterName = context.name2 || 'Character';
+    const initialMeta = JSON.stringify(getChatMeta(filename, avatar));
+    const windowSize = titleOnly ? 15 : 30;
+    const snapshot = (source, live) => {
+        const selected = [];
+        let count = 0;
+        for (let i = source.length - 1; i >= 0; i--) {
+            const message = source[i];
+            const text = live ? message?.mes : message?.text;
+            if (typeof text !== 'string') continue;
+            if (selected.length < windowSize) selected.push({ role: live ? (message.is_user ? 'user' : 'assistant') : message.role, text });
+            count++;
+        }
+        selected.reverse();
+        return { messages: selected, dropped: Math.max(0, count - selected.length) };
     };
+    const captured = filename === getActiveFilename() && Array.isArray(context.chat)
+        ? snapshot(context.chat, true)
+        : snapshot(await readChatMessages(filename), false);
+    if (!isCurrentActionCharacter({ avatar })) throw new DOMException('Character changed', 'AbortError');
+    const includeSiblings = branchContextActive && !titleOnly;
+    const siblingContext = includeSiblings ? await getSummarySiblingContextText(filename, characterName) : '';
+    if (includeSiblings && !isCurrentActionCharacter({ avatar })) throw new DOMException('Character changed', 'AbortError');
+    return {
+        avatar, filename, messages: captured.messages, characterName, initialMeta,
+        branchPoint: entry.branchPoint == null ? null : Math.max(-1, entry.branchPoint - captured.dropped), siblingContext,
+    };
+
 }
 
 function isCurrentActionCharacter(action) {
@@ -3962,8 +3942,8 @@ async function handleAITitle(e) {
     setActionBusy(btn, true);
 
     try {
-        const action = captureChatAction(filename, entry);
-        const initialMeta = JSON.stringify(getChatMeta(filename, action.avatar));
+        const action = await captureChatAction(filename, entry, { titleOnly: true });
+        const initialMeta = action.initialMeta;
         const title = await generateTitleForChat(action.messages, action.characterName);
 
         if (title && JSON.stringify(getChatMeta(filename, action.avatar)) === initialMeta) {
@@ -4000,8 +3980,8 @@ async function handleAISummaryAndTitle(e) {
     setActionBusy(btn, true);
 
     try {
-        const action = captureChatAction(filename, entry);
-        const initialMeta = JSON.stringify(getChatMeta(filename, action.avatar));
+        const action = await captureChatAction(filename, entry);
+        const initialMeta = action.initialMeta;
         const summary = await generateSummaryForChat(action.messages, action.characterName, action.branchPoint, action.siblingContext);
         const title = await generateTitleForChat(action.messages, action.characterName);
 
@@ -4190,8 +4170,8 @@ async function handleRegenSummary(e) {
     setActionBusy(btn, true);
 
     try {
-        const action = captureChatAction(filename, entry);
-        const initialMeta = JSON.stringify(getChatMeta(filename, action.avatar));
+        const action = await captureChatAction(filename, entry);
+        const initialMeta = action.initialMeta;
         const summary = await generateSummaryForChat(action.messages, action.characterName, action.branchPoint, action.siblingContext);
 
         if (summary && JSON.stringify(getChatMeta(filename, action.avatar)) === initialMeta) {
@@ -4213,11 +4193,11 @@ async function handleRegenSummary(e) {
     }
 }
 
-function getSummarySiblingContextText(fileName, characterName) {
+async function getSummarySiblingContextText(fileName, characterName) {
     if (!branchContextActive) return '';
     if (!fileName) return '';
 
-    const siblings = getSiblingBranchContextForThread(fileName, SUMMARY_SIBLING_BRANCH_LIMIT);
+    const siblings = await getSiblingMessagesAsync(fileName, { maxSiblings: SUMMARY_SIBLING_BRANCH_LIMIT });
     if (siblings.length === 0) return '';
 
     const targetDisplayName = getDisplayName(fileName) || fileName;

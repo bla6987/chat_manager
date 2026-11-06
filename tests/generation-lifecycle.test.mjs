@@ -235,7 +235,7 @@ test('branch injection refreshes the live edited snapshot with panel and embeddi
             refreshSwipeBrowser: () => operations.push('swipes'),
             markChatDirty: () => operations.push('dirty'), isEmbeddingGenerationEnabled: () => false, isPanelOpen: () => false,
             isBranchContextActive: () => true, updateActiveChat: async () => { operations.push('update'); return true; },
-            updateBranchContextInjection: () => operations.push('inject'), clearBranchContextInjection() {},
+            refreshBranchContextInjection: async () => { operations.push('inject'); }, clearBranchContextInjection() {},
         };
         const callback = new Function(...Object.keys(fixtureValues), `${match[0]}; return onMessageUpdate;`)(...Object.values(fixtureValues));
         callback();
