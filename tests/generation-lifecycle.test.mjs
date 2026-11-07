@@ -211,16 +211,13 @@ test('entry point invalidates local edits before optional display/embedding upda
     const match = source.match(/const onMessageUpdate = \(\(\) => \{[\s\S]*?\n\}\)\(\);/);
     assert.ok(match);
     const f = fixture();
-    const dirty = [];
+    const recorded = [];
     try {
-        const callback = new Function('SillyTavern', 'getActiveChatFile', 'getIndexCharacterAvatar', 'markChatDirty', 'refreshSwipeBrowser', `${match[0]}; return onMessageUpdate;`)(
-            globalThis.SillyTavern, () => 'fixture.jsonl', () => 'fixture.png', file => dirty.push(file), () => {},
+        const callback = new Function('SillyTavern', 'recordLocalChatEdit', 'refreshSwipeBrowser', `${match[0]}; return onMessageUpdate;`)(
+            globalThis.SillyTavern, context => recorded.push(context), () => {},
         );
         callback();
-        assert.deepEqual(dirty, ['fixture.jsonl'], 'cache invalidation is synchronous before the optional debounce');
-        f.context.characters[0].avatar = 'other.png';
-        callback();
-        assert.deepEqual(dirty, ['fixture.jsonl'], 'another character cannot invalidate a same-named indexed thread');
+        assert.deepEqual(recorded, [f.context], 'cache invalidation is synchronous before the optional debounce');
     } finally { f.restore(); }
 });
 
@@ -231,9 +228,9 @@ test('branch injection refreshes the live edited snapshot with panel and embeddi
     const operations = [];
     try {
         const fixtureValues = {
-            SillyTavern: globalThis.SillyTavern, getActiveChatFile: () => 'fixture.jsonl', getIndexCharacterAvatar: () => 'fixture.png',
+            SillyTavern: globalThis.SillyTavern, getActiveChatFile: () => 'fixture.jsonl',
             refreshSwipeBrowser: () => operations.push('swipes'),
-            markChatDirty: () => operations.push('dirty'), isEmbeddingGenerationEnabled: () => false, isPanelOpen: () => false,
+            recordLocalChatEdit: () => operations.push('dirty'), isEmbeddingGenerationEnabled: () => false, isPanelOpen: () => false,
             isBranchContextActive: () => true, updateActiveChat: async () => { operations.push('update'); return true; },
             refreshBranchContextInjection: async () => { operations.push('inject'); }, clearBranchContextInjection() {},
         };
@@ -274,7 +271,7 @@ test('endpoint-only settings changes invalidate in-flight work, dimensions, and 
     } finally { f.restore(); }
 });
 
-test('explicit reopen revalidates cached files while host chat switching keeps default refresh', async () => {
+test('reopening and host chat switching keep the default refresh; only the verify control forces a re-read', async () => {
     const source = await fs.readFile(new URL('../index.js', import.meta.url), 'utf8');
     const open = source.match(/async function openChatManager\(event\) \{[\s\S]*?\n\}/);
     assert.ok(open);
@@ -283,9 +280,18 @@ test('explicit reopen revalidates cached files while host chat switching keeps d
         () => 'panel', async () => true, () => true, async options => calls.push(options), async () => assert.fail('already open'), { getElementById: () => null },
     );
     assert.equal(await run(), true);
-    assert.deepEqual(calls, [{ forceRevalidate: true }]);
+    assert.deepEqual(calls, [undefined]);
     const switched = source.match(/async function onChatChanged\(\) \{[\s\S]*$/);
     assert.ok(switched[0].includes('void refreshPanel().catch('), 'host switch keeps nonblocking incremental refresh');
+    assert.ok(!source.includes('forceRevalidate'), 'the entry point never forces a full re-read itself');
+    const ui = await fs.readFile(new URL('../src/ui-controller.js', import.meta.url), 'utf8');
+    assert.equal(ui.match(/refreshPanel\(\{ forceRevalidate: true \}\)/g).length, 1, 'verifyAllChats is the only forcing caller');
+    assert.match(ui.match(/async function refreshAfterPanelPaint[\s\S]*?\n\}/)[0], /await refreshPanel\(\);/);
+    assert.ok(source.includes('verifyAllChats()'), 'the verify control is bound');
+    for (const template of ['panel', 'popup']) {
+        const html = await fs.readFile(new URL(`../templates/${template}.html`, import.meta.url), 'utf8');
+        assert.ok(html.includes('id="chat-manager-verify-chats"'), `${template} offers the verify control`);
+    }
 });
 
 test('settings generate action reports superseded runs without a success toast', async () => {

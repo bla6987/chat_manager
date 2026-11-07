@@ -3,9 +3,9 @@
  * Lifecycle hooks, event listeners, UI injection.
  */
 
-import { onHydrationUpdate, buildIndex, clearIndex, getIndex, getIndexCharacterAvatar, markChatDirty, removeChatFromIndex, updateActiveChat } from './src/chat-reader.js';
+import { onHydrationUpdate, buildIndex, clearIndex, getIndex, getIndexCharacterAvatar, recordLocalChatEdit, removeChatFromIndex, updateActiveChat } from './src/chat-reader.js';
 import {
-    togglePanel, closePanel, refreshPanel, renderThreadCards, refreshThreadCardsAfterMessage, onSearchInput, isPanelOpen, resetSearchState,
+    togglePanel, closePanel, refreshPanel, verifyAllChats, renderThreadCards, refreshThreadCardsAfterMessage, onSearchInput, isPanelOpen, resetSearchState,
     toggleTimeline, isTimelineActive, toggleSemanticMap, isSemanticMapActive, toggleGraphView, isGraphViewActive, toggleStats, isStatsActive, toggleBranchContext, isBranchContextActive,
     clearInMemoryEmbeddings, generateEmbeddingsForCurrentIndex, scheduleEmbeddingBootstrap, scheduleIncrementalEmbedding, setEmbeddingGenerationActive, performSearch,
 } from './src/ui-controller.js';
@@ -112,10 +112,7 @@ function getActiveChatFile(context = null) {
 const onMessageUpdate = (() => {
     let timer = null;
     return function () {
-        const eventContext = SillyTavern.getContext();
-        const eventAvatar = eventContext.characters?.[eventContext.characterId]?.avatar;
-        const eventFile = getActiveChatFile(eventContext);
-        if (eventFile && eventAvatar === getIndexCharacterAvatar()) markChatDirty(eventFile);
+        recordLocalChatEdit(SillyTavern.getContext());
         refreshSwipeBrowser();
         if (timer) clearTimeout(timer);
         timer = setTimeout(async () => {
@@ -367,7 +364,7 @@ async function openChatManager(event) {
     if (!ready) return false;
 
     if (isPanelOpen()) {
-        await refreshPanel({ forceRevalidate: true });
+        await refreshPanel();
     } else {
         await togglePanel();
     }
@@ -1369,6 +1366,17 @@ function bindPanelEvents() {
         branchCtxToggleBtn.addEventListener('click', (e) => {
             e.stopPropagation();
             toggleBranchContext();
+        });
+    }
+
+    const verifyChatsBtn = document.getElementById('chat-manager-verify-chats');
+    if (verifyChatsBtn) {
+        verifyChatsBtn.addEventListener('click', (e) => {
+            e.stopPropagation();
+            void verifyAllChats().catch(error => {
+                console.warn(`[${MODULE_NAME}] Chat verification failed:`, error);
+                toastr.error('Could not verify chats.');
+            });
         });
     }
 

@@ -1,0 +1,230 @@
+<!doctype html>
+<html lang="en">
+<meta charset="utf-8">
+<title>Chat Manager open reuse checks</title>
+<link rel="stylesheet" href="../style.css">
+<style>
+body { background:#13161a; color:#e1e4e9; font:14px system-ui; margin:16px; }
+pre { white-space:pre-wrap; line-height:1.5; }
+iframe { width:100%; height:560px; border:1px solid #444b55; background:#20242b; }
+</style>
+<!--
+Runs the real entry point, templates and IndexedDB inside an iframe, so reloading
+the iframe is a real page reload. Only the SillyTavern server and host are mocked,
+with synthetic chats. Serve from a test origin: this clears chat_manager_cache there.
+Keep the tab in front for meaningful timings: opening waits on animation frames,
+which browsers throttle to about one per second in background tabs.
+-->
+<script type="module">
+const isFrame = new URLSearchParams(location.search).has('frame');
+
+if (isFrame) {
+    const server = window.parent.fixtureServer;
+    const realFetch = window.fetch.bind(window);
+    window.fetch = async (url, options) => {
+        const path = String(url);
+        const template = path.match(/\/templates\/([\w.-]+)$/);
+        if (template) return realFetch(`../templates/${template[1]}`);
+        return server.handle(path, options);
+    };
+    const listeners = new Map();
+    const context = server.context({
+        eventSource: {
+            on(name, fn) { listeners.set(name, [...(listeners.get(name) || []), fn]); },
+            emit: async (name, ...args) => { for (const fn of listeners.get(name) || []) await fn(...args); },
+        },
+        eventTypes: Object.fromEntries(['CHAT_CHANGED', 'MESSAGE_SENT', 'MESSAGE_RECEIVED', 'MESSAGE_EDITED', 'MESSAGE_DELETED',
+            'MESSAGE_SWIPED', 'MESSAGE_UPDATED', 'CHAT_CREATED', 'CHAT_DELETED', 'GENERATION_STARTED', 'GENERATION_ENDED', 'GENERATION_STOPPED', 'APP_READY'].map(name => [name, name.toLowerCase()])),
+    });
+    window.toastr = Object.fromEntries(['success', 'warning', 'info', 'error'].map(kind => [kind, message => server.toasts.push({ kind, message })]));
+    window.SillyTavern = { getContext: () => context, libs: {
+        DOMPurify: { sanitize: html => html },
+        lodash: { debounce: fn => fn },
+        moment: () => ({ isValid: () => true, format: () => 'Oct 16', fromNow: () => 'just now' }),
+    } };
+    window.reader = await import('../src/chat-reader.js');
+    await import('../index.js');
+    window.hostContext = context;
+    window.fixtureReady = true;
+} else {
+    const CHATS = Number(new URLSearchParams(location.search).get('chats')) || 300;
+    const MESSAGES = 40, WORDS = 150;
+    const results = document.getElementById('results');
+    const frame = document.getElementById('frame');
+    const assert = (value, label) => { if (!value) throw Error(label); results.textContent += `PASS ${label}\n`; };
+    const note = label => { results.textContent += `     ${label}\n`; };
+    const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+    const until = async (test, label, timeout = 300000) => {
+        const start = performance.now();
+        while (!test()) {
+            if (performance.now() - start > timeout) throw Error(`Timed out: ${label}`);
+            await sleep(5);
+        }
+    };
+    const message = (chat, index) => ({
+        name: index % 2 ? 'Mira' : 'User', is_user: index % 2 === 0, is_system: false,
+        send_date: new Date(Date.UTC(2026, 0, 1) + chat * 3_600_000 + index * 60_000).toISOString(),
+        mes: `chat ${chat} message ${index} `.padEnd(WORDS * 6, 'lantern '), extra: {},
+    });
+    const chats = new Map();
+    for (let chat = 0; chat < CHATS; chat++) {
+        chats.set(`chat-${chat}`, [{ user_name: 'User', character_name: 'Mira', chat_metadata: {} },
+            ...Array.from({ length: MESSAGES }, (_, index) => message(chat, index))]);
+    }
+    const server = window.fixtureServer = {
+        gets: [], lists: 0, toasts: [], settings: {}, activeChat: 'chat-0',
+        sizes: new Map(),
+        context(extra) {
+            return {
+                characterId: 0, characters: [{ avatar: 'fixture.png', name: 'Mira' }], name1: 'User', name2: 'Mira',
+                chatId: this.activeChat, chat: structuredClone(chats.get(this.activeChat).slice(1)), chatMetadata: {},
+                extensionSettings: this.settings, saveSettingsDebounced() {}, getRequestHeaders: () => ({}), onlineStatus: 'connected',
+                ...extra,
+            };
+        },
+        async handle(path, options) {
+            if (path === '/api/characters/chats') {
+                this.lists++;
+                return Response.json([...chats].map(([id, rows]) => ({
+                    file_id: id, file_name: `${id}.jsonl`, file_size: this.sizes.get(id) || '100.00KB',
+                    chat_items: rows.length - 1, mes: rows.at(-1).mes, last_mes: rows.at(-1).send_date,
+                })));
+            }
+            if (path === '/api/chats/get') {
+                const id = JSON.parse(options.body).file_name;
+                this.gets.push(id);
+                return Response.json(chats.get(id));
+            }
+            return new Response('', { status: 404 });
+        },
+    };
+    const win = () => frame.contentWindow;
+    const doc = () => frame.contentDocument;
+    const clearCounts = () => { server.gets = []; server.lists = 0; server.toasts = []; };
+    async function reload() {
+        const loaded = new Promise(resolve => frame.addEventListener('load', resolve, { once: true }));
+        frame.src = `browser-open-reuse.html?frame=${Date.now()}`;
+        await loaded;
+        await until(() => win().fixtureReady, 'extension loaded');
+    }
+    const toggleButton = () => doc().getElementById('chat-manager-topbar-toggle');
+    const settled = () => until(() => !win().reader.isBuilding() && !doc().querySelector('#chat-manager-content .chat-manager-loading'), 'index settled');
+    const indexingCards = () => [...doc().querySelectorAll('.chat-manager-card-meta span')].filter(span => span.textContent === 'Indexing...').length;
+    /** Open with the real control and time how long the user waits. */
+    async function open(label) {
+        clearCounts();
+        const start = performance.now();
+        toggleButton().click();
+        await until(() => doc().querySelector('.chat-manager-card'), 'cards rendered');
+        const cards = performance.now() - start;
+        await settled();
+        await until(() => indexingCards() === 0 || server.gets.length === 0, 'cards patched', 5000);
+        const ready = performance.now() - start;
+        note(`${label}: cards in ${Math.round(cards)} ms, fully indexed in ${Math.round(ready)} ms, ${server.gets.length} chats downloaded`);
+        return { cards, ready };
+    }
+    async function close() {
+        toggleButton().click();
+        await until(() => !doc().querySelector('.chat-manager-panel.open'), 'panel closed');
+    }
+    const bodyText = async name => (await win().reader.readChatMessages(name)).find(item => item.index === 3).text;
+    async function editOnServer(id, transform) {
+        chats.get(id)[4].mes = transform(chats.get(id)[4].mes);
+    }
+
+    document.getElementById('run').onclick = async () => {
+        results.textContent = '';
+        window.fixtureDone = false;
+        if (document.visibilityState !== 'visible') note('This tab is hidden, so the timings below are throttled.');
+        try {
+            await new Promise(resolve => { const request = indexedDB.deleteDatabase('chat_manager_cache'); request.onsuccess = request.onerror = request.onblocked = resolve; });
+            await reload();
+
+            await open('First open, nothing cached');
+            assert(server.gets.length === CHATS - 1, 'first open downloads every chat except the live one');
+            assert(indexingCards() === 0 && doc().querySelector('.chat-manager-card'), 'first open ends with no card still indexing');
+
+            await close();
+            await open('Reopen in the same page');
+            assert(server.gets.length === 0 && server.lists === 1, 'reopening downloads nothing');
+
+            await close();
+            await reload();
+            assert(win().reader.isBuilding() === false && Object.keys(win().reader.getIndex()).length === 0, 'a reload starts with no index in memory');
+            await open('Open after a page reload');
+            assert(server.gets.length === 0 && server.lists === 1, 'a reload restores from IndexedDB without downloading');
+            assert(indexingCards() === 0, 'restored cards do not stay on Indexing...');
+            const entries = Object.values(win().reader.getIndex());
+            assert(entries.length === CHATS && entries.every(entry => entry.isLoaded && !entry.needsHydration && entry.messageCount === MESSAGES), 'every restored chat reports its real message count');
+            assert(doc().querySelector('.chat-manager-card-meta span').textContent === `${MESSAGES} messages`, 'restored cards show the message count');
+            assert((await bodyText('chat-5.jsonl')).startsWith('chat 5 message 3'), 'complete text is available for a restored chat');
+            assert(server.gets.length === 0, 'reading a restored chat comes from the cached body');
+
+            // A local edit while the index is not loaded, the case that had no record before.
+            await close();
+            await reload();
+            const editedText = text => text.replace('message 3', 'MESSAGE 3');
+            await editOnServer('chat-0', editedText);
+            win().hostContext.chat[3].mes = editedText(win().hostContext.chat[3].mes);
+            await win().hostContext.eventSource.emit('message_edited', 3);
+            await sleep(50);
+            assert(Object.keys(win().reader.getIndex()).length === 0, 'a local edit with the panel closed does not build an index');
+            server.activeChat = 'chat-1';
+            await reload();
+            await open('Open after a same-size local edit');
+            assert(server.gets.length === 1 && server.gets[0] === 'chat-0', 'only the locally edited chat is re-read after a reload');
+            assert((await bodyText('chat-0.jsonl')).startsWith('chat 0 MESSAGE 3'), 'the local edit is visible');
+
+            await close();
+            server.sizes.set('chat-7', '100.01KB');
+            await open('Reopen after one chat changed size');
+            assert(server.gets.length === 1 && server.gets[0] === 'chat-7', 'only the chat with changed metadata is re-read');
+
+            await close();
+            await editOnServer('chat-8', editedText);
+            await open('Reopen after a same-size remote edit');
+            assert(server.gets.length === 0, 'a same-size remote edit does not trigger a download');
+            assert((await bodyText('chat-8.jsonl')).startsWith('chat 8 message 3'), 'that edit stays unseen until verified');
+
+            clearCounts();
+            const verify = doc().getElementById('chat-manager-verify-chats');
+            assert(verify && verify.textContent.trim() === 'Verify chats' && verify.getClientRects().length > 0, 'the panel shows a labeled verify control');
+            const start = performance.now();
+            verify.click();
+            assert(verify.disabled && verify.getAttribute('aria-busy') === 'true', 'the verify control shows it is busy');
+            await until(() => server.toasts.length > 0, 'verification finished');
+            note(`Verify chats: ${Math.round(performance.now() - start)} ms, ${server.gets.length} chats downloaded`);
+            assert(server.gets.length === CHATS - 1 || server.gets.length === CHATS, 'verify re-reads the archive');
+            assert(server.toasts[0].kind === 'success' && server.toasts[0].message === `Checked ${CHATS} chats.`, 'verify reports success');
+            assert(!verify.disabled && !verify.hasAttribute('aria-busy'), 'the verify control recovers');
+            assert((await bodyText('chat-8.jsonl')).startsWith('chat 8 MESSAGE 3'), 'verify reveals the same-size remote edit');
+
+            await close();
+            server.settings.chat_manager.displayMode = 'popup';
+            await reload();
+            clearCounts();
+            toggleButton().click();
+            await until(() => doc().querySelector('#chat-manager-shadow-overlay.visible .chat-manager-card'), 'popup cards rendered');
+            await settled();
+            assert(server.gets.length === 0, 'the popup reuses cached chats too');
+            assert(doc().querySelector('#chat-manager-shadow-overlay #chat-manager-verify-chats').getClientRects().length > 0, 'the popup shows the verify control');
+            results.textContent += 'ALL PASS\n';
+        } catch (error) {
+            results.textContent += `FAIL ${error.message}\n`;
+        }
+        window.fixtureDone = true;
+    };
+    results.textContent = 'Ready. Uses synthetic chats only.';
+}
+</script>
+<body>
+<script>
+if (new URLSearchParams(location.search).has('frame')) {
+    document.body.innerHTML = '<div id="extensionTopBar" style="padding:4px"></div>';
+} else {
+    document.body.innerHTML = '<h1>Open reuse</h1><p>Real entry point, templates and IndexedDB. Mocked host and server, synthetic chats.</p>'
+        + '<button id="run">Run checks</button><pre id="results">Loading…</pre><iframe id="frame" title="Extension under test"></iframe>';
+}
+</script>
+</body>
+</html>

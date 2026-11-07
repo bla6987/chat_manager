@@ -42,12 +42,33 @@ memory, IndexedDB, or the original server-side chat files. A cold read stays
 ephemeral unless a caller explicitly requests residency.
 
 The existing IndexedDB v2 store gains separate catalog records; there is no
-destructive database migration. Legacy body records are projected into catalog
-records one at a time. Writes for the same file coalesce, and one write
+destructive database migration. Writes for the same file coalesce, and one write
 transaction runs at a time. Cache failures fall back to the original chat files.
 Failed revalidation preserves previously known data but rejects operations that
 would otherwise consume stale text. The caching code does not edit chat files or
 delete swipes.
+
+## When chats are re-read
+
+Opening the panel reuses every chat whose cached record still matches the host's
+chat list: formatted file size, message count, and last message date. Age alone
+never expires a record. A chat is downloaded again only when its list metadata
+differs, it has no trusted cached record, or the user chooses **Verify chats**.
+
+An edit in the host deletes that chat's cached record, even if the panel has never
+opened, so the next build re-reads it. The chat open in the host reads from the
+host's live array, which is newer than the file while a debounced save is pending.
+Catalogs written before edit tracking existed lack `localEditsTracked`, so they are
+re-read once after updating.
+
+Automatic embedding restoration at page load and on character switches lists chats
+and restores catalogs without downloading any. Unknown chats stay queued until the
+panel or another feature requests hydration.
+
+The host's list has no file revision, and its file size is rounded. An edit that
+leaves all three list values unchanged stays unseen until **Verify chats** runs or
+the chat changes again, if it came from another device or browser, or from an
+extension that saves a chat without emitting a message event.
 
 Closing the panel releases inactive bodies and rendered view state. Stale search
 references are dropped on invalidation rather than waiting for the next search.

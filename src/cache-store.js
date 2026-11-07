@@ -126,25 +126,13 @@ export function getCachedChat(avatar, fileName, { signal } = {}) {
     return readRecord(makeKey(avatar, fileName), signal);
 }
 
-/**
- * Read compact catalog records one at a time. Legacy v2 records are projected
- * and immediately released; subsequent writes persist a separate small record.
- */
+/** Read compact catalog records one at a time. */
 export async function* iterateCachedChatCatalogs(avatar, fileNames, { signal, acceptMetadata } = {}) {
     for (const fileName of fileNames) {
         throwIfAborted(signal);
-        const key = makeKey(avatar, fileName);
-        let record = await readRecord(CATALOG_PREFIX + key, signal);
-        if (!record) {
-            // Legacy bodies require matching validity metadata before IDB clones
-            // them, and both revisions are checked in the same transaction.
-            await consumeCachedChatsForCharacter(avatar, [fileName], acceptMetadata || (() => true), entries => {
-                record = entries.get(fileName);
-            });
-        }
+        const record = await readRecord(CATALOG_PREFIX + makeKey(avatar, fileName), signal);
         throwIfAborted(signal);
         if (record && acceptMetadata && !acceptMetadata(fileName, record)) continue;
-        if (record && record.bodyResident !== false) record = catalogRecord(avatar, fileName, record);
         if (record) yield { fileName, entry: record };
     }
 }
@@ -251,6 +239,8 @@ function catalogRecord(avatar, fileName, entry) {
         messages: descriptors, messageDescriptors: descriptors,
         bodyEmbeddingText: entry.bodyEmbeddingText ?? messagePreview((entry.messages || []).slice(-10).map(message => String(message.text || '').trim().slice(0, 2000)).filter(Boolean).join('\n').slice(0, 2000).trim(), 2000),
         bodyResident: false, isLoaded: true,
+        // Every writer holds authoritative content; see isTrustedCatalog in chat-reader.js.
+        localEditsTracked: true,
     };
 }
 

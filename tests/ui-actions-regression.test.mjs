@@ -290,6 +290,100 @@ test('explicit refresh forwards force revalidation to both thread and alternate-
     }
 });
 
+function verifyButton(nodes) {
+    const button = new Element('button');
+    const icon = button.appendChild(new Element('i')); icon.tag = 'i';
+    button.querySelector = selector => selector === 'i' ? icon : null;
+    button.attributes = {};
+    button.setAttribute = (name, value) => { button.attributes[name] = value; };
+    button.removeAttribute = name => { delete button.attributes[name]; };
+    nodes.set('chat-manager-verify-chats', button);
+    return { button, icon };
+}
+
+function verifySetup(overrides = {}) {
+    const calls = [];
+    const fixture = setup({
+        buildIndex: async (...args) => { calls.push(args); return { changed: false }; }, prioritizeInQueue() {},
+        isBuilding: () => false, didLastBuildFail: () => false, getIndexCharacterAvatar: () => 'alpha.png',
+        getHydrationProgress: () => ({ loaded: 3, total: 3 }), ...overrides,
+    });
+    fixture.settings.enabled = false;
+    vm.runInContext("panelOpen = true; ensureHydrationSubscription = () => {}; ensureSearchModeBadge = () => {}; updateSearchModeBadgeDisplay = () => {}; renderLoading = () => {}; renderThreadCards = () => {}; getCurrentSearchQuery = () => '';", fixture.sandbox);
+    return { ...fixture, calls, ...verifyButton(fixture.nodes) };
+}
+
+test('verify control forces one re-read, shows it is busy, and reports success', async () => {
+    const { sandbox, calls, toasts, button, icon } = verifySetup();
+    const pending = sandbox.verifyAllChats();
+    assert.equal(button.disabled, true);
+    assert.equal(button.attributes['aria-busy'], 'true');
+    assert.ok(icon.classList.contains('fa-spin'));
+    await sandbox.verifyAllChats();
+    await pending;
+    assert.equal(calls.length, 1, 'a second click during verification is ignored');
+    assert.equal(calls[0][2].forceRevalidate, true);
+    assert.deepEqual(toasts, [{ kind: 'success', message: 'Checked 3 chats.' }]);
+    assert.equal(button.disabled, false);
+    assert.equal(button.attributes['aria-busy'], undefined);
+    assert.ok(!icon.classList.contains('fa-spin'));
+});
+
+test('verify control waits for hydration and reports chats it could not read', async () => {
+    let building = 2;
+    const { sandbox, toasts, timers } = verifySetup({
+        isBuilding: () => building-- > 0, getHydrationProgress: () => ({ loaded: 2, total: 3 }),
+    });
+    const pending = sandbox.verifyAllChats();
+    for (let turn = 0; turn < 20 && !toasts.length; turn++) {
+        await new Promise(resolve => setImmediate(resolve));
+        timers.splice(0).forEach(fn => fn());
+    }
+    await pending;
+    assert.deepEqual(toasts, [{ kind: 'warning', message: 'Checked 2 of 3 chats. The rest could not be read.' }]);
+});
+
+test('verify control reports a failed chat list instead of claiming success', async () => {
+    const { sandbox, toasts } = verifySetup({ didLastBuildFail: () => true });
+    await sandbox.verifyAllChats();
+    assert.deepEqual(toasts, [{ kind: 'error', message: 'Could not read the chat list from the server.' }]);
+});
+
+test('verify control stays quiet after a character switch and does nothing while closed', async () => {
+    const switched = verifySetup({ getIndexCharacterAvatar: () => 'beta.png' });
+    await switched.sandbox.verifyAllChats();
+    assert.deepEqual(switched.toasts, []);
+    assert.equal(switched.button.disabled, false);
+    const closed = verifySetup();
+    vm.runInContext('panelOpen = false;', closed.sandbox);
+    await closed.sandbox.verifyAllChats();
+    assert.equal(closed.calls.length, 0);
+    assert.equal(closed.button.disabled, undefined);
+});
+
+test('verify control recovers its button when the re-read throws', async () => {
+    const { sandbox, button, icon } = verifySetup({ buildIndex: async () => { throw new Error('boom'); } });
+    await assert.rejects(sandbox.verifyAllChats(), /boom/);
+    assert.equal(button.disabled, false);
+    assert.ok(!icon.classList.contains('fa-spin'));
+    await assert.rejects(sandbox.verifyAllChats(), /boom/, 'a later click can retry');
+});
+
+test('index progress restores the thread footer instead of a finished indexing count', () => {
+    const { sandbox, nodes } = setup();
+    vm.runInContext("getCurrentSearchQuery = () => '';", sandbox);
+    const status = nodes.get('chat-manager-status');
+    sandbox.onIndexProgress(4, 10);
+    assert.equal(status.textContent, 'Indexing chats... 4/10');
+    let footers = 0;
+    vm.runInContext('updateThreadListFooter = () => { globalThis.footerUpdated(); };', Object.assign(sandbox, { footerUpdated: () => footers++ }));
+    sandbox.onIndexProgress(10, 10);
+    assert.equal(status.textContent, 'Indexing chats... 10/10', 'with no list on screen the count remains');
+    vm.runInContext("threadLists.set(document.getElementById('chat-manager-content'), { entries: [] });", sandbox);
+    sandbox.onIndexProgress(10, 10);
+    assert.equal(footers, 1);
+});
+
 test('fresh alternate work drains after a cleared in-flight flush and its already-fired timer', async () => {
     const oldRequest = deferred(); const started = deferred(); let calls = 0;
     const { sandbox, settings, index, timers } = setup({

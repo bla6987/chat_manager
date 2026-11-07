@@ -117,30 +117,29 @@ test('successful empty archive invalidates search results and releases cached bo
     await new Promise(resolve => setImmediate(resolve)); assert.equal(records.size, 0);
 });
 
-test('same-length earlier edits revalidate explicitly, when dirty, and after bounded reuse', async () => {
+test('same-length earlier edits revalidate explicitly and when dirty, never by elapsed time', async () => {
     setup(); await reader.buildIndex(); await reader.loadEntryNow('a.jsonl');
     const before = contentRequests; await reader.buildIndex();
-    assert.equal(contentRequests, before, 'recent known-good entries reuse their body');
+    assert.equal(contentRequests, before, 'known-good entries reuse their body');
     bodies.get('a.jsonl')[1].mes = 'new text';
     await reader.buildIndex(null, null, { forceRevalidate: true }); await reader.loadEntryNow('a.jsonl');
     assert.equal(reader.getIndex()['a.jsonl'].messages[0].text, 'new text');
     bodies.get('a.jsonl')[1].mes = 'old text'; reader.markChatDirty('a.jsonl');
     await reader.loadEntryNow('a.jsonl'); assert.equal(reader.getIndex()['a.jsonl'].messages[0].text, 'old text');
-    reader.getIndex()['a.jsonl'].validatedAt -= 60_001; bodies.get('a.jsonl')[1].mes = 'new text';
-    await reader.buildIndex(); await reader.loadEntryNow('a.jsonl');
-    assert.equal(reader.getIndex()['a.jsonl'].messages[0].text, 'new text');
+    reader.getIndex()['a.jsonl'].validatedAt -= 7 * 24 * 3_600_000; bodies.get('a.jsonl')[1].mes = 'remote text';
+    const settled = contentRequests; await reader.buildIndex();
+    assert.equal(contentRequests, settled, 'age alone does not re-read matching metadata');
+    await reader.buildIndex(null, null, { forceRevalidate: true }); await reader.loadEntryNow('a.jsonl');
+    assert.equal(reader.getIndex()['a.jsonl'].messages[0].text, 'remote text');
 });
 
 test('warm cached restoration reconciles queue membership with linear work', async () => {
     const count = 1000; setup(Array.from({ length: count }, (_, i) => `${i}.jsonl`));
-    for (const row of rows) records.set(`test.png:${row.file_name}`, {
+    for (const row of rows) records.set(`\u0000catalog:test.png:${row.file_name}`, {
         cacheFormatVersion: 2, fileName: row.file_name, lastModified: Date.parse(date),
-        validatedAt: Date.now(), serverSignature: JSON.stringify(['100 B', 2]),
-        messages: [{ filename: row.file_name, index: 0, role: 'assistant', text: 'cached' }], messageCount: 1,
-    });
-    for (const [key, record] of records) metadataRecords.set(key, {
-        cacheFormatVersion: record.cacheFormatVersion, lastModified: record.lastModified,
-        validatedAt: record.validatedAt, serverSignature: record.serverSignature,
+        validatedAt: 1, serverSignature: JSON.stringify(['100 B', 2]),
+        bodyResident: false, localEditsTracked: true,
+        messages: [{ filename: row.file_name, index: 0, role: 'assistant', text: '', isDescriptor: true }], messageCount: 1,
     });
     let visits = 0;
     const filter = Array.prototype.filter;

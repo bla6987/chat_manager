@@ -161,8 +161,9 @@ test('restored compact catalogs invalidate searches before the next catalog comp
     const date = '2026-10-16T12:00:00Z';
     const names = Array.from({ length: 51 }, (_, i) => `batch${i}.jsonl`);
     names.forEach(name => seed(name, {
+        key: `\u0000catalog:avatar:${name}`, bodyResident: false, localEditsTracked: true,
         lastModified: Date.parse(date), serverSignature: JSON.stringify(['100 B', 1]),
-        messageCount: 1, messages: [{ filename: name, index: 0, role: 'assistant', text: name }],
+        messageCount: 1, messages: [{ filename: name, index: 0, role: 'assistant', text: '', isDescriptor: true }],
     }));
     const context = { characterId: 0, characters: [{ avatar: 'avatar' }], chat: [],
         getRequestHeaders: () => ({}) };
@@ -173,7 +174,7 @@ test('restored compact catalogs invalidate searches before the next catalog comp
     let release;
     const paused = new Promise(resolve => {
         delayReadCompletion = complete => {
-            if (bodyReads.filter(key => !key.startsWith('\u0000catalog:')).length === 51) { release = complete; resolve(); }
+            if (bodyReads.filter(key => key.startsWith('\u0000catalog:')).length === 51) { release = complete; resolve(); }
             else complete();
         };
     });

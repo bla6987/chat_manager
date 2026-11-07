@@ -15,9 +15,6 @@ const MODULE_NAME = 'chat_manager';
 const HYDRATION_BATCH_SIZE = 2;
 const HYDRATION_YIELD_MS = 16;
 const FALLBACK_SORT_TIMESTAMP = 0;
-// The host list has no file revision: last_mes survives edits. Limit reuse even
-// when size/count match; explicit refreshes and local dirty events bypass this.
-const REVALIDATE_AFTER_MS = 60_000;
 
 /** @type {Object<string, ChatIndexEntry>} filename -> index entry */
 let chatIndex = {};
@@ -26,6 +23,11 @@ let indexBuildInProgress = false;
 let nextBuildToken = 0;
 let activeBuildToken = null;
 let nextInitialOrder = 0;
+// Startup work can build a catalog without downloading the archive. Any caller
+// that wants hydration latches this, including while another build is running.
+let backgroundHydrationRequested = false;
+let forcedBuildPending = false;
+let lastBuildFailed = false;
 
 let hydrationQueue = [];
 let queuedFiles = new Set();
@@ -652,9 +654,22 @@ function metaSignature(meta) {
     return JSON.stringify([meta?.file_size ?? null, getMetaMessageCount(meta)]);
 }
 
-function recentlyValidated(entry) {
-    const age = Date.now() - entry?.validatedAt;
-    return Number.isFinite(age) && age >= 0 && age < REVALIDATE_AFTER_MS;
+/**
+ * The host list has no file revision, so matching size/count/date can still hide
+ * a same-size edit. Local edits delete their cached record (recordLocalChatEdit)
+ * and remote ones wait for a forceRevalidate build. Catalogs written before that
+ * tracking existed may predate a local edit, so they are re-read once instead.
+ */
+function isTrustedCatalog(record) {
+    return record?.localEditsTracked === true;
+}
+
+/** The host's array is newer than the file while a debounced save is pending. */
+function liveChatContext(fileName) {
+    const context = SillyTavern.getContext();
+    if (context.characters?.[context.characterId]?.avatar !== currentCharacterAvatar) return null;
+    if (!Array.isArray(context.chat) || context.chat.length === 0) return null;
+    return resolveActiveChatFilename(context, chatIndex) === fileName ? context : null;
 }
 
 function allocateInitialOrder() {
@@ -861,12 +876,17 @@ async function hydrateEntry(fileName, sessionId, persist = true) {
             if (entry.isLoaded && !entry.needsHydration) return true;
 
             const expectedTimestamp = entry.lastModified;
-            let chatData;
-            try {
-                chatData = await fetchChatContent(fileName);
-            } catch (err) {
-                console.error(`[${MODULE_NAME}] Failed to hydrate ${fileName}:`, err);
-                return false;
+            // Reading the file before a pending save lands would persist the old
+            // text under metadata that no later list could tell apart.
+            const live = liveChatContext(fileName);
+            let chatData = live?.chat;
+            if (!live) {
+                try {
+                    chatData = await fetchChatContent(fileName);
+                } catch (err) {
+                    console.error(`[${MODULE_NAME}] Failed to hydrate ${fileName}:`, err);
+                    return false;
+                }
             }
 
             if (sessionId !== hydrationSessionId) return false;
@@ -898,7 +918,7 @@ async function hydrateEntry(fileName, sessionId, persist = true) {
                 isLoaded: true,
                 needsHydration: false,
                 validatedAt: Date.now(),
-                mainChat: mainChatFromData(chatData),
+                mainChat: mainChatFromData(chatData, live?.chatMetadata),
                 messageEmbeddings: retainMessageEmbeddings(current, messages),
                 cachedMessageEmbeddingKeys: retainCachedEmbeddingKeys(current, messages),
             };
@@ -981,15 +1001,22 @@ function startHydrationLoop() {
 
 /**
  * Build (or incrementally update) the index for the current character.
- * Metadata phase returns quickly; full chat hydration runs in the background.
+ * Metadata phase returns quickly; hydration of new or changed chats runs in the
+ * background. Chats whose list metadata matches their cached catalog are reused.
  * @param {Function} [onProgress] - Called with (completed, total) for progress tracking
  * @param {Function} [onMetadataReady] - Called once metadata is available for immediate UI rendering
+ * @param {{ forceRevalidate?: boolean, backgroundHydration?: boolean }} [options]
+ *   forceRevalidate re-reads every chat from the server. backgroundHydration: false
+ *   leaves unknown chats queued until a later build asks for hydration.
  * @returns {Promise<{ index: Object, changed: boolean, buildInProgress: boolean, hydrationStarted: boolean, isComplete: boolean }>}
  */
 export async function buildIndex(onProgress, onMetadataReady, options = {}) {
     progressCallback = onProgress || null;
+    const requestsHydration = options.backgroundHydration !== false;
+    if (requestsHydration) backgroundHydrationRequested = true;
 
     if (indexBuildInProgress) {
+        if (options.forceRevalidate) forcedBuildPending = true;
         if (Object.keys(chatIndex).length > 0) {
             notifyMetadataReady(onMetadataReady, false);
         }
@@ -1021,6 +1048,7 @@ export async function buildIndex(onProgress, onMetadataReady, options = {}) {
         // freshly reset session and must retain the build lock across awaits.
         indexBuildInProgress = true;
         activeBuildToken = buildToken;
+        backgroundHydrationRequested = requestsHydration;
     }
 
     currentCharacterAvatar = character.avatar;
@@ -1029,6 +1057,7 @@ export async function buildIndex(onProgress, onMetadataReady, options = {}) {
     let changed = false;
     let metadataNotified = false;
 
+    lastBuildFailed = false;
     try {
         const chatList = await fetchChatList();
         if (buildSessionId !== hydrationSessionId || currentCharacterAvatar !== buildAvatar) {
@@ -1108,7 +1137,6 @@ export async function buildIndex(onProgress, onMetadataReady, options = {}) {
             }
         }
         // Catalog records contain fingerprints/previews, never complete bodies.
-        // The iterator also projects legacy cache records one at a time.
         const idbCache = new Map();
         try {
             if (cacheFiles.length > 0) {
@@ -1118,7 +1146,7 @@ export async function buildIndex(onProgress, onMetadataReady, options = {}) {
                         return buildSessionId === hydrationSessionId && currentCharacterAvatar === buildAvatar
                             && chatIndex[fileName] === entriesBeforeCacheRead.get(fileName)
                             && cached.lastModified === getMetaTimestamp(metadata)
-                            && cached.serverSignature === metaSignature(metadata) && recentlyValidated(cached);
+                            && cached.serverSignature === metaSignature(metadata) && isTrustedCatalog(cached);
                     },
                 })) {
                     if (buildSessionId !== hydrationSessionId || currentCharacterAvatar !== buildAvatar) {
@@ -1133,7 +1161,7 @@ export async function buildIndex(onProgress, onMetadataReady, options = {}) {
                     const metadata = serverChats.get(fileName);
                     if (!current || current !== entriesBeforeCacheRead.get(fileName)
                         || entry.lastModified !== getMetaTimestamp(metadata)
-                        || entry.serverSignature !== metaSignature(metadata) || !recentlyValidated(entry)) continue;
+                        || entry.serverSignature !== metaSignature(metadata) || !isTrustedCatalog(entry)) continue;
                     chatIndex[fileName] = {
                         ...current, ...entry, fileName, initialOrder: current.initialOrder,
                         firstTimestampMs: normalizeTimestamp(entry.firstMessageTimestamp),
@@ -1167,14 +1195,13 @@ export async function buildIndex(onProgress, onMetadataReady, options = {}) {
             const entry = chatIndex[fileName];
             normalizeEntryShape(entry);
             const metadataChanged = entry.lastModified !== serverTimestamp || entry.serverSignature !== signature;
-            const reusable = !options.forceRevalidate && !entry.needsHydration && entry.isLoaded
-                && !metadataChanged && recentlyValidated(entry);
+            const reusable = !options.forceRevalidate && !entry.needsHydration && entry.isLoaded && !metadataChanged;
             if (reusable) continue;
 
             const cached = idbCache.get(fileName);
             if (!options.forceRevalidate && !entry.isLoaded && cached
                 && cached.lastModified === serverTimestamp && cached.serverSignature === signature
-                && recentlyValidated(cached) && Array.isArray(cached.messages)) {
+                && isTrustedCatalog(cached) && Array.isArray(cached.messages)) {
                 chatIndex[fileName] = {
                     ...entry, ...cached, fileName, initialOrder: entry.initialOrder,
                     firstTimestampMs: normalizeTimestamp(cached.firstMessageTimestamp),
@@ -1235,7 +1262,7 @@ export async function buildIndex(onProgress, onMetadataReady, options = {}) {
 
         emitHydrationUpdate();
 
-        if (hydrationQueue.length > 0) {
+        if (hydrationQueue.length > 0 && backgroundHydrationRequested) {
             const activeFile = resolveActiveChatFilename(SillyTavern.getContext(), chatIndex);
             const recent = getSortedEntries().filter(entry => !entry.isLoaded || entry.needsHydration)
                 .slice(0, 12).map(entry => entry.fileName);
@@ -1244,11 +1271,17 @@ export async function buildIndex(onProgress, onMetadataReady, options = {}) {
             startHydrationLoop();
         }
     } catch (err) {
+        lastBuildFailed = true;
         console.error(`[${MODULE_NAME}] Error building index:`, err);
     } finally {
         if (activeBuildToken === buildToken) {
             indexBuildInProgress = false;
             activeBuildToken = null;
+            // An explicit verification must not be lost to a build already running.
+            if (forcedBuildPending) {
+                forcedBuildPending = false;
+                void buildIndex(progressCallback, null, { forceRevalidate: true });
+            }
         }
     }
 
@@ -1402,6 +1435,24 @@ export function markChatDirty(fileName) {
     if (currentCharacterAvatar) removeCachedChat(currentCharacterAvatar, fileName);
     markEntryForHydration(fileName);
     bumpIndexVersion();
+    return true;
+}
+
+/**
+ * Record an edit to the chat open in the host, whichever character the index holds.
+ * A chat with no cached record is re-read by the next build, so deleting the record
+ * is the persistent marker for an edit that list metadata might not reveal.
+ * @param {Object} context - SillyTavern context
+ * @returns {boolean} Whether a character chat was identified
+ */
+export function recordLocalChatEdit(context) {
+    const avatar = context?.characters?.[context.characterId]?.avatar;
+    if (!avatar) return false;
+    const indexed = avatar === currentCharacterAvatar ? resolveActiveChatFilename(context, chatIndex) : null;
+    if (indexed && markChatDirty(indexed)) return true;
+    const fileName = resolveActiveChatFilename(context);
+    if (!fileName) return false;
+    removeCachedChat(avatar, fileName);
     return true;
 }
 
@@ -1739,6 +1790,9 @@ export function clearIndex() {
     progressCallback = null;
     indexBuildInProgress = false;
     activeBuildToken = null;
+    backgroundHydrationRequested = false;
+    forcedBuildPending = false;
+    lastBuildFailed = false;
     bumpIndexVersion();
     resetHydrationQueue();
     emitHydrationUpdate();
@@ -1750,6 +1804,14 @@ export function clearIndex() {
  */
 export function isBuilding() {
     return indexBuildInProgress || hydrationInProgress;
+}
+
+/**
+ * Whether the most recent build could not read the server's chat list.
+ * @returns {boolean}
+ */
+export function didLastBuildFail() {
+    return lastBuildFailed;
 }
 
 /**

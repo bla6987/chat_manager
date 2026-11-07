@@ -3,8 +3,8 @@
  */
 
 import {
-    buildIndex, getHydrationProgress, getIndex, getSortedEntries,
-    getFilteredSortedEntries, getIndexVersion,
+    buildIndex, didLastBuildFail, getHydrationProgress, getIndex, getIndexCharacterAvatar, getSortedEntries,
+    getFilteredSortedEntries, getIndexVersion, isBuilding,
     isHydrationComplete, onHydrationUpdate, prioritizeInQueue, prioritizeHydrationFiles, runDeferredBranchDetection,
     readChatMessages, trimBodyCache,
     ensureMessageEmbeddingMap, getMessageActiveSwipeIndex, getMessageEmbedding, setMessageEmbedding, setChatEmbedding, clearResidentVectors, makeMessageEmbeddingKey,
@@ -1000,7 +1000,9 @@ async function runEmbeddingGenerationWork(targetFileNames = null, options = {}) 
     }
 
     if (options.ensureIndex && Object.keys(getIndex()).length === 0) {
-        await buildIndex(null, null);
+        // Automatic runs only restore cached vectors for chats already known here.
+        // They must not download a character's archive at page load or on a switch.
+        await buildIndex(null, null, { backgroundHydration: !options.automatic });
     }
 
     requireCurrentEmbeddingRun(operation);
@@ -2074,7 +2076,34 @@ async function refreshAfterPanelPaint(root, requestId) {
     // before paint. Leave a frame for the visible shell before doing that work.
     await new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(resolve)));
     if (!panelOpen || requestId !== panelOpenRequestId || !root.isConnected) return;
-    await refreshPanel({ forceRevalidate: true });
+    await refreshPanel();
+}
+
+let chatVerificationInProgress = false;
+
+/** Re-read every chat from the server. Only this can reveal a remote same-size edit. */
+export async function verifyAllChats() {
+    if (!panelOpen || chatVerificationInProgress) return;
+    chatVerificationInProgress = true;
+    const button = document.getElementById('chat-manager-verify-chats');
+    const icon = button?.querySelector('i');
+    if (button) { button.disabled = true; button.setAttribute('aria-busy', 'true'); }
+    icon?.classList.add('fa-spin');
+    const context = SillyTavern.getContext();
+    const avatar = context.characters?.[context.characterId]?.avatar;
+    try {
+        await refreshPanel({ forceRevalidate: true });
+        while (isBuilding()) await new Promise(resolve => setTimeout(resolve, 250));
+        if (!avatar || avatar !== getIndexCharacterAvatar()) return;
+        const { loaded, total } = getHydrationProgress();
+        if (didLastBuildFail()) toastr.error('Could not read the chat list from the server.');
+        else if (loaded < total) toastr.warning(`Checked ${loaded} of ${total} chats. The rest could not be read.`);
+        else toastr.success(`Checked ${total} chat${total === 1 ? '' : 's'}.`);
+    } finally {
+        chatVerificationInProgress = false;
+        if (button) { button.disabled = false; button.removeAttribute('aria-busy'); }
+        icon?.classList.remove('fa-spin');
+    }
 }
 
 async function toggleSidePanel() {
@@ -2368,17 +2397,19 @@ export async function refreshPanel(options = {}) {
         searchState = null;
     }
 
-    if (panelOpen && refreshRequestId === panelOpenRequestId && !renderedFromMetadata && !isAnyViewActive()) {
-        renderFromLatestIndex();
+    if (panelOpen && refreshRequestId === panelOpenRequestId && !isAnyViewActive()) {
+        if (!renderedFromMetadata) renderFromLatestIndex();
+        // Cards painted from the list alone can now show their restored catalogs.
+        else if (changed && getCurrentSearchQuery().length < 2) patchCardData();
     }
 }
 
 function onIndexProgress(completed, total) {
     const status = document.getElementById('chat-manager-status');
-    const query = getCurrentSearchQuery();
-    if (status && query.length < 2) {
-        status.textContent = `Indexing chats... ${completed}/${total}`;
-    }
+    if (!status || getCurrentSearchQuery().length >= 2) return;
+    const state = completed >= total ? threadLists.get(_getContent()) : null;
+    if (state) updateThreadListFooter(state);
+    else status.textContent = `Indexing chats... ${completed}/${total}`;
 }
 
 /**
