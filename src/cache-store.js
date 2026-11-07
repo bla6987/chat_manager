@@ -1,20 +1,37 @@
 /**
- * Cache Store — IndexedDB persistent cache for hydrated chat entries.
- * Keyed by `{avatar}:{fileName}` with `lastModified` staleness check.
+ * Cache Store — IndexedDB cache of work already done on the server's chat files.
+ *
+ * chatSummaries holds one small record per chat and is read for a whole character
+ * in one transaction, so opening costs one read however large the archive is.
+ * chatDescriptors holds the compact per-message rows, read one chat at a time by
+ * the few views that need them. chatBodies holds complete text under a byte cap:
+ * the server's files stay authoritative, so a missing body only costs a download.
  */
 
-import { createMessageDescriptors, messagePreview } from './message-descriptors.js';
-
 const DB_NAME = 'chat_manager_cache';
-// Version 3 adds lightweight validity metadata; version 2 discarded legacy message IDs.
-const DB_VERSION = 3;
-const CACHE_FORMAT_VERSION = 2;
-const STORE_NAME = 'chats';
-const METADATA_STORE_NAME = 'chatMetadata';
-const READ_BATCH_SIZE = 50;
-const CATALOG_PREFIX = '\u0000catalog:';
+// Version 4 replaces the earlier uncapped stores. Everything in them is derived
+// from chat files and is rebuilt on demand, so dropping them loses nothing.
+const DB_VERSION = 4;
+const CACHE_FORMAT_VERSION = 3;
+const LEGACY_STORES = ['chats', 'chatMetadata'];
+const SUMMARY_STORE = 'chatSummaries';
+const DESCRIPTOR_STORE = 'chatDescriptors';
+const BODY_STORE = 'chatBodies';
+const LEDGER_STORE = 'chatBodyLedger';
+const ALL_STORES = [SUMMARY_STORE, DESCRIPTOR_STORE, BODY_STORE, LEDGER_STORE];
+const WRITE_BATCH_SIZE = 50;
+
+/** Shared by every character, because storage is shared. */
+export const DEFAULT_BODY_STORE_BYTES = 64 * 1024 * 1024;
+let bodyStoreBudget = DEFAULT_BODY_STORE_BYTES;
+
 const pendingWrites = new Map();
 let flushingWrites = null;
+
+/** key -> { bytes, usedAt }, loaded once and kept in step with each write. */
+let bodyLedger = null;
+let bodyLedgerBytes = 0;
+const touchedLedgerKeys = new Set();
 
 /** @type {IDBDatabase|null} */
 let db = null;
@@ -38,16 +55,14 @@ function openDB() {
 
         request.onupgradeneeded = (event) => {
             const database = event.target.result;
-            if (event.oldVersion < 2 && database.objectStoreNames.contains(STORE_NAME)) {
-                database.deleteObjectStore(STORE_NAME);
+            for (const name of LEGACY_STORES) {
+                if (database.objectStoreNames.contains(name)) database.deleteObjectStore(name);
             }
-            if (!database.objectStoreNames.contains(STORE_NAME)) {
-                const store = database.createObjectStore(STORE_NAME, { keyPath: 'key' });
-                store.createIndex('avatar', 'avatar', { unique: false });
+            if (!database.objectStoreNames.contains(SUMMARY_STORE)) {
+                database.createObjectStore(SUMMARY_STORE, { keyPath: 'key' }).createIndex('avatar', 'avatar', { unique: false });
             }
-            // Older bodies have no matching metadata and are safely rehydrated.
-            if (!database.objectStoreNames.contains(METADATA_STORE_NAME)) {
-                database.createObjectStore(METADATA_STORE_NAME, { keyPath: 'key' });
+            for (const name of [DESCRIPTOR_STORE, BODY_STORE, LEDGER_STORE]) {
+                if (!database.objectStoreNames.contains(name)) database.createObjectStore(name, { keyPath: 'key' });
             }
         };
 
@@ -63,8 +78,8 @@ function openDB() {
             reject(event.target.error);
         };
         request.onblocked = () => {
-            // An older tab may hold v1 open without a versionchange handler.
-            // Continue with server hydration instead of hanging the index build.
+            // An older tab may hold a previous version open without a versionchange
+            // handler. Continue from the server instead of hanging the index build.
             dbPromise = null;
             reject(new Error('Chat cache upgrade is blocked by another tab'));
         };
@@ -87,30 +102,16 @@ function throwIfAborted(signal) {
     if (signal?.aborted) throw signal.reason || new DOMException('Aborted', 'AbortError');
 }
 
-async function readRecord(key, signal, { fallbackKey } = {}) {
+async function readRecord(storeName, key, signal) {
     throwIfAborted(signal);
     try {
         const database = await openDB();
         const result = await new Promise(resolve => {
-            const tx = database.transaction(STORE_NAME, 'readonly');
-            const store = tx.objectStore(STORE_NAME);
+            const tx = database.transaction(storeName, 'readonly');
             let value = null;
-            let transactionComplete = false;
-            let readComplete = false;
-            const finish = () => {
-                if (transactionComplete && readComplete) resolve(value?.cacheFormatVersion === CACHE_FORMAT_VERSION ? value : null);
-            };
-            const read = (recordKey, fallback) => {
-                const request = store.get(recordKey);
-                request.onsuccess = () => {
-                    value = request.result;
-                    if (value?.cacheFormatVersion !== CACHE_FORMAT_VERSION && fallback) read(fallback, null);
-                    else { readComplete = true; finish(); }
-                };
-                request.onerror = () => { readComplete = true; finish(); };
-            };
-            read(key, fallbackKey);
-            tx.oncomplete = () => { transactionComplete = true; finish(); };
+            const request = tx.objectStore(storeName).get(key);
+            request.onsuccess = () => { value = request.result; };
+            tx.oncomplete = () => resolve(value?.cacheFormatVersion === CACHE_FORMAT_VERSION ? value : null);
             tx.onerror = tx.onabort = () => resolve(null);
         });
         throwIfAborted(signal);
@@ -121,133 +122,81 @@ async function readRecord(key, signal, { fallbackKey } = {}) {
     }
 }
 
-/** Read one complete body, never a whole-character collection. */
-export function getCachedChat(avatar, fileName, { signal } = {}) {
-    return readRecord(makeKey(avatar, fileName), signal);
-}
-
-/** Read compact catalog records one at a time. */
-export async function* iterateCachedChatCatalogs(avatar, fileNames, { signal, acceptMetadata } = {}) {
-    for (const fileName of fileNames) {
-        throwIfAborted(signal);
-        const record = await readRecord(CATALOG_PREFIX + makeKey(avatar, fileName), signal);
-        throwIfAborted(signal);
-        if (record && acceptMetadata && !acceptMetadata(fileName, record)) continue;
-        if (record) yield { fileName, entry: record };
-    }
-}
-
 /**
- * Read only the cached chat entries missing or stale in the in-memory index.
+ * Read every chat summary of one character in a single transaction.
  * @param {string} avatar
- * @param {string[]} fileNames
- * @returns {Promise<Map<string, object>>} Map of fileName -> cached entry
+ * @returns {Promise<Map<string, object>>} fileName -> summary record
  */
-export async function getCachedChatsForCharacter(avatar, fileNames) {
+export async function getCachedSummaries(avatar) {
     const result = new Map();
-    if (fileNames.length === 0) return result;
     try {
         const database = await openDB();
-        for (let offset = 0; offset < fileNames.length; offset += READ_BATCH_SIZE) {
-            const batch = fileNames.slice(offset, offset + READ_BATCH_SIZE);
-            await new Promise((resolve) => {
-                const tx = database.transaction(STORE_NAME, 'readonly');
-                const store = tx.objectStore(STORE_NAME);
-                for (const fileName of batch) {
-                    const request = store.get(makeKey(avatar, fileName));
-                    request.onsuccess = () => {
-                        const entry = request.result;
-                        if (entry?.cacheFormatVersion === CACHE_FORMAT_VERSION) result.set(fileName, entry);
-                    };
+        await new Promise(resolve => {
+            const tx = database.transaction(SUMMARY_STORE, 'readonly');
+            const request = tx.objectStore(SUMMARY_STORE).index('avatar').getAll(avatar);
+            request.onsuccess = () => {
+                for (const record of request.result || []) {
+                    if (record?.cacheFormatVersion === CACHE_FORMAT_VERSION) result.set(record.fileName, record);
                 }
-                tx.oncomplete = resolve;
-                tx.onerror = resolve;
-                tx.onabort = resolve;
-            });
-        }
-        return result;
-    } catch {
-        return result;
+            };
+            tx.oncomplete = resolve;
+            tx.onerror = tx.onabort = resolve;
+        });
+    } catch { /* Proceed without a cache; the server's files remain readable. */ }
+    return result;
+}
+
+/** Read the per-message rows of one chat. */
+export function getCachedDescriptors(avatar, fileName, { signal } = {}) {
+    return readRecord(DESCRIPTOR_STORE, makeKey(avatar, fileName), signal);
+}
+
+/** Read one complete body, never a whole-character collection. */
+export async function getCachedBody(avatar, fileName, { signal } = {}) {
+    const key = makeKey(avatar, fileName);
+    const record = await readRecord(BODY_STORE, key, signal);
+    const known = record && bodyLedger?.get(key);
+    if (known) {
+        known.usedAt = Date.now();
+        touchedLedgerKeys.add(key);
     }
+    return record;
 }
 
-/**
- * Restore usable bodies one bounded batch at a time. Metadata and bodies are
- * read in the same transaction so a concurrent write cannot pair revisions.
- * The consumer must recheck its own session/entry ownership after each await.
- */
-export async function consumeCachedChatsForCharacter(avatar, candidates, isValid, consume) {
-    let database;
-    try { database = await openDB(); } catch { return; }
-    for (let offset = 0; offset < candidates.length; offset += READ_BATCH_SIZE) {
-        const batch = candidates.slice(offset, offset + READ_BATCH_SIZE);
-        const entries = await new Promise((resolve) => {
-            const result = new Map();
-            const tx = database.transaction([METADATA_STORE_NAME, STORE_NAME], 'readonly');
-            const metadataStore = tx.objectStore(METADATA_STORE_NAME);
-            const bodyStore = tx.objectStore(STORE_NAME);
-            for (const fileName of batch) {
-                const request = metadataStore.get(makeKey(avatar, fileName));
-                request.onsuccess = () => {
-                    const metadata = request.result;
-                    if (metadata?.cacheFormatVersion !== CACHE_FORMAT_VERSION || !isValid(fileName, metadata)) return;
-                    const bodyRequest = bodyStore.get(makeKey(avatar, fileName));
-                    bodyRequest.onsuccess = () => {
-                        const body = bodyRequest.result;
-                        if (body?.cacheFormatVersion === CACHE_FORMAT_VERSION
-                            && body.lastModified === metadata.lastModified
-                            && body.serverSignature === metadata.serverSignature
-                            && body.validatedAt === metadata.validatedAt
-                            && Array.isArray(body.messages) && isValid(fileName, body)) result.set(fileName, body);
-                    };
-                };
-            }
-            tx.oncomplete = () => resolve(result);
-            tx.onerror = tx.onabort = () => resolve(new Map());
-        }).catch(() => new Map());
-        if (consume(entries) === false) return;
-    }
+function validity(entry) {
+    return { lastModified: entry.lastModified, serverSignature: entry.serverSignature, validatedAt: entry.validatedAt };
 }
 
-/**
- * Write a hydrated chat entry to the cache (fire-and-forget).
- * @param {string} avatar
- * @param {string} fileName
- * @param {object} entry - The ChatIndexEntry to cache
- */
-export function putCachedChat(avatar, fileName, entry) {
-    return putCachedChats(avatar, [{ fileName, entry }]);
-}
-
-function bodyRecord(avatar, fileName, entry) {
+function summaryRecord(avatar, fileName, entry) {
     return {
-        key: makeKey(avatar, fileName), cacheFormatVersion: CACHE_FORMAT_VERSION,
-        avatar, fileName, lastModified: entry.lastModified,
-        messageCount: entry.messageCount, messages: entry.messages,
-        firstMessageTimestamp: entry.firstMessageTimestamp,
-        lastMessageTimestamp: entry.lastMessageTimestamp, sortTimestamp: entry.sortTimestamp,
-        validatedAt: entry.validatedAt, serverSignature: entry.serverSignature,
-        mainChat: entry.mainChat, bodyEmbeddingText: entry.bodyEmbeddingText,
+        key: makeKey(avatar, fileName), cacheFormatVersion: CACHE_FORMAT_VERSION, avatar, fileName, ...validity(entry),
+        sortTimestamp: entry.sortTimestamp, messageCount: entry.messageCount,
+        firstMessageTimestamp: entry.firstMessageTimestamp, lastMessageTimestamp: entry.lastMessageTimestamp,
+        mainChat: entry.mainChat ?? null, bodyEmbeddingText: entry.bodyEmbeddingText ?? '',
+        lastMessagePreview: entry.lastMessagePreview ?? '', userMessageCount: entry.userMessageCount ?? 0,
+        activity: entry.activity ?? [], branchTargets: entry.branchTargets ?? [], openingKeys: entry.openingKeys ?? [],
+        contentHash: entry.contentHash ?? null, variants: entry.variants ?? null,
     };
 }
 
-function catalogRecord(avatar, fileName, entry) {
-    const descriptors = entry.messageDescriptors || createMessageDescriptors(entry.messages);
-    return {
-        ...bodyRecord(avatar, fileName, entry),
-        key: CATALOG_PREFIX + makeKey(avatar, fileName),
-        messages: descriptors, messageDescriptors: descriptors,
-        bodyEmbeddingText: entry.bodyEmbeddingText ?? messagePreview((entry.messages || []).slice(-10).map(message => String(message.text || '').trim().slice(0, 2000)).filter(Boolean).join('\n').slice(0, 2000).trim(), 2000),
-        bodyResident: false, isLoaded: true,
-        // Every writer holds authoritative content; see isTrustedCatalog in chat-reader.js.
-        localEditsTracked: true,
-    };
+function descriptorRecord(avatar, fileName, entry, payload) {
+    return { key: makeKey(avatar, fileName), cacheFormatVersion: CACHE_FORMAT_VERSION, ...validity(entry), payload };
+}
+
+function bodyRecord(avatar, fileName, entry, messages) {
+    return { key: makeKey(avatar, fileName), cacheFormatVersion: CACHE_FORMAT_VERSION, ...validity(entry), messages };
 }
 
 function queueWrite(key, operation) {
     return new Promise(resolve => {
         const previous = pendingWrites.get(key);
         operation.waiters = [...(previous?.waiters || []), resolve];
+        // A later chat update must not lose a body queued by the same chat's read.
+        if (previous && !operation.remove && !previous.remove && !operation.body) {
+            operation.body = previous.body;
+            operation.bodyBytes = previous.bodyBytes;
+            operation.evict = previous.evict;
+        }
         pendingWrites.set(key, operation);
         scheduleFlush();
     });
@@ -255,46 +204,101 @@ function queueWrite(key, operation) {
 
 function scheduleFlush() {
     if (flushingWrites) return;
-    // Coalesce same-turn updates before cloning the newest body into IDB.
+    // Coalesce same-turn updates before cloning the newest records into IDB.
     flushingWrites = Promise.resolve().then(flushWriteLoop).finally(() => {
         flushingWrites = null;
         if (pendingWrites.size) scheduleFlush();
     });
 }
 
+async function loadBodyLedger(database) {
+    if (bodyLedger) return;
+    const records = await new Promise(resolve => {
+        let found = [];
+        const tx = database.transaction(LEDGER_STORE, 'readonly');
+        const request = tx.objectStore(LEDGER_STORE).getAll();
+        request.onsuccess = () => { found = request.result || []; };
+        tx.oncomplete = () => resolve(found);
+        tx.onerror = tx.onabort = () => resolve([]);
+    });
+    bodyLedger = new Map(records.map(({ key, bytes, usedAt }) => [key, { bytes, usedAt }]));
+    bodyLedgerBytes = records.reduce((sum, record) => sum + (record.bytes || 0), 0);
+}
+
+function forgetLedgerBody(key, ledgerStore, bodyStore) {
+    const known = bodyLedger.get(key);
+    if (!known) return;
+    bodyLedgerBytes -= known.bytes || 0;
+    bodyLedger.delete(key);
+    touchedLedgerKeys.delete(key);
+    bodyStore.delete(key);
+    ledgerStore.delete(key);
+}
+
+/**
+ * Admit a body under the byte cap. A single chat's read may displace the least
+ * recently used bodies. An archive scan only fills free space: evicting on a scan
+ * larger than the cap would rewrite everything and leave nothing useful behind.
+ */
+function admitBody(item, ledgerStore, bodyStore) {
+    forgetLedgerBody(item.key, ledgerStore, bodyStore);
+    const bytes = item.bodyBytes;
+    if (!(bytes <= bodyStoreBudget)) return;
+    if (bodyLedgerBytes + bytes > bodyStoreBudget) {
+        if (!item.evict) return;
+        const oldest = [...bodyLedger].sort((a, b) => a[1].usedAt - b[1].usedAt);
+        for (const [key] of oldest) {
+            if (bodyLedgerBytes + bytes <= bodyStoreBudget) break;
+            forgetLedgerBody(key, ledgerStore, bodyStore);
+        }
+    }
+    const usedAt = Date.now();
+    bodyStore.put(item.body);
+    ledgerStore.put({ key: item.key, bytes, usedAt });
+    bodyLedger.set(item.key, { bytes, usedAt });
+    bodyLedgerBytes += bytes;
+}
+
 async function flushWriteLoop() {
     while (pendingWrites.size) {
         // A single transaction is outstanding at a time. Its completion provides
         // backpressure to the indexer and prevents unlimited structured clones.
-        const batch = [...pendingWrites.values()].slice(0, READ_BATCH_SIZE);
+        const batch = [...pendingWrites.values()].slice(0, WRITE_BATCH_SIZE);
         for (const item of batch) pendingWrites.delete(item.key);
         let committed = false;
         try {
             const database = await openDB();
+            await loadBodyLedger(database);
             committed = await new Promise(resolve => {
-                const tx = database.transaction([STORE_NAME, METADATA_STORE_NAME], 'readwrite');
-                const metadataStore = tx.objectStore(METADATA_STORE_NAME);
-                const store = tx.objectStore(STORE_NAME);
+                const tx = database.transaction(ALL_STORES, 'readwrite');
+                const summaries = tx.objectStore(SUMMARY_STORE);
+                const descriptors = tx.objectStore(DESCRIPTOR_STORE);
+                const bodies = tx.objectStore(BODY_STORE);
+                const ledger = tx.objectStore(LEDGER_STORE);
                 for (const item of batch) {
                     if (item.remove) {
-                        store.delete(item.key);
-                        store.delete(CATALOG_PREFIX + item.key);
-                        metadataStore.delete(item.key);
-                    } else {
-                        if (item.body) store.put(item.body);
-                        store.put(item.catalog);
-                        metadataStore.put({ key: item.key, cacheFormatVersion: CACHE_FORMAT_VERSION,
-                            lastModified: item.catalog.lastModified, validatedAt: item.catalog.validatedAt,
-                            serverSignature: item.catalog.serverSignature });
+                        summaries.delete(item.key);
+                        descriptors.delete(item.key);
+                        forgetLedgerBody(item.key, ledger, bodies);
+                        bodies.delete(item.key);
+                        continue;
                     }
+                    if (item.summary) summaries.put(item.summary);
+                    if (item.descriptors) descriptors.put(item.descriptors);
+                    if (item.body) admitBody(item, ledger, bodies);
                 }
+                for (const key of touchedLedgerKeys) {
+                    const known = bodyLedger.get(key);
+                    if (known) ledger.put({ key, ...known });
+                }
+                touchedLedgerKeys.clear();
                 tx.oncomplete = () => resolve(true);
                 tx.onerror = tx.onabort = () => resolve(false);
             });
         } catch { /* A cache failure never changes the source chat files. */ }
         for (const item of batch) {
             for (const resolve of item.waiters) resolve(committed);
-            item.body = item.catalog = null;
+            item.body = item.summary = item.descriptors = null;
         }
     }
 }
@@ -305,31 +309,63 @@ export async function flushPendingCacheWrites() {
 }
 
 /**
- * Write several hydrated entries using one transaction.
+ * Write several indexed chats using one transaction.
  * @param {string} avatar
- * @param {Array<{fileName: string, entry: object}>} chats
+ * @param {Array<{ fileName: string, entry: object, descriptorsPayload?: string, body?: Array, evictBodies?: boolean }>} chats
+ *   body stores complete text; evictBodies lets it displace older bodies.
+ * @returns {Promise<boolean>} Whether every write committed
  */
 export function putCachedChats(avatar, chats) {
     if (!Array.isArray(chats) || chats.length === 0) return Promise.resolve(true);
     const writes = [];
-    for (const { fileName, entry } of chats) {
+    for (const { fileName, entry, descriptorsPayload, body, evictBodies = true } of chats) {
         if (!fileName || !entry) continue;
-        const key = makeKey(avatar, fileName);
-        const hasBody = entry.bodyResident !== false && !(entry.messages || []).some(message => message?.isDescriptor);
-        writes.push(queueWrite(key, {
-            key, body: hasBody ? bodyRecord(avatar, fileName, entry) : null,
-            catalog: catalogRecord(avatar, fileName, entry),
+        writes.push(queueWrite(makeKey(avatar, fileName), {
+            key: makeKey(avatar, fileName),
+            summary: summaryRecord(avatar, fileName, entry),
+            descriptors: typeof descriptorsPayload === 'string' ? descriptorRecord(avatar, fileName, entry, descriptorsPayload) : null,
+            body: body ? bodyRecord(avatar, fileName, entry, body) : null,
+            bodyBytes: entry.bodyBytes,
+            evict: evictBodies,
         }));
     }
     return Promise.all(writes).then(results => results.every(Boolean));
 }
 
+/** Write one indexed chat. See putCachedChats. */
+export function putCachedChat(avatar, fileName, entry, extra = {}) {
+    return putCachedChats(avatar, [{ fileName, entry, ...extra }]);
+}
+
 /**
- * Remove a cached chat entry (fire-and-forget).
+ * Store a body read for an already indexed, unchanged chat.
+ * @param {string} avatar
+ * @param {string} fileName
+ * @param {object} entry
+ * @param {Array} messages
+ * @param {{ evictBodies?: boolean }} [options]
+ */
+export function putCachedBody(avatar, fileName, entry, messages, { evictBodies = true } = {}) {
+    const key = makeKey(avatar, fileName);
+    return queueWrite(key, { key, body: bodyRecord(avatar, fileName, entry, messages), bodyBytes: entry.bodyBytes, evict: evictBodies });
+}
+
+/**
+ * Remove everything cached for a chat (fire-and-forget).
  * @param {string} avatar
  * @param {string} fileName
  */
 export function removeCachedChat(avatar, fileName) {
     const key = makeKey(avatar, fileName);
     return queueWrite(key, { key, remove: true });
+}
+
+/** Controlled testing of the stored-body cap. */
+export function setBodyStoreBudget(bytes) {
+    if (!Number.isFinite(bytes) || bytes < 0) throw new RangeError('Body store budget must be a nonnegative number of bytes');
+    bodyStoreBudget = Math.floor(bytes);
+}
+
+export function getBodyStoreStats() {
+    return { budgetBytes: bodyStoreBudget, storedBytes: bodyLedgerBytes, storedChats: bodyLedger?.size ?? 0 };
 }

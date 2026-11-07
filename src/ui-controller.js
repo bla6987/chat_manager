@@ -63,6 +63,7 @@ import { searchArchivePage } from './archive-search.js';
 import { computeArchiveClusters } from './archive-clusters.js';
 import { computeArchiveDriftSummary } from './archive-drift.js';
 import { messagePreview } from './message-descriptors.js';
+import { forEachSummarizedVariant } from './chat-index-data.js';
 
 const MODULE_NAME = 'chat_manager';
 const HYBRID_SEARCH_MIN_CHARS = 5;
@@ -478,7 +479,7 @@ function driftCacheToken(entry) {
 }
 
 function getDriftSummary(entry) {
-    if (!entry?.isLoaded || entry.needsHydration || (entry.messages?.length || 0) < 2) return null;
+    if (!entry?.isLoaded || entry.needsHydration || (entry.messages?.length || entry.messageCount || 0) < 2) return null;
     if (!isEmbeddingLevelOn(getEmbeddingSettings(), 'message')) return null;
     const token = driftCacheToken(entry);
     const cached = driftSummaryCache.get(entry);
@@ -612,8 +613,22 @@ function hasStoredChatEmbedding(entry) {
 }
 
 function hasMessageEmbeddingsForAllTextMessages(entry, settings = getEmbeddingSettings()) {
-    if (!entry?.isLoaded || !Array.isArray(entry.messages) || !entry.messages.length) return false;
+    if (!entry?.isLoaded) return false;
     const known = entry.cachedMessageEmbeddingKeys;
+    if (!entry.messages?.length) {
+        if (!entry.messageCount || !entry.variants) return false;
+        let complete = true;
+        forEachSummarizedVariant(entry, {
+            includeAlternates: settings.includeAlternateSwipes === true,
+            maxSwipes: clampPositiveInt(settings.maxSwipesPerMessage, 8),
+        }, (index, swipe, active) => {
+            if (known?.has(makeMessageEmbeddingKey(index, swipe))) return true;
+            const vector = getMessageEmbedding(entry, { index, swipeId: active }, swipe);
+            complete = isVector(vector) && vector.length > 0;
+            return complete;
+        });
+        return complete;
+    }
     for (const msg of entry.messages) {
         const active = getMessageActiveSwipeIndex(msg);
         const variants = [];
@@ -1095,6 +1110,11 @@ async function runEmbeddingGenerationWork(targetFileNames = null, options = {}) 
             const entry = getIndex()[originalEntry.fileName];
             if (!entry?.isLoaded || entry.needsHydration) continue;
             let count = 0;
+            if (!entry.messages?.length) {
+                forEachSummarizedVariant(entry, { includeAlternates: true, maxSwipes: clampPositiveInt(settings.maxSwipesPerMessage, 8) }, (index, swipe, active) => {
+                    if (swipe !== active && !isVector(getMessageEmbedding(entry, { index, swipeId: active }, swipe))) count++;
+                });
+            }
             for (const msg of entry.messages || []) {
                 const active = getMessageActiveSwipeIndex(msg);
                 const length = Math.min(msg.swipeCount ?? msg.swipes?.length ?? 0, clampPositiveInt(settings.maxSwipesPerMessage, 8));
@@ -1855,9 +1875,8 @@ function formatFromNowOrFallback(momentLib, value, fallback = 'unknown') {
 }
 
 function getLastMessageFallback(entry) {
-    if (!entry || !entry.isLoaded || !Array.isArray(entry.messages) || entry.messages.length === 0) {
-        return '';
-    }
+    if (!entry) return '';
+    if (!entry.isLoaded || !entry.messages?.length) return entry.lastMessagePreview || '';
 
     const lastMsg = entry.messages[entry.messages.length - 1];
     return typeof lastMsg?.text === 'string' && lastMsg.text ? messagePreview(lastMsg.text.trim(), 240) : (lastMsg?.preview || '');
@@ -1929,11 +1948,15 @@ function scheduleBranchDetection() {
         branchDetectionTask = null;
         if (!panelOpen || isAnyViewActive()) return;
         const activeFile = getActiveFilename();
-        runDeferredBranchDetection(activeFile);
-        patchBranchIndicators();
-        if (branchContextActive) {
-            void refreshBranchContextStatus(activeFile);
-        }
+        const content = _getContent();
+        const rendered = content ? [...content.querySelectorAll('.chat-manager-card')].map(card => card.dataset.filename) : [];
+        void runDeferredBranchDetection(activeFile, { fileNames: rendered }).then(() => {
+            if (!panelOpen || isAnyViewActive()) return;
+            patchBranchIndicators();
+            if (branchContextActive) {
+                void refreshBranchContextStatus(activeFile);
+            }
+        });
     };
     task.idle = typeof globalThis.requestIdleCallback === 'function';
     task.id = task.idle ? globalThis.requestIdleCallback(run, { timeout: 500 }) : setTimeout(run, 0);

@@ -1,33 +1,10 @@
 import test, { afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 
-// A persistent IndexedDB stand-in: clearIndex() models a page reload, because
-// these records survive it the way real IndexedDB records survive a reload.
-const stores = new Map([['chats', new Map()], ['chatMetadata', new Map()]]);
-globalThis.indexedDB = { open() {
-    const request = {};
-    queueMicrotask(() => {
-        const database = {
-            objectStoreNames: { contains: name => stores.has(name) },
-            close() {},
-            transaction() {
-                const tx = { objectStore(name) {
-                    const data = stores.get(name);
-                    return {
-                        get(key) { const req = {}; queueMicrotask(() => { req.result = structuredClone(data.get(key)); req.onsuccess?.(); }); return req; },
-                        put(record) { data.set(record.key, structuredClone(record)); },
-                        delete(key) { data.delete(key); },
-                    };
-                } };
-                setImmediate(() => tx.oncomplete?.());
-                return tx;
-            },
-        };
-        request.onsuccess?.({ target: { result: database } });
-    });
-    return request;
-} };
+import { installFakeIndexedDB } from './helpers/fake-indexeddb.mjs';
 
+// clearIndex() models a page reload, because these records survive it.
+const fake = installFakeIndexedDB({ schedule: setImmediate });
 const reader = await import('../src/chat-reader.js');
 const cache = await import('../src/cache-store.js');
 const metadata = await import('../src/metadata-store.js');
@@ -38,7 +15,7 @@ const raw = mes => ({ mes, is_user: false, send_date: date });
 let context, rows, bodies, gets, listRequests, listGate, failList;
 function setup(names = ['a.jsonl', 'b.jsonl', 'c.jsonl']) {
     reader.clearIndex();
-    for (const store of stores.values()) store.clear();
+    fake.reset();
     gets = []; listRequests = 0; listGate = null; failList = false;
     context = { characterId: 0, characters: [{ avatar: 'alpha.png', name: 'Alpha' }, { avatar: 'beta.png', name: 'Beta' }], chat: [],
         chatMetadata: {}, extensionSettings: {}, saveSettingsDebounced() {}, getRequestHeaders: () => ({}) };
@@ -77,7 +54,7 @@ test('reopening never re-reads a chat whose metadata still matches, however old 
     assert.equal(reader.isHydrationComplete(), true);
 });
 
-test('a reload restores every chat from its catalog without downloading a body', async () => {
+test('a reload restores every chat from its summary without downloading a body', async () => {
     setup(); await reload();
     await buildAndSettle();
     assert.deepEqual(gets, []);
@@ -85,8 +62,11 @@ test('a reload restores every chat from its catalog without downloading a body',
     const entries = Object.values(reader.getIndex());
     assert.equal(entries.length, 3);
     assert.ok(entries.every(entry => entry.isLoaded && !entry.needsHydration && entry.bodyResident === false));
-    assert.equal(await text('a.jsonl'), 'a.jsonl text', 'complete text stays readable from the cached body');
-    assert.deepEqual(gets, []);
+    assert.equal(await text('a.jsonl'), 'a.jsonl text', 'complete text stays readable');
+    assert.deepEqual(gets, ['a.jsonl'], 'background indexing stored no body, so the first read downloads it');
+    gets.length = 0;
+    assert.equal(await text('a.jsonl'), 'a.jsonl text');
+    assert.deepEqual(gets, [], 'a body that was read is reused');
 });
 
 for (const [field, values] of [
@@ -143,29 +123,19 @@ test('an edit under another character cannot invalidate a same-named chat in the
     await cache.flushPendingCacheWrites();
     assert.equal(reader.getIndex()['a.jsonl'], held);
     assert.equal(held.needsHydration, false);
-    assert.ok(stores.get('chats').has('\u0000catalog:alpha.png:a.jsonl'));
+    assert.ok(fake.store('chatSummaries').has('alpha.png:a.jsonl'));
 });
 
 test('group chats and an empty selection record nothing', async () => {
     setup(); await buildAndSettle();
-    const before = stores.get('chats').size;
+    const before = fake.store('chatSummaries').size;
     context.chatId = 'a';
     context.characterId = undefined;
     assert.equal(reader.recordLocalChatEdit(context), false);
     context.characterId = 0; context.chatId = undefined;
     assert.equal(reader.recordLocalChatEdit(context), false);
     await cache.flushPendingCacheWrites();
-    assert.equal(stores.get('chats').size, before);
-});
-
-test('catalogs written before edit tracking are re-read once and then trusted', async () => {
-    setup(); await reload();
-    for (const record of stores.get('chats').values()) delete record.localEditsTracked;
-    await buildAndSettle();
-    assert.deepEqual(gets.toSorted(), ['a.jsonl', 'b.jsonl', 'c.jsonl']);
-    gets.length = 0;
-    reader.clearIndex(); await buildAndSettle();
-    assert.deepEqual(gets, []);
+    assert.equal(fake.store('chatSummaries').size, before);
 });
 
 test('the open chat prefers live text, including over a file its save has not reached', async () => {
@@ -180,6 +150,8 @@ test('the open chat prefers live text, including over a file its save has not re
     assert.equal(reader.getIndex()['a.jsonl'].messages[1].text, 'unsaved edit');
     assert.equal(reader.getIndex()['a.jsonl'].mainChat, 'b.jsonl');
     await cache.flushPendingCacheWrites();
+    // The host's save lands, then a reload finds the chat under its new summary.
+    bodies.get('a.jsonl')[2].mes = 'unsaved edit';
     context.chat = []; context.chatId = 'b'; context.chatMetadata = {};
     reader.clearIndex(); await buildAndSettle();
     assert.equal(await text('a.jsonl'), 'unsaved edit');
@@ -195,7 +167,9 @@ test('a reload with the open chat unchanged reads neither it nor any other body'
 });
 
 test('forced revalidation re-reads every chat and finds a same-size remote edit', async () => {
-    setup(); await buildAndSettle(); gets.length = 0;
+    setup(); await buildAndSettle();
+    assert.equal(await text('c.jsonl'), 'c.jsonl text');
+    await cache.flushPendingCacheWrites(); gets.length = 0;
     bodies.get('c.jsonl')[2].mes = 'C.JSONL TEXT';
     await buildAndSettle();
     assert.deepEqual(gets, []);
@@ -231,7 +205,7 @@ test('builds without background hydration list chats but download nothing until 
     assert.equal(reader.isHydrationComplete(), true);
 });
 
-test('builds without background hydration still restore catalogs and the live chat', async () => {
+test('builds without background hydration still restore summaries and the live chat', async () => {
     setup(); await reload();
     bodies.set('new.jsonl', [{ chat_metadata: {} }, raw('new')]);
     rows.push({ file_name: 'new.jsonl', last_mes: date, chat_items: 1, file_size: '50 B' });
@@ -292,4 +266,13 @@ test('automatic embedding startup does not download the archive', async () => {
     assert.equal(listRequests, 1);
     assert.deepEqual(gets, []);
     assert.equal(Object.keys(reader.getIndex()).length, 3);
+});
+
+test('a cached summary whose chat was deleted while unloaded is removed from storage', async () => {
+    setup(); await reload();
+    rows.splice(2, 1);
+    await buildAndSettle();
+    await cache.flushPendingCacheWrites();
+    assert.equal(fake.store('chatSummaries').has('alpha.png:c.jsonl'), false);
+    assert.equal(fake.store('chatDescriptors').has('alpha.png:c.jsonl'), false);
 });

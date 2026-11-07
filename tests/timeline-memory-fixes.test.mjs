@@ -1,4 +1,5 @@
-import { normalizedMessageFingerprint, messagePreview as truncateMessagePreview } from '../src/message-descriptors.js';
+import { messagePreview as truncateMessagePreview } from '../src/message-descriptors.js';
+import { messageKey } from '../src/chat-index-data.js';
 import { clearIcicleSemanticCache } from '../src/icicle-data.js';
 import test from 'node:test';
 import assert from 'node:assert/strict';
@@ -9,7 +10,7 @@ const dataSource = (await readFile(new URL('../src/icicle-data.js', import.meta.
 const viewSource = (await readFile(new URL('../src/icicle-view.js', import.meta.url), 'utf8'))
     .replace(/^import\s[\s\S]*?from\s+['"][^'"]+['"];\s*/gm, '').replace(/^export /gm, '');
 function builder(source, stats = { refs: 0 }) {
-    return new Function('stats', 'normalizedMessageFingerprint', 'truncateMessagePreview', `${source}; return buildIcicleData;`)(stats, normalizedMessageFingerprint, truncateMessagePreview);
+    return new Function('stats', 'messageKey', 'truncateMessagePreview', `${source}; return buildIcicleData;`)(stats, messageKey, truncateMessagePreview);
 }
 const originalConstruction = dataSource
     .replace('            current = child;', '            child.chatFiles.push(fileName);\n            current = child;')

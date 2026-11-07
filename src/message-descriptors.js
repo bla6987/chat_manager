@@ -43,6 +43,12 @@ export function createMessageDescriptor(message) {
     const normalized = text.trim().replace(/\s+/g, ' ');
     const swipeId = Number.isFinite(Number(message?.swipeId)) ? Math.max(0, Math.floor(Number(message.swipeId))) : 0;
     const variants = Array.isArray(message?.swipes) && message.swipes.length ? message.swipes : [text];
+    // Hashing is the slow part of indexing. Most text has nothing to normalize,
+    // and the active swipe is the message text, so neither is hashed twice.
+    const textHash = textFingerprint(text);
+    const normalizedTextHash = normalized === text ? textHash : textFingerprint(normalized);
+    const preview = messagePreview(text);
+    const variantValue = (index, variant) => (index === swipeId ? text : variant);
     return {
         filename: message?.filename,
         index: message?.index,
@@ -52,17 +58,17 @@ export function createMessageDescriptor(message) {
         branches: Array.isArray(message?.branches) ? [...message.branches] : [],
         isDescriptor: true,
         text: '',
-        preview: messagePreview(text),
-        textHash: textFingerprint(text),
+        preview,
+        textHash,
         textLength: text.length,
         wordCount: normalized ? normalized.split(' ').length : 0,
-        normalizedTextHash: textFingerprint(normalized),
+        normalizedTextHash,
         normalizedTextLength: normalized.length,
         swipeId,
         swipeCount: variants.length,
-        swipeHashes: variants.map((variant, index) => textFingerprint(index === swipeId ? text : variant)),
-        swipeLengths: variants.map((variant, index) => String(index === swipeId ? text : variant || '').length),
-        swipePreviews: variants.map((variant, index) => messagePreview(index === swipeId ? text : variant)),
+        swipeHashes: variants.map((variant, index) => (index === swipeId ? textHash : textFingerprint(variant))),
+        swipeLengths: variants.map((variant, index) => String(variantValue(index, variant) || '').length),
+        swipePreviews: variants.map((variant, index) => (index === swipeId ? preview : messagePreview(variant))),
     };
 }
 

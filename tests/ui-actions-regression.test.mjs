@@ -494,7 +494,7 @@ test('branch detection coalesces during idle time, reads the latest chat, and ca
     const { sandbox } = setup({
         requestIdleCallback: fn => { idle.push(fn); return idle.length; },
         cancelIdleCallback: id => cancelled.push(id),
-        runDeferredBranchDetection: filename => detected.push(filename),
+        runDeferredBranchDetection: async filename => { detected.push(filename); },
     });
     sandbox.selectedFile = 'before.jsonl';
     vm.runInContext("panelOpen = true; getActiveFilename = () => selectedFile; patchBranchIndicators = () => {};", sandbox);

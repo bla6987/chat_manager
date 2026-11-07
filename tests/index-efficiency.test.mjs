@@ -1,70 +1,18 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 
-let writeTransactions = 0;
-let holdReadTransactions = false;
-let heldReadTransactions = [];
-let readTransactionSizes = [];
-let readStartedResolve = null;
+import { installFakeIndexedDB } from './helpers/fake-indexeddb.mjs';
 
-function nextReadStarted() {
-    return new Promise(resolve => { readStartedResolve = resolve; });
-}
-
+const fake = installFakeIndexedDB();
+const readStarted = () => new Promise(resolve => {
+    fake.holdReads = true;
+    const previous = fake.onRead;
+    fake.onRead = (...args) => { fake.onRead = previous; resolve(args); };
+});
 function releaseHeldReads() {
-    // Release this cache operation, including follow-up metadata/body transactions.
-    holdReadTransactions = false;
-    const releases = heldReadTransactions;
-    heldReadTransactions = [];
-    for (const release of releases) release();
+    fake.holdReads = false;
+    fake.release();
 }
-
-globalThis.indexedDB = {
-    open() {
-        const request = {};
-        queueMicrotask(() => {
-            const database = {
-                objectStoreNames: { contains: () => true },
-                transaction(_name, mode) {
-                    if (mode === 'readwrite') writeTransactions++;
-                    let reads = 0;
-                    const tx = {
-                        objectStore() {
-                            return {
-                                get() {
-                                    reads++;
-                                    const getRequest = {};
-                                    queueMicrotask(() => {
-                                        getRequest.result = undefined;
-                                        getRequest.onsuccess?.();
-                                    });
-                                    return getRequest;
-                                },
-                                put() {},
-                                delete() {},
-                            };
-                        },
-                    };
-                    const complete = () => {
-                        if (mode === 'readonly') readTransactionSizes.push(reads);
-                        tx.oncomplete?.();
-                    };
-                    if (mode === 'readonly' && holdReadTransactions) {
-                        heldReadTransactions.push(complete);
-                        readStartedResolve?.();
-                        readStartedResolve = null;
-                    } else {
-                        queueMicrotask(complete);
-                    }
-                    return tx;
-                },
-            };
-            request.result = database;
-            request.onsuccess?.({ target: { result: database } });
-        });
-        return request;
-    },
-};
 
 const reader = await import('../src/chat-reader.js');
 const cache = await import('../src/cache-store.js');
@@ -108,13 +56,13 @@ test('unchanged active updates preserve entry identity and version while all ind
     ]);
     const entry = reader.getIndex()['active.jsonl'];
     const version = reader.getIndexVersion();
-    const writes = writeTransactions;
+    const writes = fake.writeTransactions;
     let notifications = 0;
     const unsubscribe = reader.onHydrationUpdate(() => notifications++);
     assert.equal(await reader.updateActiveChat('active.jsonl'), false);
     assert.equal(reader.getIndex()['active.jsonl'], entry);
     assert.equal(reader.getIndexVersion(), version);
-    assert.equal(writeTransactions, writes);
+    assert.equal(fake.writeTransactions, writes);
     assert.equal(notifications, 0);
     unsubscribe();
 
@@ -140,25 +88,18 @@ test('branch comparisons are reused while message array identities are unchanged
 });
 
 test('cache batch writes share one IndexedDB transaction', async () => {
-    const before = writeTransactions;
+    const before = fake.writeTransactions;
     cache.putCachedChats('test.png', [
         { fileName: 'a.jsonl', entry: { messages: [] } },
         { fileName: 'b.jsonl', entry: { messages: [] } },
     ]);
     await new Promise(resolve => setImmediate(resolve));
-    assert.equal(writeTransactions - before, 1);
+    assert.equal(fake.writeTransactions - before, 1);
 });
 
-test('cache reads use transactions of at most 50 records', async () => {
-    readTransactionSizes = [];
-    await cache.getCachedChatsForCharacter('test.png', Array.from({ length: 121 }, (_, i) => `${i}.jsonl`));
-    assert.deepEqual(readTransactionSizes, [50, 50, 21]);
-});
-
-test('cold metadata is published before delayed cached bodies finish reading', async () => {
+test('cold metadata is published before the cached summaries finish reading', async () => {
     reader.clearIndex();
-    holdReadTransactions = true;
-    const readStarted = nextReadStarted();
+    const readBegun = readStarted();
     const context = {
         characterId: 0, characters: [{ avatar: 'cold.png', name: 'Cold' }], chat: [],
         extensionSettings: {}, saveSettingsDebounced() {}, getRequestHeaders: () => ({}),
@@ -178,17 +119,15 @@ test('cold metadata is published before delayed cached bodies finish reading', a
         assert.equal(state.index['cold.jsonl'].messageCount, 12);
         assert.equal(state.index['cold.jsonl'].isLoaded, false);
     });
-    await readStarted;
+    await readBegun;
     assert.equal(metadataReady, true);
     releaseHeldReads();
     await build;
-    holdReadTransactions = false;
 });
 
 test('active update that lands during a cache read wins over the older build', async () => {
     reader.clearIndex();
-    holdReadTransactions = true;
-    const readStarted = nextReadStarted();
+    const readBegun = readStarted();
     const context = {
         characterId: 0, characters: [{ avatar: 'race.png', name: 'Race' }], chat: [raw('new live text')],
         extensionSettings: {}, saveSettingsDebounced() {}, getRequestHeaders: () => ({}),
@@ -199,14 +138,13 @@ test('active update that lands during a cache read wins over the older build', a
             ? [[{ file_name: 'race.jsonl', last_mes: '2026-01-01T00:00:00Z', mes_count: 1 }]] : [];
     } });
     const build = reader.buildIndex();
-    await readStarted;
+    await readBegun;
     assert.equal(await reader.updateActiveChat('race.jsonl'), true);
     const liveEntry = reader.getIndex()['race.jsonl'];
     releaseHeldReads();
     await build;
     assert.equal(reader.getIndex()['race.jsonl'], liveEntry);
     assert.equal(liveEntry.messages[0].text, 'new live text');
-    holdReadTransactions = false;
 });
 
 test('an entry replaced during a cache read is not deleted by an older server list', async () => {
@@ -234,23 +172,20 @@ test('an entry replaced during a cache read is not deleted by an older server li
             ? [[{ file_name: 'pending.jsonl', last_mes: '2026-01-01T00:00:00Z', mes_count: 1 }]] : [];
     } });
 
-    holdReadTransactions = true;
-    const readStarted = nextReadStarted();
+    const readBegun = readStarted();
     const build = reader.buildIndex();
-    await readStarted;
+    await readBegun;
     context.chat = [raw('after')];
     assert.equal(await reader.updateActiveChat('active.jsonl'), true);
     const replacement = reader.getIndex()['active.jsonl'];
     releaseHeldReads();
     await build;
     assert.equal(reader.getIndex()['active.jsonl'], replacement);
-    holdReadTransactions = false;
 });
 
 test('a reset and newer character build win while an older cache read is pending', async () => {
     reader.clearIndex();
-    holdReadTransactions = true;
-    const oldReadStarted = nextReadStarted();
+    const oldReadStarted = readStarted();
     let context = {
         characterId: 0, characters: [{ avatar: 'old.png', name: 'Old' }], chat: [],
         extensionSettings: {}, saveSettingsDebounced() {}, getRequestHeaders: () => ({}),
@@ -271,7 +206,6 @@ test('a reset and newer character build win while an older cache read is pending
         ...context,
         characters: [{ avatar: 'new.png', name: 'New' }],
     };
-    holdReadTransactions = false;
     const newBuild = reader.buildIndex();
     releaseHeldReads();
     await oldBuild;

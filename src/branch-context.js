@@ -53,9 +53,8 @@ export async function getSiblingMessagesAsync(fileName, { maxSiblings = 3, maxTe
     assertScopeCurrent(scope, signal);
     const count = Math.max(0, Math.min(3, Math.floor(Number(maxSiblings) || 0)));
     const textLimit = Math.max(1, Math.min(MSG_TRUNCATE, Math.floor(Number(maxTextChars) || MSG_TRUNCATE)));
-    // Copy identifiers before the first await, releasing any resident message
-    // references returned by the branch selector immediately.
-    const selections = getSiblingBranchContextForThread(fileName, count)
+    // Keep only identifiers, releasing the selector's message records immediately.
+    const selections = (await getSiblingBranchContextForThread(fileName, count, { signal }))
         .map(({ fileName: siblingFile, branchPoint }) => ({ fileName: siblingFile, branchPoint }));
     const siblings = [];
     for (const selection of selections) {

@@ -5,7 +5,8 @@ import { buildIcicleData, reLayoutSubtree } from '../src/icicle-data.js';
 import { getGridCellAtPoint, selectTopStable } from '../src/view-efficiency-utils.js';
 import { computePcaBasisAsync, projectVectorToPca } from '../src/semantic-engine.js';
 import { isVector } from '../src/vector-utils.js';
-import { createMessageDescriptor, normalizedMessageFingerprint, messagePreview } from '../src/message-descriptors.js';
+import { createMessageDescriptor, messagePreview } from '../src/message-descriptors.js';
+import { messageKey } from '../src/chat-index-data.js';
 
 test('bounded selection matches stable descending full sort including ties', () => {
     const items = [3, 9, 9, -1, 8, 9, 2].map((similarity, index) => ({ similarity, index }));
@@ -73,9 +74,9 @@ test('icicle fits PCA only for gradient mode, caches its basis by vector revisio
     const raw = (await readFile(new URL('../src/icicle-data.js', import.meta.url), 'utf8'))
         .replace(/^import .*;$/gm, '').replace(/^export /gm, '');
     let fits = 0;
-    const api = new Function('computePcaBasisAsync', 'projectVectorToPca', 'isVector', 'normalizedMessageFingerprint', 'truncateMessagePreview',
+    const api = new Function('computePcaBasisAsync', 'projectVectorToPca', 'isVector', 'messageKey', 'truncateMessagePreview',
         `${raw};return { buildIcicleData, clearIcicleSemanticCache };`)(
-        async (...args) => { fits++; return computePcaBasisAsync(...args); }, projectVectorToPca, isVector, normalizedMessageFingerprint, messagePreview);
+        async (...args) => { fits++; return computePcaBasisAsync(...args); }, projectVectorToPca, isVector, messageKey, messagePreview);
     const messages = branch => [{ index: 0, role: 'user', text: 'shared' }, { index: 1, role: 'assistant', text: branch }];
     const index = {
         a: { isLoaded: true, messages: messages('left'), chatEmbedding: new Float32Array([1, 0, 0]), clusterLabel: 1 },
@@ -109,10 +110,10 @@ test('icicle gradient projects every persisted chat from a bounded sample and re
     const raw = (await readFile(new URL('../src/icicle-data.js', import.meta.url), 'utf8'))
         .replace(/^import .*;$/gm, '').replace(/^export /gm, '');
     const fitSizes = [];
-    const api = new Function('computePcaBasisAsync', 'projectVectorToPca', 'isVector', 'normalizedMessageFingerprint', 'truncateMessagePreview',
+    const api = new Function('computePcaBasisAsync', 'projectVectorToPca', 'isVector', 'messageKey', 'truncateMessagePreview',
         `${raw};return { buildIcicleData, clearIcicleSemanticCache, cache:()=>semanticBasisCache };`)(
         async (vectors, options) => { fitSizes.push(vectors.length); return computePcaBasisAsync(vectors, options); },
-        projectVectorToPca, isVector, normalizedMessageFingerprint, messagePreview);
+        projectVectorToPca, isVector, messageKey, messagePreview);
     const index = Object.fromEntries(Array.from({ length: 1300 }, (_, i) => [`chat${i}`, {
         isLoaded: true, chatEmbedding: null,
         messages: [createMessageDescriptor({ index: 0, role: 'assistant', text: `branch ${i}` })],

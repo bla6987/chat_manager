@@ -4,6 +4,7 @@
  */
 
 import { timestampMs } from './timestamps.js';
+import { iterateActivity } from './chat-index-data.js';
 
 let cachedStats = null;
 let cachedStatsVersion = -1;
@@ -50,9 +51,14 @@ export function computeStats(chatIndex, indexVersion) {
 
         if (entry.isLoaded) {
             if (!entry.needsHydration) loadedChats++;
-            for (const msg of entry.messages) {
-                if (msg.role === 'user') userMessages++;
-                else assistantMessages++;
+            if (Number.isFinite(entry.userMessageCount)) {
+                userMessages += entry.userMessageCount;
+                assistantMessages += entry.messageCount - entry.userMessageCount;
+            } else {
+                for (const msg of entry.messages) {
+                    if (msg.role === 'user') userMessages++;
+                    else assistantMessages++;
+                }
             }
         }
 
@@ -117,27 +123,33 @@ export function computeHeatmapData(chatIndex, indexVersion) {
     let loadedCount = 0;
     const totalCount = Object.keys(chatIndex).length;
 
+    const addActivity = (fileName, ms, messages) => {
+        const d = new Date(ms);
+        const dateKey = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+
+        const count = (dayCounts.get(dateKey) || 0) + messages;
+        dayCounts.set(dateKey, count);
+        if (count > maxCount) maxCount = count;
+
+        if (!dayChats.has(dateKey)) dayChats.set(dateKey, new Set());
+        dayChats.get(dateKey).add(fileName);
+
+        if (!minDate || dateKey < minDate) minDate = dateKey;
+        if (!maxDate || dateKey > maxDate) maxDate = dateKey;
+    };
+
     for (const entry of Object.values(chatIndex)) {
         if (!entry.isLoaded) continue;
         if (!entry.needsHydration) loadedCount++;
 
+        if (Array.isArray(entry.activity)) {
+            for (const [ms, messages] of iterateActivity(entry.activity)) addActivity(entry.fileName, ms, messages);
+            continue;
+        }
         for (const msg of entry.messages) {
             if (msg.timestamp === null || msg.timestamp === undefined || msg.timestamp === '') continue;
             const ms = Number.isFinite(msg.timestampMs) ? msg.timestampMs : timestampMs(msg.timestamp);
-            if (ms === null) continue;
-            const d = new Date(ms);
-
-            const dateKey = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
-
-            const count = (dayCounts.get(dateKey) || 0) + 1;
-            dayCounts.set(dateKey, count);
-            if (count > maxCount) maxCount = count;
-
-            if (!dayChats.has(dateKey)) dayChats.set(dateKey, new Set());
-            dayChats.get(dateKey).add(entry.fileName);
-
-            if (!minDate || dateKey < minDate) minDate = dateKey;
-            if (!maxDate || dateKey > maxDate) maxDate = dateKey;
+            if (ms !== null) addActivity(entry.fileName, ms, 1);
         }
     }
 

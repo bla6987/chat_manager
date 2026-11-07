@@ -3,11 +3,12 @@
  * Never modifies any chat files.
  */
 
-import { getCachedChat, iterateCachedChatCatalogs, putCachedChat, putCachedChats, removeCachedChat, flushPendingCacheWrites } from './cache-store.js';
+import { getCachedBody, getCachedDescriptors, getCachedSummaries, putCachedBody, putCachedChat, removeCachedChat, flushPendingCacheWrites } from './cache-store.js';
+import { canonicalFilename, decodeDescriptors, embeddingTextFromMessages, encodeDescriptors, mainChatFromData, parseMessages, summarizeChat } from './chat-index-data.js';
 import { getRepresentativeEmbeddingText } from './embedding-text.js';
 import { timestampMs, localDateBoundary } from './timestamps.js';
 import { resolveActiveChatFilename } from './active-chat.js';
-import { createMessageDescriptor, estimateMessageBodyBytes, sameMessageContent, messagePreview } from './message-descriptors.js';
+import { createMessageDescriptor, estimateMessageBodyBytes, sameMessageContent } from './message-descriptors.js';
 import { isVector, toFloat32Vector, vectorByteLength, ByteBudgetLRU } from './vector-utils.js';
 export { messageFingerprint, normalizedMessageFingerprint, sameMessageContent } from './message-descriptors.js';
 
@@ -175,12 +176,28 @@ function forgetResidentBody(fileName) {
 function rememberResidentBody(entry) {
     forgetResidentBody(entry.fileName);
     entry.messageDescriptors = descriptorsFor(entry.messages);
-    entry.bodyEmbeddingText = messagePreview(entry.messages.slice(-10).map(message => String(message.text || '').trim().slice(0, 2000)).filter(Boolean).join('\n').slice(0, 2000).trim(), 2000);
+    entry.bodyEmbeddingText = embeddingTextFromMessages(entry.messages);
     entry.bodyResident = true;
     const bytes = estimateMessageBodyBytes(entry.messages);
     entry.bodyBytes = bytes;
     residentBodies.set(entry.fileName, { entry, bytes });
     residentBodyBytes += bytes;
+}
+
+/** Summary fields replace an entry's messages when its body leaves memory. */
+function withSummary(entry, summary) {
+    const lastMessageTimestamp = summary.lastMessageTimestamp ?? entry.lastMessageTimestamp;
+    return {
+        ...entry, ...summary, lastMessageTimestamp,
+        firstTimestampMs: normalizeTimestamp(summary.firstMessageTimestamp),
+        lastTimestampMs: normalizeTimestamp(lastMessageTimestamp),
+    };
+}
+
+/** A resident body can be compared directly; otherwise only hashes remain. */
+function sameContent(entry, summary, messages) {
+    if (entry.contentHash) return entry.contentHash === summary.contentHash;
+    return messagesEqual(entry.messages, messages);
 }
 
 function touchResidentBody(fileName) {
@@ -200,8 +217,8 @@ export function trimBodyCache({ keepActive = true, targetBytes = bodyCacheBudget
         const entry = chatIndex[fileName];
         forgetResidentBody(fileName);
         if (entry !== cached.entry || entry.bodyResident === false) continue;
-        entry.messages = entry.messageDescriptors || descriptorsFor(entry.messages);
-        entry.messageDescriptors = entry.messages;
+        entry.messages = [];
+        entry.messageDescriptors = null;
         entry.bodyResident = false;
         invalidateSearchableCache();
     }
@@ -360,30 +377,18 @@ export function getMessageEmbedding(entry, msg, swipeIndex = null) {
     return null;
 }
 
-function messageVariantText(msg, swipeIndex) {
-    if (!msg) return '';
-    const text = swipeIndex === getMessageActiveSwipeIndex(msg) ? msg.text : msg.swipes?.[swipeIndex];
-    return typeof text === 'string' ? text.trim() : '';
-}
-
 function retainMessageEmbeddings(entry, messages) {
     if (!(entry.messageEmbeddings instanceof Map)) return null;
     const previousMap = ensureMessageEmbeddingMap(entry);
     const retained = new Map();
-    for (let i = 0; i < messages.length; i++) {
-        const msg = messages[i];
-        const previous = entry.messages[i];
-        if (!previous) continue;
-        const swipeCount = Math.max(msg.swipes?.length || 0, getMessageActiveSwipeIndex(msg) + 1);
-        for (let swipe = 0; swipe < swipeCount; swipe++) {
-            const text = messageVariantText(msg, swipe);
-            if (!text) continue;
-            if (previous.isDescriptor) {
-                const descriptor = descriptorsFor([msg])[0];
-                if (previous.swipeHashes?.[swipe] !== descriptor.swipeHashes?.[swipe]) continue;
-            } else if (text !== messageVariantText(previous, swipe)) continue;
-            const vector = previousMap.get(makeMessageEmbeddingKey(previous.index, swipe));
-            if (vector) retained.set(makeMessageEmbeddingKey(msg.index, swipe), vector);
+    const previous = descriptorsFor(entry.messages);
+    const next = descriptorsFor(messages);
+    for (let i = 0; i < next.length; i++) {
+        if (!previous[i]) continue;
+        for (let swipe = 0; swipe < next[i].swipeCount; swipe++) {
+            if (!(next[i].swipeLengths?.[swipe] > 0) || previous[i].swipeHashes?.[swipe] !== next[i].swipeHashes?.[swipe]) continue;
+            const vector = previousMap.get(makeMessageEmbeddingKey(previous[i].index, swipe));
+            if (vector) retained.set(makeMessageEmbeddingKey(next[i].index, swipe), vector);
         }
     }
     compositeEmbeddingMaps.add(retained);
@@ -503,73 +508,6 @@ export async function fetchChatContent(fileName, { signal } = {}) {
 }
 
 /**
- * Parse messages from a chat data array into our index format.
- * @param {Array} chatData - Raw message objects from the server
- * @param {string} fileName - Chat filename
- * @returns {IndexMessage[]}
- */
-function parseMessages(chatData, fileName, previousMessages = null) {
-    const messages = [];
-    // Disk arrays include a header; the host's live chat array does not.
-    const offset = chatData[0] && typeof chatData[0].mes !== 'string' ? 1 : 0;
-    for (let i = offset; i < chatData.length; i++) {
-        const msg = chatData[i];
-        // Skip metadata-only entries (no 'mes' field)
-        if (!msg || typeof msg.mes !== 'string') continue;
-
-        const previous = previousMessages?.[i - offset];
-        const rawBranches = Array.isArray(msg.extra?.branches) ? msg.extra.branches.map(canonicalFilename).filter(Boolean) : [];
-        const rawSwipeId = Number.isFinite(Number(msg.swipe_id)) ? Math.max(0, Math.floor(Number(msg.swipe_id))) : 0;
-        const expectedSwipes = Array.isArray(msg.swipes) && msg.swipes.length ? msg.swipes : (msg.mes.trim() ? [msg.mes] : []);
-        const expectedSwipeId = expectedSwipes.length ? Math.min(rawSwipeId, expectedSwipes.length - 1) : 0;
-        if (previous && !previous.isDescriptor && previous.index === i - offset
-            && previous.text === msg.mes && previous.role === (msg.is_user ? 'user' : 'assistant')
-            && previous.timestamp === (msg.send_date || '') && previous.swipeId === expectedSwipeId
-            && (previous.branches?.length || 0) === rawBranches.length
-            && rawBranches.every((branch, n) => branch === previous.branches[n])
-            && (previous.swipes?.length || 0) === expectedSwipes.length
-            && expectedSwipes.every((swipe, n) => previous.swipes[n] === (n === expectedSwipeId ? msg.mes : (typeof swipe === 'string' ? swipe : '')))) {
-            messages.push(previous);
-            continue;
-        }
-
-        const rawSwipes = Array.isArray(msg.swipes) ? msg.swipes : null;
-        let swipeId = Number.isFinite(Number(msg.swipe_id)) ? Math.max(0, Math.floor(Number(msg.swipe_id))) : 0;
-        let swipes = null;
-
-        if (rawSwipes && rawSwipes.length > 0) {
-            swipes = rawSwipes.map(swipe => typeof swipe === 'string' ? swipe : '');
-            if (swipeId >= swipes.length) {
-                swipeId = swipes.length - 1;
-            }
-            if (swipeId < 0) {
-                swipeId = 0;
-            }
-            if (swipes[swipeId] !== msg.mes) {
-                swipes[swipeId] = msg.mes;
-            }
-        } else if (msg.mes.trim().length > 0) {
-            swipes = [msg.mes];
-            swipeId = 0;
-        }
-
-        messages.push({
-            filename: fileName,
-            index: i - offset,
-            role: msg.is_user ? 'user' : 'assistant',
-            text: msg.mes,
-            timestamp: msg.send_date || '',
-            timestampMs: timestampMs(msg.send_date),
-            branches: rawBranches,
-            swipes: swipes || undefined,
-            swipeId,
-        });
-    }
-    if (previousMessages && messages.length === previousMessages.length && messages.every((message, i) => message === previousMessages[i])) return previousMessages;
-    return messages;
-}
-
-/**
  * Extract a timestamp (ms since epoch) from a chat metadata object.
  * @param {Object} metaObj
  * @returns {number}
@@ -642,27 +580,15 @@ function normalizeTimestamp(value) {
     return timestampMs(value) ?? FALLBACK_SORT_TIMESTAMP;
 }
 
-function canonicalFilename(value) {
-    return typeof value === 'string' && value.trim() ? `${value.trim().replace(/\.jsonl$/i, '')}.jsonl` : null;
-}
-
-function mainChatFromData(chatData, metadata = null) {
-    return canonicalFilename(metadata?.main_chat ?? chatData[0]?.chat_metadata?.main_chat);
-}
-
 function metaSignature(meta) {
     return JSON.stringify([meta?.file_size ?? null, getMetaMessageCount(meta)]);
 }
 
-/**
+/*
  * The host list has no file revision, so matching size/count/date can still hide
  * a same-size edit. Local edits delete their cached record (recordLocalChatEdit)
- * and remote ones wait for a forceRevalidate build. Catalogs written before that
- * tracking existed may predate a local edit, so they are re-read once instead.
+ * and remote ones wait for a forceRevalidate build.
  */
-function isTrustedCatalog(record) {
-    return record?.localEditsTracked === true;
-}
 
 /** The host's array is newer than the file while a debounced save is pending. */
 function liveChatContext(fileName) {
@@ -858,13 +784,41 @@ function messagesEqual(a, b) {
     return true;
 }
 
+function hasResidentEmbeddingState(entry) {
+    return entry.messageEmbeddings instanceof Map ? entry.messageEmbeddings.size > 0 : entry.cachedMessageEmbeddingKeys?.size > 0;
+}
+
+/** Embedding state follows unchanged messages, which needs the previous records. */
+async function withPreviousMessages(entry) {
+    if (entry.messages?.length || !hasResidentEmbeddingState(entry)) return entry;
+    const stored = currentCharacterAvatar ? await getCachedDescriptors(currentCharacterAvatar, entry.fileName) : null;
+    if (!stored || stored.validatedAt !== entry.validatedAt) return entry;
+    try {
+        return { ...entry, messages: decodeDescriptors(stored.payload, entry.fileName) };
+    } catch {
+        return entry;
+    }
+}
+
+async function indexChatContent(fileName, live, previousMessages) {
+    // Reading the file before a pending save lands would persist the old text
+    // under metadata that no later list could tell apart.
+    const chatData = live ? live.chat : await fetchChatContent(fileName);
+    const messages = parseMessages(chatData, fileName, previousMessages);
+    const descriptors = descriptorsFor(messages);
+    return { messages, descriptors, summary: summarizeChat(messages, descriptors, mainChatFromData(chatData, live?.chatMetadata)) };
+}
+
 /**
- * Fetch and hydrate a single entry, re-trying if metadata changed during fetch.
+ * Fetch and index a single entry, re-trying if metadata changed during fetch.
  * @param {string} fileName
  * @param {number} sessionId
+ * @param {{ retainBody?: boolean, evictBodies?: boolean }} [options]
+ *   retainBody false keeps only the summary in memory. evictBodies lets the body
+ *   displace older stored bodies; archive scans leave it off.
  * @returns {Promise<boolean>}
  */
-async function hydrateEntry(fileName, sessionId, persist = true) {
+async function hydrateEntry(fileName, sessionId, { retainBody = true, evictBodies = true } = {}) {
     if (entryHydrationPromises.has(fileName)) {
         return entryHydrationPromises.get(fileName);
     }
@@ -876,17 +830,13 @@ async function hydrateEntry(fileName, sessionId, persist = true) {
             if (entry.isLoaded && !entry.needsHydration) return true;
 
             const expectedTimestamp = entry.lastModified;
-            // Reading the file before a pending save lands would persist the old
-            // text under metadata that no later list could tell apart.
             const live = liveChatContext(fileName);
-            let chatData = live?.chat;
-            if (!live) {
-                try {
-                    chatData = await fetchChatContent(fileName);
-                } catch (err) {
-                    console.error(`[${MODULE_NAME}] Failed to hydrate ${fileName}:`, err);
-                    return false;
-                }
+            let indexed;
+            try {
+                indexed = await indexChatContent(fileName, live, entry.bodyResident !== false ? entry.messages : null);
+            } catch (err) {
+                console.error(`[${MODULE_NAME}] Failed to hydrate ${fileName}:`, err);
+                return false;
             }
 
             if (sessionId !== hydrationSessionId) return false;
@@ -902,38 +852,42 @@ async function hydrateEntry(fileName, sessionId, persist = true) {
                 continue;
             }
 
-            const messages = parseMessages(chatData, fileName, current.bodyResident !== false ? current.messages : null);
-            const firstTs = messages.length > 0 ? messages[0].timestamp : null;
-            const lastTs = messages.length > 0 ? messages[messages.length - 1].timestamp : current.lastMessageTimestamp;
+            const previous = await withPreviousMessages(current);
+            if (sessionId !== hydrationSessionId || chatIndex[fileName] !== current) continue;
 
-            chatIndex[fileName] = {
-                ...current,
-                messageCount: messages.length,
-                messages,
-                firstMessageTimestamp: firstTs,
-                lastMessageTimestamp: lastTs,
-                firstTimestampMs: normalizeTimestamp(firstTs),
-                lastTimestampMs: normalizeTimestamp(lastTs),
+            const { messages, descriptors, summary } = indexed;
+            // The open chat stays resident: it may hold edits no file has yet.
+            const keepBody = retainBody || !!live;
+            const next = {
+                ...withSummary(current, summary),
+                messages: keepBody ? messages : [],
+                messageDescriptors: keepBody ? descriptors : null,
+                bodyResident: keepBody,
                 branchPoint: null,
                 isLoaded: true,
                 needsHydration: false,
                 validatedAt: Date.now(),
-                mainChat: mainChatFromData(chatData, live?.chatMetadata),
-                messageEmbeddings: retainMessageEmbeddings(current, messages),
-                cachedMessageEmbeddingKeys: retainCachedEmbeddingKeys(current, messages),
+                messageEmbeddings: retainMessageEmbeddings(previous, messages),
+                cachedMessageEmbeddingKeys: retainCachedEmbeddingKeys(previous, messages),
             };
-            rememberResidentBody(chatIndex[fileName]);
-            if (!current.isLoaded || getRepresentativeEmbeddingText(current) !== getRepresentativeEmbeddingText(chatIndex[fileName])) {
-                chatIndex[fileName].chatEmbedding = null;
-                chatIndex[fileName].chatEmbeddingHash = null;
-                chatIndex[fileName].cachedChatEmbeddingHash = null;
-                chatIndex[fileName].clusterLabel = null;
+            chatIndex[fileName] = next;
+            if (keepBody) rememberResidentBody(next);
+            else forgetResidentBody(fileName);
+            if (!current.isLoaded || getRepresentativeEmbeddingText(current) !== getRepresentativeEmbeddingText(next)) {
+                next.chatEmbedding = null;
+                next.chatEmbeddingHash = null;
+                next.cachedChatEmbeddingHash = null;
+                next.clusterLabel = null;
             }
-            syncEntryVectorBudget(chatIndex[fileName]);
+            syncEntryVectorBudget(next);
             bumpIndexVersion();
 
-            if (persist && currentCharacterAvatar) {
-                await putCachedChat(currentCharacterAvatar, fileName, chatIndex[fileName]);
+            if (currentCharacterAvatar) {
+                await putCachedChat(currentCharacterAvatar, fileName, next, {
+                    descriptorsPayload: encodeDescriptors(descriptors),
+                    body: retainBody && !live ? messages : undefined,
+                    evictBodies,
+                });
                 if (sessionId !== hydrationSessionId || !chatIndex[fileName]) return false;
                 trimBodyCache({ keepFile: fileName });
             }
@@ -968,16 +922,7 @@ function startHydrationLoop() {
                     queuedFiles.delete(fileName);
                 }
 
-                const results = await Promise.all(batch.map(fileName => hydrateEntry(fileName, sessionId, false)));
-                if (sessionId === hydrationSessionId && currentCharacterAvatar) {
-                    const hydrated = [];
-                    for (let i = 0; i < batch.length; i++) {
-                        const entry = chatIndex[batch[i]];
-                        if (results[i] && entry?.isLoaded && !entry.needsHydration) hydrated.push({ fileName: batch[i], entry });
-                    }
-                    await putCachedChats(currentCharacterAvatar, hydrated);
-                    trimBodyCache();
-                }
+                await Promise.all(batch.map(fileName => hydrateEntry(fileName, sessionId, { retainBody: false, evictBodies: false })));
                 if (sessionId === hydrationSessionId) emitHydrationUpdate();
                 if (sessionId === hydrationSessionId && hydrationQueue.length > 0) {
                     await new Promise(resolve => setTimeout(resolve, HYDRATION_YIELD_MS));
@@ -1002,7 +947,7 @@ function startHydrationLoop() {
 /**
  * Build (or incrementally update) the index for the current character.
  * Metadata phase returns quickly; hydration of new or changed chats runs in the
- * background. Chats whose list metadata matches their cached catalog are reused.
+ * background. Chats whose list metadata matches their cached summary are reused.
  * @param {Function} [onProgress] - Called with (completed, total) for progress tracking
  * @param {Function} [onMetadataReady] - Called once metadata is available for immediate UI rendering
  * @param {{ forceRevalidate?: boolean, backgroundHydration?: boolean }} [options]
@@ -1127,57 +1072,35 @@ export async function buildIndex(onProgress, onMetadataReady, options = {}) {
         const entriesBeforeCacheRead = new Map(Object.entries(chatIndex));
         const indexKeysBeforeCacheRead = new Set(Object.keys(chatIndex));
 
-        // Loaded, unchanged entries already live in memory. Avoid cloning their
-        // full message histories out of IndexedDB on every panel open.
-        const cacheFiles = [];
-        for (const [fileName, metaObj] of serverChats) {
-            const entry = chatIndex[fileName];
-            if (!options.forceRevalidate && !entry?.isLoaded) {
-                cacheFiles.push(fileName);
-            }
+        // Loaded, unchanged entries already live in memory. Everything else is
+        // restored from one read of the character's summaries.
+        const cachedSummaries = options.forceRevalidate || serverChats.size === 0
+            ? new Map() : await getCachedSummaries(character.avatar);
+        if (buildSessionId !== hydrationSessionId || currentCharacterAvatar !== buildAvatar) {
+            return getBuildStateResponse(false);
         }
-        // Catalog records contain fingerprints/previews, never complete bodies.
-        const idbCache = new Map();
-        try {
-            if (cacheFiles.length > 0) {
-                for await (const { fileName, entry } of iterateCachedChatCatalogs(character.avatar, cacheFiles, {
-                    acceptMetadata: (fileName, cached) => {
-                        const metadata = serverChats.get(fileName);
-                        return buildSessionId === hydrationSessionId && currentCharacterAvatar === buildAvatar
-                            && chatIndex[fileName] === entriesBeforeCacheRead.get(fileName)
-                            && cached.lastModified === getMetaTimestamp(metadata)
-                            && cached.serverSignature === metaSignature(metadata) && isTrustedCatalog(cached);
-                    },
-                })) {
-                    if (buildSessionId !== hydrationSessionId || currentCharacterAvatar !== buildAvatar) {
-                        return getBuildStateResponse(false);
-                    }
-                    if (!Array.isArray(entry.messages)) continue;
-                    for (const msg of entry.messages) {
-                        if (!msg.filename) msg.filename = fileName;
-                    }
-                    idbCache.set(fileName, entry);
-                    const current = chatIndex[fileName];
-                    const metadata = serverChats.get(fileName);
-                    if (!current || current !== entriesBeforeCacheRead.get(fileName)
-                        || entry.lastModified !== getMetaTimestamp(metadata)
-                        || entry.serverSignature !== metaSignature(metadata) || !isTrustedCatalog(entry)) continue;
-                    chatIndex[fileName] = {
-                        ...current, ...entry, fileName, initialOrder: current.initialOrder,
-                        firstTimestampMs: normalizeTimestamp(entry.firstMessageTimestamp),
-                        lastTimestampMs: normalizeTimestamp(entry.lastMessageTimestamp),
-                        branchPoint: null, isLoaded: true, needsHydration: false,
-                        bodyResident: false, messageDescriptors: entry.messages,
-                        chatEmbedding: null, chatEmbeddingHash: null, clusterLabel: null, messageEmbeddings: null,
-                    };
-                    entriesBeforeCacheRead.set(fileName, chatIndex[fileName]);
-                    queuedFiles.delete(fileName);
-                    changed = true;
-                    bumpIndexVersion();
-                }
-            }
-        } catch {
-            // IndexedDB unavailable — proceed without cache
+        for (const [fileName, record] of cachedSummaries) {
+            const metadata = serverChats.get(fileName);
+            // The file was deleted while no index was loaded.
+            if (!metadata) { removeCachedChat(character.avatar, fileName); continue; }
+            const current = chatIndex[fileName];
+            if (!current || current.isLoaded || current !== entriesBeforeCacheRead.get(fileName)
+                || record.lastModified !== getMetaTimestamp(metadata)
+                || record.serverSignature !== metaSignature(metadata)) continue;
+            chatIndex[fileName] = {
+                ...current, ...record, fileName, initialOrder: current.initialOrder,
+                firstTimestampMs: normalizeTimestamp(record.firstMessageTimestamp),
+                lastTimestampMs: normalizeTimestamp(record.lastMessageTimestamp),
+                messages: [], messageDescriptors: null, bodyResident: false,
+                branchPoint: null, isLoaded: true, needsHydration: false,
+                chatEmbedding: null, chatEmbeddingHash: null, clusterLabel: null, messageEmbeddings: null,
+            };
+            delete chatIndex[fileName].key;
+            delete chatIndex[fileName].avatar;
+            delete chatIndex[fileName].cacheFormatVersion;
+            entriesBeforeCacheRead.set(fileName, chatIndex[fileName]);
+            queuedFiles.delete(fileName);
+            changed = true;
         }
 
         const existingKeys = indexKeysBeforeCacheRead;
@@ -1198,32 +1121,16 @@ export async function buildIndex(onProgress, onMetadataReady, options = {}) {
             const reusable = !options.forceRevalidate && !entry.needsHydration && entry.isLoaded && !metadataChanged;
             if (reusable) continue;
 
-            const cached = idbCache.get(fileName);
-            if (!options.forceRevalidate && !entry.isLoaded && cached
-                && cached.lastModified === serverTimestamp && cached.serverSignature === signature
-                && isTrustedCatalog(cached) && Array.isArray(cached.messages)) {
-                chatIndex[fileName] = {
-                    ...entry, ...cached, fileName, initialOrder: entry.initialOrder,
-                    firstTimestampMs: normalizeTimestamp(cached.firstMessageTimestamp),
-                    lastTimestampMs: normalizeTimestamp(cached.lastMessageTimestamp),
-                    branchPoint: null, isLoaded: true, needsHydration: false,
-                    bodyResident: false, messageDescriptors: cached.messages,
-                    chatEmbedding: null, chatEmbeddingHash: null, clusterLabel: null, messageEmbeddings: null,
-                };
-                queuedFiles.delete(fileName);
-                changed = true;
-            } else {
-                // Keep the last successful body visible while revalidating; a
-                // failed request must not turn known-good data into an empty chat.
-                chatIndex[fileName] = {
-                    ...entry, lastModified: serverTimestamp, serverSignature: signature,
-                    sortTimestamp: metadataChanged ? serverTimestamp : entry.sortTimestamp,
-                    needsHydration: true,
-                };
-                if (entry.isLoaded && entry.bodyResident !== false) rememberResidentBody(chatIndex[fileName]);
-                markEntryForHydration(fileName);
-                changed = true;
-            }
+            // Keep the last successful body visible while revalidating; a
+            // failed request must not turn known-good data into an empty chat.
+            chatIndex[fileName] = {
+                ...entry, lastModified: serverTimestamp, serverSignature: signature,
+                sortTimestamp: metadataChanged ? serverTimestamp : entry.sortTimestamp,
+                needsHydration: true,
+            };
+            if (entry.isLoaded && entry.bodyResident !== false) rememberResidentBody(chatIndex[fileName]);
+            markEntryForHydration(fileName);
+            changed = true;
         }
 
         // Reconcile queue membership once, including all restored and deleted files.
@@ -1343,7 +1250,7 @@ function assertBodyReadCurrent(sessionId, avatar, signal) {
  * keep only IDs/previews after use. No residency or content revision changes are
  * made for a successful read of an unchanged cached body.
  */
-export async function readChatMessages(fileName, { signal } = {}) {
+export async function readChatMessages(fileName, { signal, evictBodies = true } = {}) {
     fileName = canonicalFilename(fileName);
     const sessionId = hydrationSessionId;
     const avatar = currentCharacterAvatar;
@@ -1352,7 +1259,7 @@ export async function readChatMessages(fileName, { signal } = {}) {
     if (!entry) throw new Error(`Chat not present in this character's catalog: ${fileName}`);
     normalizeEntryShape(entry);
     if (!entry.isLoaded || entry.needsHydration) {
-        const loaded = await hydrateEntry(fileName, sessionId);
+        const loaded = await hydrateEntry(fileName, sessionId, { evictBodies });
         assertBodyReadCurrent(sessionId, avatar, signal);
         entry = chatIndex[fileName];
         if (!loaded || !entry?.isLoaded || entry.needsHydration) {
@@ -1368,9 +1275,9 @@ export async function readChatMessages(fileName, { signal } = {}) {
 
     await flushPendingCacheWrites();
     assertBodyReadCurrent(sessionId, avatar, signal);
-    const cached = avatar ? await getCachedChat(avatar, fileName, { signal }) : null;
+    const cached = avatar ? await getCachedBody(avatar, fileName, { signal }) : null;
     assertBodyReadCurrent(sessionId, avatar, signal);
-    if (chatIndex[fileName] !== entry) return readChatMessages(fileName, { signal });
+    if (chatIndex[fileName] !== entry) return readChatMessages(fileName, { signal, evictBodies });
     if (cached && Array.isArray(cached.messages) && !cached.messages.some(message => message?.isDescriptor)
         && cached.lastModified === entry.lastModified && cached.serverSignature === entry.serverSignature
         && cached.validatedAt === entry.validatedAt) {
@@ -1383,31 +1290,75 @@ export async function readChatMessages(fileName, { signal } = {}) {
     assertBodyReadCurrent(sessionId, avatar, signal);
     const current = chatIndex[fileName];
     if (!current) throw new Error(`Chat was removed while reading: ${fileName}`);
-    if (current !== entry) return readChatMessages(fileName, { signal });
+    if (current !== entry) return readChatMessages(fileName, { signal, evictBodies });
     const messages = parseMessages(raw, fileName);
-    if (!entry.isLoaded || !messagesEqual(entry.messages, messages)) {
-        const firstTs = messages[0]?.timestamp || null;
-        const lastTs = messages.at(-1)?.timestamp || entry.lastMessageTimestamp;
+    const descriptors = descriptorsFor(messages);
+    const summary = summarizeChat(messages, descriptors, mainChatFromData(raw));
+    if (!entry.isLoaded || !sameContent(entry, summary, messages)) {
+        const previous = await withPreviousMessages(entry);
+        assertBodyReadCurrent(sessionId, avatar, signal);
+        if (chatIndex[fileName] !== entry) return readChatMessages(fileName, { signal, evictBodies });
         const updated = {
-            ...entry, messages, messageCount: messages.length,
-            firstMessageTimestamp: firstTs, lastMessageTimestamp: lastTs,
-            firstTimestampMs: normalizeTimestamp(firstTs), lastTimestampMs: normalizeTimestamp(lastTs),
-            mainChat: mainChatFromData(raw), isLoaded: true, needsHydration: false,
+            ...withSummary(entry, summary), messages, isLoaded: true, needsHydration: false,
             validatedAt: Date.now(), branchPoint: null,
-            messageEmbeddings: retainMessageEmbeddings(entry, messages),
-            cachedMessageEmbeddingKeys: retainCachedEmbeddingKeys(entry, messages),
+            messageEmbeddings: retainMessageEmbeddings(previous, messages),
+            cachedMessageEmbeddingKeys: retainCachedEmbeddingKeys(previous, messages),
             chatEmbedding: null, chatEmbeddingHash: null, cachedChatEmbeddingHash: null, clusterLabel: null,
         };
         chatIndex[fileName] = updated;
         syncEntryVectorBudget(updated);
         rememberResidentBody(updated);
         bumpIndexVersion();
-        if (avatar) await putCachedChat(avatar, fileName, updated);
+        if (avatar) {
+            await putCachedChat(avatar, fileName, updated, { descriptorsPayload: encodeDescriptors(descriptors), body: messages, evictBodies });
+        }
         assertBodyReadCurrent(sessionId, avatar, signal);
         trimBodyCache();
         emitHydrationUpdate();
+    } else if (avatar) {
+        entry.bodyBytes = summary.bodyBytes;
+        await putCachedBody(avatar, fileName, entry, messages, { evictBodies });
+        assertBodyReadCurrent(sessionId, avatar, signal);
     }
     return messages;
+}
+
+/**
+ * Read the per-message records of one chat for a single operation. They are never
+ * retained here, so a view holds at most the chat it is currently working on.
+ * @param {string} fileName
+ * @param {{ signal?: AbortSignal }} [options]
+ * @returns {Promise<Array>}
+ */
+export async function readChatDescriptors(fileName, { signal } = {}) {
+    fileName = canonicalFilename(fileName);
+    const sessionId = hydrationSessionId;
+    const avatar = currentCharacterAvatar;
+    assertBodyReadCurrent(sessionId, avatar, signal);
+    const entry = chatIndex[fileName];
+    if (!entry) throw new Error(`Chat not present in this character's catalog: ${fileName}`);
+    if (entry.isLoaded && !entry.needsHydration) {
+        if (entry.messages?.length) return descriptorsFor(entry.messages);
+        await flushPendingCacheWrites();
+        const stored = avatar ? await getCachedDescriptors(avatar, fileName, { signal }) : null;
+        assertBodyReadCurrent(sessionId, avatar, signal);
+        if (chatIndex[fileName] !== entry) return readChatDescriptors(fileName, { signal });
+        if (stored && stored.lastModified === entry.lastModified && stored.serverSignature === entry.serverSignature
+            && stored.validatedAt === entry.validatedAt) {
+            try {
+                return decodeDescriptors(stored.payload, fileName);
+            } catch (error) {
+                console.warn(`[${MODULE_NAME}] Ignoring unreadable records for ${fileName}:`, error);
+            }
+        }
+    }
+    const descriptors = descriptorsFor(await readChatMessages(fileName, { signal, evictBodies: false }));
+    assertBodyReadCurrent(sessionId, avatar, signal);
+    const current = chatIndex[fileName];
+    if (avatar && current?.isLoaded && !current.needsHydration) {
+        await putCachedChat(avatar, fileName, current, { descriptorsPayload: encodeDescriptors(descriptors) });
+    }
+    return descriptors;
 }
 
 /** Complete archive iteration with at most one cold body held by the iterator. */
@@ -1419,7 +1370,7 @@ export async function* iterateChatBodies({ fileNames, signal } = {}) {
         assertBodyReadCurrent(sessionId, avatar, signal);
         const fileName = canonicalFilename(name);
         if (!chatIndex[fileName]) continue;
-        const messages = await readChatMessages(fileName, { signal });
+        const messages = await readChatMessages(fileName, { signal, evictBodies: false });
         assertBodyReadCurrent(sessionId, avatar, signal);
         yield { entry: chatIndex[fileName], messages };
     }
@@ -1494,14 +1445,14 @@ export async function updateActiveChat(fileName) {
         const cached = chatIndex[fileName];
         const messages = parseMessages(chatData, fileName, cached.bodyResident !== false ? cached.messages : null);
         activeBodyFile = fileName;
-        const firstTimestamp = messages.length > 0 ? messages[0].timestamp : null;
+        const descriptors = descriptorsFor(messages);
         const lastTimestamp = messages.length > 0 ? messages[messages.length - 1].timestamp : null;
         const parsedLastModified = timestampMs(lastTimestamp) ?? NaN;
         const hasValidLastModified = Number.isFinite(parsedLastModified);
-        const effectiveLastTs = lastTimestamp || cached.lastMessageTimestamp;
 
         const mainChat = mainChatFromData(chatData, context.chatMetadata);
-        if (cached.isLoaded && !cached.needsHydration && (cached.mainChat || null) === mainChat && messagesEqual(cached.messages, messages)) {
+        const summary = summarizeChat(messages, descriptors, mainChat);
+        if (cached.isLoaded && !cached.needsHydration && (cached.mainChat || null) === mainChat && sameContent(cached, summary, messages)) {
             if (cached.bodyResident === false) {
                 cached.messages = messages;
                 rememberResidentBody(cached);
@@ -1513,23 +1464,19 @@ export async function updateActiveChat(fileName) {
             return false;
         }
 
+        const previous = await withPreviousMessages(cached);
+        if (updateSession !== hydrationSessionId || chatIndex[fileName] !== cached) return false;
         const updated = {
-            ...cached,
-            messageCount: messages.length,
+            ...withSummary(cached, summary),
             messages,
-            firstMessageTimestamp: firstTimestamp,
-            lastMessageTimestamp: effectiveLastTs,
-            firstTimestampMs: normalizeTimestamp(firstTimestamp),
-            lastTimestampMs: normalizeTimestamp(effectiveLastTs),
             lastModified: hasValidLastModified ? parsedLastModified : cached.lastModified,
             sortTimestamp: hasValidLastModified ? parsedLastModified : cached.sortTimestamp,
             branchPoint: null,
             isLoaded: true,
             needsHydration: false,
             validatedAt: Date.now(),
-            mainChat,
-            messageEmbeddings: retainMessageEmbeddings(cached, messages),
-            cachedMessageEmbeddingKeys: retainCachedEmbeddingKeys(cached, messages),
+            messageEmbeddings: retainMessageEmbeddings(previous, messages),
+            cachedMessageEmbeddingKeys: retainCachedEmbeddingKeys(previous, messages),
         };
         if (getRepresentativeEmbeddingText(cached) !== getRepresentativeEmbeddingText(updated)) {
             updated.chatEmbedding = null;
@@ -1543,7 +1490,8 @@ export async function updateActiveChat(fileName) {
         bumpIndexVersion();
 
         if (currentCharacterAvatar) {
-            await putCachedChat(currentCharacterAvatar, fileName, updated);
+            // The host holds this body and the server file follows its save.
+            await putCachedChat(currentCharacterAvatar, fileName, updated, { descriptorsPayload: encodeDescriptors(descriptors) });
         }
         if (updateSession !== hydrationSessionId || chatIndex[fileName] !== updated) return false;
         trimBodyCache();
@@ -1558,38 +1506,52 @@ export async function updateActiveChat(fileName) {
     }
 }
 
-/**
- * Run branch detection on the current index. Designed to be called deferred (via setTimeout).
- * @param {string} activeFilename - The currently active chat filename
- */
-export function runDeferredBranchDetection(activeFilename) {
-    detectBranches(chatIndex, activeFilename);
+// Comparisons repeat on every render, so results outlive one detection run. They
+// hold only numbers, keyed by the content of both chats.
+let branchMemo = { baseKey: null, results: new Map() };
+
+function isBranchMemoHit(hit, entry) {
+    return !!hit && !!entry?.contentHash && entry.isLoaded && !entry.needsHydration && hit.token === entry.contentHash;
 }
 
 /**
- * Detect branch points by comparing each chat against the active chat.
- * @param {Object} index - The chat index to analyze
+ * Find where related chats diverge from the active chat, reading only the chats
+ * that have not been compared yet. Designed to be called deferred.
  * @param {string} activeFilename - The currently active chat filename
+ * @param {{ fileNames?: string[]|null, signal?: AbortSignal }} [options]
+ *   fileNames limits the comparison to those chats, such as the rendered cards.
  */
-function detectBranches(index, activeFilename) {
-    // Reset all branch points (detection is relative to the active chat)
-    for (const entry of Object.values(index)) {
-        entry.branchPoint = null;
-    }
-
+export async function runDeferredBranchDetection(activeFilename, { fileNames = null, signal } = {}) {
+    const session = hydrationSessionId;
+    const index = chatIndex;
     const activeEntry = activeFilename ? index[activeFilename] : null;
-    if (!activeEntry || !activeEntry.isLoaded || activeEntry.messages.length < 2) return;
-    const related = relatedThreadNames(index, activeFilename);
+    const count = activeEntry?.isLoaded ? (activeEntry.messageCount ?? activeEntry.messages?.length ?? 0) : 0;
+    const related = count >= 2 ? relatedThreadNames(index, activeFilename) : new Set();
+    related.delete(activeFilename);
 
-    for (const entry of Object.values(index)) {
-        if (entry.fileName === activeFilename) continue;
-        if (!entry.isLoaded || entry.messages.length < 2) continue;
-        if (!related.has(entry.fileName)) continue;
-
-        const branchPoint = computeRelatedBranchPoint(activeEntry.messages, entry.messages);
-        if (branchPoint !== null) {
-            entry.branchPoint = branchPoint;
+    const baseKey = activeEntry?.contentHash ? `${activeFilename}\u0000${activeEntry.contentHash}` : null;
+    if (branchMemo.baseKey !== baseKey) branchMemo = { baseKey, results: new Map() };
+    const wanted = fileNames ? new Set(fileNames) : null;
+    let base = null;
+    for (const name of related) {
+        if (wanted && !wanted.has(name)) continue;
+        if (session !== hydrationSessionId || signal?.aborted) return;
+        if (isBranchMemoHit(branchMemo.results.get(name), index[name])) continue;
+        try {
+            base ??= await readChatDescriptors(activeFilename, { signal });
+            const candidate = await readChatDescriptors(name, { signal });
+            if (session !== hydrationSessionId) return;
+            const branchPoint = base.length >= 2 && candidate.length >= 2 ? computeRelatedBranchPoint(base, candidate) : null;
+            branchMemo.results.set(name, { token: chatIndex[name]?.contentHash, branchPoint });
+        } catch (error) {
+            if (error?.name === 'AbortError') return;
+            console.warn(`[${MODULE_NAME}] Branch comparison failed for ${name}:`, error);
         }
+    }
+    if (session !== hydrationSessionId || index !== chatIndex || signal?.aborted) return;
+    for (const entry of Object.values(chatIndex)) {
+        const hit = related.has(entry.fileName) ? branchMemo.results.get(entry.fileName) : null;
+        entry.branchPoint = isBranchMemoHit(hit, entry) ? hit.branchPoint : null;
     }
 }
 
@@ -1640,86 +1602,43 @@ function computeRelatedBranchPoint(baseMessages, candidateMessages) {
     return computeBranchPoint(baseMessages, candidateMessages);
 }
 
-function sortSiblingContextByRecency(siblings) {
-    siblings.sort((a, b) => {
-        const aLast = a.messages[a.messages.length - 1];
-        const bLast = b.messages[b.messages.length - 1];
-        const aTime = aLast?.timestamp ? normalizeTimestamp(aLast.timestamp) : 0;
-        const bTime = bLast?.timestamp ? normalizeTimestamp(bLast.timestamp) : 0;
-        return (Number.isFinite(bTime) ? bTime : 0) - (Number.isFinite(aTime) ? aTime : 0);
-    });
-}
-
 /**
- * Get sibling branch context for the active chat.
- * Returns post-divergence messages from sibling branches (chats that share a common prefix
- * with the active chat but diverge at some point).
- * @param {string} activeFilename - The currently active chat filename
- * @param {number} [maxBranches=3] - Maximum number of sibling branches to return
- * @returns {Array<{ fileName: string, branchPoint: number, messages: IndexMessage[] }>}
- */
-export function getSiblingBranchContext(activeFilename, maxBranches = 3) {
-    if (!activeFilename) return [];
-
-    const siblings = [];
-
-    for (const entry of Object.values(chatIndex)) {
-        if (entry.fileName === activeFilename) continue;
-        if (!entry.isLoaded || entry.branchPoint === null) continue;
-
-        // Collect all messages after the branch point
-        const postBranchMessages = entry.messages.slice(entry.branchPoint);
-        if (postBranchMessages.length === 0) continue;
-
-        siblings.push({
-            fileName: entry.fileName,
-            branchPoint: entry.branchPoint,
-            messages: postBranchMessages,
-        });
-    }
-
-    // Sort by most recent activity (newest first), then cap
-    sortSiblingContextByRecency(siblings);
-
-    return siblings.slice(0, maxBranches);
-}
-
-/**
- * Get sibling branch context relative to an arbitrary base thread.
- * Unlike active-chat branch detection, this helper never mutates global entry.branchPoint values.
+ * Get sibling branch context relative to any thread. Host provenance selects the
+ * candidates and only as many are read as it takes, newest first. This never
+ * changes the branch points shown for the active chat.
  * @param {string} baseFilename - Filename of the thread being summarized
  * @param {number} [maxBranches=3] - Maximum number of sibling branches to return
- * @returns {Array<{ fileName: string, branchPoint: number, messages: IndexMessage[] }>}
+ * @param {{ signal?: AbortSignal }} [options]
+ * @returns {Promise<Array<{ fileName: string, branchPoint: number, messages: Array }>>}
+ *   messages hold compact records from the branch point on, never complete text.
  */
-export function getSiblingBranchContextForThread(baseFilename, maxBranches = 3) {
-    if (!baseFilename) return [];
+export async function getSiblingBranchContextForThread(baseFilename, maxBranches = 3, { signal } = {}) {
+    if (!baseFilename || !chatIndex[baseFilename]) return [];
+    const related = relatedThreadNames(chatIndex, baseFilename);
+    related.delete(baseFilename);
+    if (!related.size || maxBranches <= 0) return [];
 
-    const baseEntry = chatIndex[baseFilename];
-    if (!baseEntry || !baseEntry.isLoaded || baseEntry.messages.length < 2) return [];
+    const candidates = [...related].map(name => chatIndex[name]).filter(Boolean)
+        .sort((a, b) => (b.lastTimestampMs || 0) - (a.lastTimestampMs || 0));
+    const base = await readChatDescriptors(baseFilename, { signal });
+    if (base.length < 2) return [];
 
     const siblings = [];
-    const related = relatedThreadNames(chatIndex, baseFilename);
-
-    for (const entry of Object.values(chatIndex)) {
-        if (entry.fileName === baseFilename) continue;
-        if (!entry.isLoaded || entry.messages.length < 2) continue;
-        if (!related.has(entry.fileName)) continue;
-
-        const branchPoint = computeRelatedBranchPoint(baseEntry.messages, entry.messages);
-        if (branchPoint === null) continue;
-
-        const postBranchMessages = entry.messages.slice(branchPoint);
-        if (postBranchMessages.length === 0) continue;
-
-        siblings.push({
-            fileName: entry.fileName,
-            branchPoint,
-            messages: postBranchMessages,
-        });
+    for (const { fileName } of candidates) {
+        let messages;
+        try {
+            messages = await readChatDescriptors(fileName, { signal });
+        } catch (error) {
+            if (error?.name === 'AbortError') throw error;
+            continue; // One unreadable relative must not hide the others.
+        }
+        if (messages.length < 2) continue;
+        const branchPoint = computeRelatedBranchPoint(base, messages);
+        if (branchPoint === null || messages.length <= branchPoint) continue;
+        siblings.push({ fileName, branchPoint, messages: messages.slice(branchPoint) });
+        if (siblings.length >= maxBranches) break;
     }
-
-    sortSiblingContextByRecency(siblings);
-    return siblings.slice(0, maxBranches);
+    return siblings;
 }
 
 /** Host provenance defines families; shared greetings alone never authorize injection. */
@@ -1734,8 +1653,12 @@ function relatedThreadNames(index, baseFilename) {
     };
     for (const entry of Object.values(index)) {
         connect(entry.fileName, canonicalFilename(entry.mainChat));
-        for (const message of entry.messages || []) {
-            for (const branch of message.branches || []) connect(entry.fileName, canonicalFilename(branch));
+        if (Array.isArray(entry.branchTargets)) {
+            for (const branch of entry.branchTargets) connect(entry.fileName, canonicalFilename(branch));
+        } else {
+            for (const message of entry.messages || []) {
+                for (const branch of message.branches || []) connect(entry.fileName, canonicalFilename(branch));
+            }
         }
     }
     const related = new Set([baseFilename]);

@@ -11,7 +11,7 @@
 
 import { timestampMs } from './timestamps.js';
 import { buildIcicleData, reLayoutSubtree, sharesActiveThread, clearIcicleSemanticCache } from './icicle-data.js';
-import { getIndex, getMessageEmbedding, iterateChatBodies } from './chat-reader.js';
+import { getIndex, getMessageEmbedding, iterateChatBodies, readChatDescriptors } from './chat-reader.js';
 import { isVector } from './vector-utils.js';
 import { iterateCachedMessageVectors, iterateCachedChatVectors } from './archive-data.js';
 import { getDisplayName, getEmbeddingSettings, setEmbeddingSettings } from './metadata-store.js';
@@ -299,6 +299,7 @@ export async function mountIcicle(containerEl, mode) {
         data = await buildIcicleData(chatIndex, activeChatFile, {
             threadFocus: threadFocusActive, colorMode, embeddingRevision, signal: controller.signal,
             iterateChatVectors: typeof iterateCachedChatVectors === 'function' ? iterateCachedChatVectors : null,
+            readDescriptors: typeof readChatDescriptors === 'function' ? readChatDescriptors : null,
         });
     } catch (error) {
         if (generation !== lifecycleGeneration || container !== containerEl) return;
@@ -551,6 +552,7 @@ export async function updateIcicleData({ resetView = false } = {}) {
             threadFocus: buildThreadFocus,
             colorMode, embeddingRevision, signal: controller.signal,
             iterateChatVectors: typeof iterateCachedChatVectors === 'function' ? iterateCachedChatVectors : null,
+            readDescriptors: typeof readChatDescriptors === 'function' ? readChatDescriptors : null,
             previousRoot: shouldResetView ? null : icicleRoot,
         });
     } catch (err) {
@@ -1139,11 +1141,12 @@ function getTopicDriftForChat(chatFile, chatIndex) {
     if (!chatFile || !chatIndex) return null;
 
     const entry = chatIndex[chatFile];
-    if (!entry?.isLoaded || !Array.isArray(entry.messages) || entry.messages.length < 2) return null;
+    const messageCount = entry?.messages?.length || entry?.messageCount || 0;
+    if (!entry?.isLoaded || messageCount < 2) return null;
 
     const embeddingSettings = getEmbeddingSettings();
     const cacheSignature = [
-        entry.messages.length,
+        messageCount,
         entry.lastMessageTimestamp || '',
         entry.messageEmbeddings?.size || 0,
         entry.messageEmbeddingVersion || 0,
@@ -2698,8 +2701,7 @@ function tryApplyPendingFocus() {
     const node = findNodeForTarget(filename, msgIndex);
     if (!node) {
         const entry = getIndex()[filename];
-        const loadedTarget = entry?.isLoaded && Array.isArray(entry.messages)
-            && msgIndex < entry.messages.length;
+        const loadedTarget = entry?.isLoaded && msgIndex < (entry.messages?.length || entry.messageCount || 0);
         if (loadedTarget) {
             // An explicit result jump must be able to reveal a loaded target
             // outside the current thread or explored subtree. Keep the request

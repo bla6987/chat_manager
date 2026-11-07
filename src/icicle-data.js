@@ -26,7 +26,8 @@
 
 import { computePcaBasisAsync, projectVectorToPca } from './semantic-engine.js';
 import { isVector } from './vector-utils.js';
-import { normalizedMessageFingerprint, messagePreview as truncateMessagePreview } from './message-descriptors.js';
+import { messagePreview as truncateMessagePreview } from './message-descriptors.js';
+import { messageKey } from './chat-index-data.js';
 
 const PREVIEW_CHARS = 160;
 const vectorIds = new WeakMap();
@@ -42,10 +43,6 @@ export function clearIcicleSemanticCache() {
 
 function messagePreview(message) {
     return truncateMessagePreview(message.preview ?? message.text ?? '', PREVIEW_CHARS);
-}
-
-function messageKey(message) {
-    return `${message.role}:${normalizedMessageFingerprint(message)}`;
 }
 
 /**
@@ -70,16 +67,17 @@ function filterToThread(loadedEntries, activeChatFile) {
         || sharesActiveThread(entry, activeEntry));
 }
 
+function openingKeysOf(entry) {
+    if (entry?.messages?.length >= 2) return entry.messages.slice(0, 2).map(messageKey);
+    return entry?.openingKeys?.length >= 2 ? entry.openingKeys : null;
+}
+
 /** Whether the current-thread filter includes an entry alongside the active chat. */
 export function sharesActiveThread(entry, activeEntry) {
-    if (!activeEntry?.isLoaded || !activeEntry.messages || activeEntry.messages.length < 2) return true;
-    if (!entry?.messages || entry.messages.length < 2) return false;
-    for (let i = 0; i < 2; i++) {
-        const message = entry.messages[i];
-        const active = activeEntry.messages[i];
-        if (messageKey(message) !== messageKey(active)) return false;
-    }
-    return true;
+    const active = activeEntry?.isLoaded ? openingKeysOf(activeEntry) : null;
+    if (!active) return true;
+    const own = openingKeysOf(entry);
+    return !!own && own[0] === active[0] && own[1] === active[1];
 }
 
 /**
@@ -87,13 +85,16 @@ export function sharesActiveThread(entry, activeEntry) {
  *
  * @param {Object} chatIndex - keyed by fileName
  * @param {string|null} activeChatFile
- * @param {{ threadFocus?: boolean, previousRoot?: TrieNode|null, colorMode?: string, embeddingRevision?: number, signal?: AbortSignal, iterateChatVectors?: Function }} [options]
+ * @param {{ threadFocus?: boolean, previousRoot?: TrieNode|null, colorMode?: string, embeddingRevision?: number, signal?: AbortSignal, iterateChatVectors?: Function, readDescriptors?: Function }} [options]
+ *   readDescriptors supplies the per-message records of a chat without a resident
+ *   body, one chat at a time, so the tree is the only thing retained.
  * @returns {{ root: TrieNode, flatNodes: Array, maxDepth: number, loadedCount: number, pcaRanges: { x: [number, number], y: [number, number], z: [number, number] }|null }}
  */
 export async function buildIcicleData(chatIndex, activeChatFile, options = {}) {
     const loadedEntries = [];
     for (const [fileName, entry] of Object.entries(chatIndex)) {
-        if (entry.isLoaded && entry.messages && entry.messages.length > 0) {
+        const hasMessages = entry.messages?.length > 0 || (options.readDescriptors && entry.messageCount > 0);
+        if (entry.isLoaded && hasMessages) {
             loadedEntries.push({ fileName, entry });
         }
     }
@@ -114,10 +115,21 @@ export async function buildIcicleData(chatIndex, activeChatFile, options = {}) {
     let maxDepth = 0;
 
     for (const { fileName, entry } of entries) {
+        let messages = entry.messages;
+        if (!messages?.length) {
+            if (options.signal?.aborted) throw options.signal.reason || new Error('Icicle build cancelled');
+            try {
+                messages = await options.readDescriptors(fileName, { signal: options.signal });
+            } catch (error) {
+                if (error?.name === 'AbortError') throw error;
+                console.warn(`[chat_manager] Graph skipped ${fileName}:`, error);
+                continue;
+            }
+        }
         let current = root;
 
-        for (let i = 0; i < entry.messages.length; i++) {
-            const msg = entry.messages[i];
+        for (let i = 0; i < messages.length; i++) {
+            const msg = messages[i];
             // Full-text fingerprints preserve topology after bodies are evicted;
             // previews are only display text and never decide branch identity.
             const compositeKey = messageKey(msg);

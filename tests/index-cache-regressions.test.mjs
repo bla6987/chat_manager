@@ -1,38 +1,12 @@
 import test, { afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 
-const records = new Map();
-const metadataRecords = new Map();
-let requestedVersion;
-let upgraded = false;
-let writes = 0;
-globalThis.indexedDB = { open(_name, version) {
-    requestedVersion = version;
-    const request = {};
-    queueMicrotask(() => {
-        const database = {
-            objectStoreNames: { contains: () => storeExists },
-            deleteObjectStore() { records.clear(); storeExists = false; upgraded = true; },
-            createObjectStore() { storeExists = true; return { createIndex() {} }; },
-            close() {},
-            transaction() {
-                const tx = { objectStore(name) { const data = name === 'chatMetadata' ? metadataRecords : records; return {
-                    get(key) { const req = {}; queueMicrotask(() => { req.result = structuredClone(data.get(key)); req.onsuccess?.(); }); return req; },
-                    put(record) { data.set(record.key, structuredClone(record)); writes++; },
-                    delete(key) { data.delete(key); },
-                }; } };
-                setImmediate(() => tx.oncomplete?.());
-                return tx;
-            },
-        };
-        let storeExists = true;
-        if (!upgraded) request.onupgradeneeded?.({ oldVersion: 1, target: { result: database } });
-        request.onsuccess?.({ target: { result: database } });
-    });
-    return request;
-} };
+import { installFakeIndexedDB } from './helpers/fake-indexeddb.mjs';
+
+const fake = installFakeIndexedDB({ schedule: setImmediate });
 const reader = await import('../src/chat-reader.js');
 const cache = await import('../src/cache-store.js');
+const { decodeDescriptors } = await import('../src/chat-index-data.js');
 const date = '2026-10-14T12:00:00Z';
 const raw = (mes, extra = {}) => ({ mes, is_user: false, send_date: date, ...extra });
 let context;
@@ -41,7 +15,7 @@ let bodies;
 let failures;
 let contentRequests;
 function setup(names = ['a.jsonl']) {
-    reader.clearIndex(); records.clear(); metadataRecords.clear(); writes = 0; contentRequests = 0;
+    reader.clearIndex(); fake.reset(); contentRequests = 0;
     context = { characterId: 0, characters: [{ avatar: 'test.png', name: 'Test' }], chat: [], chatMetadata: {},
         extensionSettings: {}, saveSettingsDebounced() {}, getRequestHeaders: () => ({}) };
     rows = names.map(file_name => ({ file_name, last_mes: date, chat_items: 2, file_size: '100 B' }));
@@ -58,15 +32,6 @@ function setup(names = ['a.jsonl']) {
 }
 afterEach(async () => { reader.clearIndex(); await new Promise(resolve => setImmediate(resolve)); });
 
-test('cache upgrade and format guard discard records containing legacy message IDs', async () => {
-    setup();
-    records.set('test.png:old.jsonl', { messages: [{ index: 1 }] });
-    assert.equal((await cache.getCachedChatsForCharacter('test.png', ['old.jsonl'])).size, 0);
-    assert.equal(requestedVersion, 3); assert.equal(upgraded, true);
-    records.set('test.png:old.jsonl', { cacheFormatVersion: 1, messages: [{ index: 1 }] });
-    assert.equal((await cache.getCachedChatsForCharacter('test.png', ['old.jsonl'])).size, 0);
-});
-
 test('disk and live parsing keep host IDs, ancestry and swipe content consistent', async () => {
     setup();
     bodies.set('a.jsonl', [{ chat_metadata: { main_chat: 'parent' } }, raw('greeting', { extra: { branches: ['child'] } }), raw('answer')]);
@@ -78,17 +43,17 @@ test('disk and live parsing keep host IDs, ancestry and swipe content consistent
     context.chat = bodies.get('a.jsonl').slice(1); context.chatMetadata = { main_chat: 'parent' };
     assert.equal(await reader.updateActiveChat('a.jsonl'), false);
     assert.equal(reader.getIndex()['a.jsonl'], entry);
-    await new Promise(resolve => setImmediate(resolve));
-    assert.equal(records.get('test.png:a.jsonl').cacheFormatVersion, 2);
-    assert.equal(records.get('test.png:a.jsonl').mainChat, 'parent.jsonl');
-    assert.deepEqual(records.get('test.png:a.jsonl').messages[0].branches, ['child.jsonl']);
+    await cache.flushPendingCacheWrites();
+    assert.equal(fake.store('chatSummaries').get('test.png:a.jsonl').mainChat, 'parent.jsonl');
+    assert.deepEqual(fake.store('chatSummaries').get('test.png:a.jsonl').branchTargets, ['child.jsonl']);
+    assert.deepEqual(decodeDescriptors(fake.store('chatDescriptors').get('test.png:a.jsonl').payload, 'a.jsonl')[0].branches, ['child.jsonl']);
 });
 
 test('failed cold hydration stays retryable; successful empty content is loaded', async () => {
     setup(); failures.add('a.jsonl'); await reader.buildIndex();
     assert.equal(await reader.loadEntryNow('a.jsonl'), false);
     assert.equal(reader.getIndex()['a.jsonl'].isLoaded, false);
-    assert.equal(writes, 0);
+    assert.equal(fake.writeTransactions, 0);
     failures.clear(); bodies.set('a.jsonl', []);
     assert.equal(await reader.loadEntryNow('a.jsonl'), true);
     assert.equal(reader.getIndex()['a.jsonl'].messageCount, 0);
@@ -114,7 +79,7 @@ test('successful empty archive invalidates search results and releases cached bo
     reader.getSearchableMessages(); const version = reader.getIndexVersion();
     rows = []; await reader.buildIndex();
     assert.ok(reader.getIndexVersion() > version); assert.deepEqual(reader.getSearchableMessages(), []);
-    await new Promise(resolve => setImmediate(resolve)); assert.equal(records.size, 0);
+    await cache.flushPendingCacheWrites(); assert.equal(fake.store('chatSummaries').size, 0); assert.equal(fake.store('chatDescriptors').size, 0);
 });
 
 test('same-length earlier edits revalidate explicitly and when dirty, never by elapsed time', async () => {
@@ -135,12 +100,11 @@ test('same-length earlier edits revalidate explicitly and when dirty, never by e
 
 test('warm cached restoration reconciles queue membership with linear work', async () => {
     const count = 1000; setup(Array.from({ length: count }, (_, i) => `${i}.jsonl`));
-    for (const row of rows) records.set(`\u0000catalog:test.png:${row.file_name}`, {
-        cacheFormatVersion: 2, fileName: row.file_name, lastModified: Date.parse(date),
-        validatedAt: 1, serverSignature: JSON.stringify(['100 B', 2]),
-        bodyResident: false, localEditsTracked: true,
-        messages: [{ filename: row.file_name, index: 0, role: 'assistant', text: '', isDescriptor: true }], messageCount: 1,
-    });
+    await reader.getIndex(); await cache.flushPendingCacheWrites();
+    await cache.putCachedChats('test.png', rows.map(row => ({ fileName: row.file_name, entry: {
+        lastModified: Date.parse(date), validatedAt: 1, serverSignature: JSON.stringify(['100 B', 2]), messageCount: 2,
+    } })));
+    await cache.flushPendingCacheWrites();
     let visits = 0;
     const filter = Array.prototype.filter;
     Array.prototype.filter = function (callback, thisArg) {
@@ -160,14 +124,14 @@ test('prompt sibling context requires host provenance and compares message roles
     bodies.get('cousin.jsonl')[0].chat_metadata.main_chat = 'a';
     await reader.buildIndex();
     await Promise.all(rows.map(row => reader.loadEntryNow(row.file_name)));
-    assert.deepEqual(reader.getSiblingBranchContextForThread('a.jsonl').map(e => e.fileName).sort(), ['child.jsonl', 'cousin.jsonl']);
-    assert.deepEqual(reader.getSiblingBranchContextForThread('independent.jsonl'), []);
+    assert.deepEqual((await reader.getSiblingBranchContextForThread('a.jsonl')).map(e => e.fileName).sort(), ['child.jsonl', 'cousin.jsonl']);
+    assert.deepEqual(await reader.getSiblingBranchContextForThread('independent.jsonl'), []);
     bodies.get('child.jsonl')[1].mes = 'alternate first greeting';
     reader.markChatDirty('child.jsonl'); await reader.loadEntryNow('child.jsonl');
-    assert.equal(reader.getSiblingBranchContextForThread('a.jsonl').find(e => e.fileName === 'child.jsonl').branchPoint, 0);
+    assert.equal((await reader.getSiblingBranchContextForThread('a.jsonl')).find(e => e.fileName === 'child.jsonl').branchPoint, 0);
     bodies.get('independent.jsonl')[1].extra = { branches: ['a'] };
     reader.markChatDirty('independent.jsonl'); await reader.loadEntryNow('independent.jsonl');
-    assert.ok(reader.getSiblingBranchContextForThread('a.jsonl').some(e => e.fileName === 'independent.jsonl'));
+    assert.ok((await reader.getSiblingBranchContextForThread('a.jsonl')).some(e => e.fileName === 'independent.jsonl'));
     const messages = [{ text: 'hello', role: 'assistant' }, { text: 'same', role: 'user' }];
     assert.equal(reader.computeBranchPoint(messages, [messages[0], { text: 'same', role: 'assistant' }]), 1);
     assert.equal(reader.computeBranchPoint(messages, [{ text: 'hello', role: 'user' }, messages[1]]), null);
@@ -212,7 +176,7 @@ test('a blocked legacy-cache upgrade falls back instead of hanging hydration', a
     globalThis.indexedDB = { open() { const request = {}; queueMicrotask(() => request.onblocked?.()); return request; } };
     try {
         const isolatedCache = await import('../src/cache-store.js?blocked-upgrade');
-        assert.equal((await isolatedCache.getCachedChatsForCharacter('test.png', ['a.jsonl'])).size, 0);
+        assert.equal((await isolatedCache.getCachedSummaries('test.png')).size, 0);
     } finally { globalThis.indexedDB = indexedDB; }
 });
 

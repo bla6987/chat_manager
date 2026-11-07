@@ -1,60 +1,9 @@
 import test, { afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 
-const records = new Map();
-const metadataRecords = new Map();
-let storageUnavailable = false;
-let holdWrites = false;
-let releaseWrite = null;
-let writeTransactions = 0;
-let activeWrites = 0;
-let peakWrites = 0;
-let bodyPuts = 0;
-globalThis.indexedDB = { open() {
-    const request = {};
-    queueMicrotask(() => {
-        const database = {
-            objectStoreNames: { contains: () => true }, close() {},
-            transaction(_name, mode) {
-                if (storageUnavailable) throw new Error('Storage blocked');
-                const tx = {};
-                let pending = 0;
-                let completionScheduled = false;
-                if (mode === 'readwrite') { writeTransactions++; peakWrites = Math.max(peakWrites, ++activeWrites); }
-                const scheduleComplete = () => {
-                    if (completionScheduled || pending) return;
-                    completionScheduled = true;
-                    const complete = () => {
-                        if (mode === 'readwrite') activeWrites--;
-                        tx.oncomplete?.();
-                    };
-                    if (mode === 'readwrite' && holdWrites) releaseWrite = complete;
-                    else queueMicrotask(complete);
-                };
-                tx.objectStore = storeName => ({
-                    get(key) {
-                        const req = {}; pending++;
-                        queueMicrotask(() => {
-                            req.result = structuredClone((storeName === 'chatMetadata' ? metadataRecords : records).get(key)); req.onsuccess?.();
-                            pending--; scheduleComplete();
-                        });
-                        return req;
-                    },
-                    put(record) {
-                        (storeName === 'chatMetadata' ? metadataRecords : records).set(record.key, structuredClone(record));
-                        if (storeName !== 'chatMetadata' && !record.key.startsWith('\u0000catalog:')) bodyPuts++;
-                    },
-                    delete(key) { (storeName === 'chatMetadata' ? metadataRecords : records).delete(key); },
-                });
-                queueMicrotask(scheduleComplete);
-                return tx;
-            },
-        };
-        request.onsuccess?.({ target: { result: database } });
-    });
-    return request;
-} };
+import { installFakeIndexedDB } from './helpers/fake-indexeddb.mjs';
 
+const fake = installFakeIndexedDB();
 const reader = await import('../src/chat-reader.js');
 const cache = await import('../src/cache-store.js');
 const { messageFingerprint, normalizedMessageFingerprint, sameMessageContent, createMessageDescriptor } = await import('../src/message-descriptors.js');
@@ -74,8 +23,7 @@ async function until(predicate) {
 }
 
 async function setup(count = 4) {
-    reader.clearIndex(); await cache.flushPendingCacheWrites(); records.clear(); metadataRecords.clear();
-    storageUnavailable = false; holdWrites = false; contentReads = 0;
+    reader.clearIndex(); await cache.flushPendingCacheWrites(); fake.reset(); contentReads = 0;
     reader.setBodyCacheBudget(30_000); reader.setVectorCacheBudget(reader.DEFAULT_VECTOR_CACHE_BYTES);
     context = {
         characterId: 0, characters: [{ avatar: 'memory.png', name: 'Memory' }],
@@ -96,27 +44,32 @@ async function setup(count = 4) {
 }
 
 afterEach(async () => {
-    holdWrites = false; releaseWrite?.(); releaseWrite = null;
+    fake.holdWrites = false; fake.release();
     reader.clearIndex(); await cache.flushPendingCacheWrites();
     reader.setBodyCacheBudget(reader.DEFAULT_BODY_CACHE_BYTES);
     reader.setVectorCacheBudget(reader.DEFAULT_VECTOR_CACHE_BYTES);
-    storageUnavailable = false;
+    cache.setBodyStoreBudget(cache.DEFAULT_BODY_STORE_BYTES);
+    fake.unavailable = false;
 });
 
-test('archive indexing bounds resident bodies and full iteration preserves every swipe', async () => {
+test('background indexing keeps only summaries and full iteration preserves every swipe', async () => {
     await setup(8); await reader.buildIndex(); await until(() => reader.isHydrationComplete());
     const stats = reader.getBodyCacheStats();
-    assert.ok(stats.residentBytes <= stats.budgetBytes);
-    assert.ok(stats.residentChats < 8);
+    assert.equal(stats.residentChats, 0, 'nothing asked for a body');
     assert.equal(Object.keys(reader.getIndex()).length, 8);
-    const evicted = Object.values(reader.getIndex()).filter(entry => !entry.bodyResident);
-    assert.ok(evicted.length > 0);
-    for (const entry of evicted) {
+    for (const entry of Object.values(reader.getIndex())) {
         assert.equal(entry.isLoaded, true, 'indexed completion does not depend on residency');
-        assert.ok(entry.messages.every(message => message.isDescriptor && message.text === '' && !message.swipes));
-        assert.equal(entry.messages[1].swipeCount, 3);
-        assert.ok(entry.messages[1].preview.length <= 160);
+        assert.deepEqual(entry.messages, []);
+        assert.equal(entry.bodyResident, false);
+        assert.equal(entry.messageCount, 2);
+        assert.equal(entry.userMessageCount, 0);
+        assert.ok(entry.lastMessagePreview.length <= 240);
+        const stored = await reader.readChatDescriptors(entry.fileName);
+        assert.ok(stored.every(message => message.isDescriptor && message.text === '' && !message.swipes));
+        assert.equal(stored[1].swipeCount, 3);
+        assert.ok(stored[1].preview.length <= 160);
     }
+    assert.equal(fake.store('chatBodies').size, 0, 'background indexing stores no complete text');
     let chats = 0, variants = 0;
     for await (const { entry, messages } of reader.iterateChatBodies()) {
         assert.equal(messages[1].text, bodies.get(entry.fileName)[2].mes);
@@ -124,13 +77,27 @@ test('archive indexing bounds resident bodies and full iteration preserves every
         chats++; variants += messages[1].swipes.length;
     }
     assert.equal(chats, 8); assert.equal(variants, 24);
-    assert.ok(reader.getBodyCacheStats().residentBytes <= stats.budgetBytes);
+    assert.equal(reader.getBodyCacheStats().residentBytes, 0, 'cold reads stay ephemeral');
 });
 
-test('cold catalog restore reads small descriptors and full body is loaded only on demand', async () => {
+test('foreground reads stay within the resident body budget', async () => {
+    await setup(8); await reader.buildIndex();
+    for (const row of rows) await reader.loadEntryNow(row.file_name);
+    const stats = reader.getBodyCacheStats();
+    assert.ok(stats.residentBytes <= stats.budgetBytes);
+    assert.ok(stats.residentChats < 8);
+    for (const entry of Object.values(reader.getIndex()).filter(item => !item.bodyResident)) {
+        assert.deepEqual(entry.messages, [], 'an evicted body leaves no per-message records behind');
+    }
+});
+
+test('a restore reads one record per character and full bodies only on demand', async () => {
     await setup(3); await reader.buildIndex(); await until(() => reader.isHydrationComplete());
     await cache.flushPendingCacheWrites(); reader.clearIndex(); contentReads = 0;
+    const reads = [];
+    fake.onRead = (store, key) => reads.push([store, key]);
     await reader.buildIndex();
+    assert.deepEqual(reads, [['chatSummaries', 'memory.png']]);
     assert.equal(reader.isHydrationComplete(), true);
     assert.equal(reader.getBodyCacheStats().residentChats, 0);
     assert.equal(contentReads, 0);
@@ -138,13 +105,25 @@ test('cold catalog restore reads small descriptors and full body is loaded only 
     const entry = reader.getIndex()['chat0.jsonl'];
     const messages = await reader.readChatMessages('chat0.jsonl');
     assert.equal(messages[1].text, bodies.get('chat0.jsonl')[2].mes);
+    assert.equal(contentReads, 1, 'an unstored body comes from the server');
     assert.equal(reader.getIndex()['chat0.jsonl'], entry);
     assert.equal(reader.getIndexVersion(), version, 'read-only residency does not change the search revision');
     assert.equal(entry.bodyResident, false);
+    await reader.readChatMessages('chat0.jsonl');
+    assert.equal(contentReads, 1, 'the second read comes from the stored copy');
+});
+
+test('stored descriptors match freshly computed ones after a restore', async () => {
+    await setup(2); await reader.buildIndex(); await reader.loadEntryNow('chat0.jsonl');
+    const fresh = reader.getIndex()['chat0.jsonl'].messageDescriptors.map(item => ({ ...item, branches: [...item.branches] }));
+    await cache.flushPendingCacheWrites(); reader.clearIndex(); contentReads = 0;
+    await reader.buildIndex();
+    assert.deepEqual(await reader.readChatDescriptors('chat0.jsonl'), fresh);
+    assert.equal(contentReads, 0);
 });
 
 test('blocked IndexedDB still permits eviction and complete authoritative reads', async () => {
-    await setup(4); storageUnavailable = true; reader.setBodyCacheBudget(0);
+    await setup(4); fake.unavailable = true; reader.setBodyCacheBudget(0);
     await reader.buildIndex(); await until(() => reader.isHydrationComplete());
     assert.equal(reader.getBodyCacheStats().residentBytes, 0);
     let count = 0;
@@ -178,7 +157,7 @@ test('an archive iterator rejects a character change and explicit cancellation',
 });
 
 test('a newer live edit wins over an older ephemeral server read', async () => {
-    await setup(1); reader.setBodyCacheBudget(0); storageUnavailable = true;
+    await setup(1); reader.setBodyCacheBudget(0); fake.unavailable = true;
     await reader.buildIndex(); await until(() => reader.isHydrationComplete());
     const originalFetch = globalThis.fetch;
     let release, started;
@@ -225,22 +204,22 @@ test('compact fingerprints preserve exact/normalized distinctions and branch com
 
 test('coalesced cache writes keep the latest body and allow only one transaction in flight', async () => {
     await setup(); await cache.flushPendingCacheWrites();
-    bodyPuts = 0; writeTransactions = 0; activeWrites = 0; peakWrites = 0;
-    const entry = text => ({ messages: [{ index: 0, role: 'assistant', text, swipes: [text], swipeId: 0 }], messageCount: 1 });
-    const first = cache.putCachedChat('memory.png', 'coalesce.jsonl', entry('old'));
-    const second = cache.putCachedChat('memory.png', 'coalesce.jsonl', entry('new'));
-    await Promise.all([first, second]);
-    assert.equal(bodyPuts, 1); assert.equal(writeTransactions, 1);
-    assert.equal((await cache.getCachedChat('memory.png', 'coalesce.jsonl')).messages[0].text, 'new');
-    holdWrites = true;
-    const held = cache.putCachedChat('memory.png', 'coalesce.jsonl', entry('held'));
-    await until(() => releaseWrite !== null);
-    const pending = cache.putCachedChat('memory.png', 'coalesce.jsonl', entry('latest'));
-    assert.equal(activeWrites, 1);
-    holdWrites = false; releaseWrite(); releaseWrite = null;
+    fake.puts = new Map(); fake.writeTransactions = 0; fake.activeWrites = 0; fake.peakWrites = 0;
+    const entry = { messageCount: 1, bodyBytes: 100 };
+    const body = text => [{ index: 0, role: 'assistant', text, swipes: [text], swipeId: 0 }];
+    const write = text => cache.putCachedChat('memory.png', 'coalesce.jsonl', entry, { body: body(text) });
+    await Promise.all([write('old'), write('new')]);
+    assert.equal(fake.puts.get('chatBodies'), 1); assert.equal(fake.writeTransactions, 1);
+    assert.equal((await cache.getCachedBody('memory.png', 'coalesce.jsonl')).messages[0].text, 'new');
+    fake.holdWrites = true;
+    const held = write('held');
+    await until(() => fake.held.length > 0);
+    const pending = write('latest');
+    assert.equal(fake.activeWrites, 1);
+    fake.holdWrites = false; fake.release();
     await Promise.all([held, pending]);
-    assert.equal(peakWrites, 1);
-    assert.equal((await cache.getCachedChat('memory.png', 'coalesce.jsonl')).messages[0].text, 'latest');
+    assert.equal(fake.peakWrites, 1);
+    assert.equal((await cache.getCachedBody('memory.png', 'coalesce.jsonl')).messages[0].text, 'latest');
 });
 
 test('message and chat vectors share a hard byte budget while disk-key metadata survives eviction', async () => {
