@@ -1582,6 +1582,7 @@ export function toggleTimeline() {
         // Initialize thread focus from persisted preference
         setIcicleThreadFocus(getThreadFocus());
 
+        clearThreadListState();
         requestFullHydration();
 
         // Show loading state immediately so the browser can paint before heavy work
@@ -1653,6 +1654,7 @@ export function toggleStats() {
         });
 
         // Mount stats view
+        clearThreadListState();
         if (content) {
             content.innerHTML = '';
             mountStatsView(content);
@@ -1930,10 +1932,17 @@ function scheduleHydrationUIRefresh() {
 
     refreshFromHydrationTimer = setTimeout(() => {
         refreshFromHydrationTimer = null;
-        if (!panelOpen) return;
+        // A view may have opened since this was scheduled. It owns the content now.
+        if (!panelOpen || isAnyViewActive()) return;
 
         const query = getCurrentSearchQuery();
         if (query.length >= 2) return;
+
+        // Sorting and filtering by content ran before that content arrived.
+        if (isHydrationIdle() && viewNeedsFullIndex() && getIndexVersion() !== threadListRenderVersion) {
+            renderThreadCards(threadLists.get(_getContent())?.visibleCount || RESULTS_PAGE_SIZE);
+            return;
+        }
 
         patchCardData();
 
@@ -2015,6 +2024,9 @@ function scheduleTimelineRefresh() {
         if (isIcicleMounted()) {
             const started = Date.now();
             void Promise.resolve(updateIcicleData()).finally(() => { timelineRefreshCost = Date.now() - started; });
+        } else {
+            // The first build is still reading chats, and it will miss any indexed now.
+            scheduleTimelineRefresh();
         }
     }, Math.max(600, timelineRefreshCost * 5));
 }
@@ -2119,6 +2131,7 @@ async function refreshAfterPanelPaint(root, requestId) {
 
 let chatVerificationInProgress = false;
 let timelineRefreshCost = 0;
+let threadListRenderVersion = -1;
 
 /** Re-read every chat from the server. Only this can reveal a remote same-size edit. */
 export async function verifyAllChats() {
@@ -2449,10 +2462,11 @@ export async function refreshPanel(options = {}) {
 
 function onIndexProgress(completed, total) {
     const status = document.getElementById('chat-manager-status');
-    if (!status || getCurrentSearchQuery().length >= 2) return;
+    // Stats and the timeline index too, and their content must not gain list controls.
+    if (!status || isAnyViewActive() || getCurrentSearchQuery().length >= 2) return;
     const state = threadLists.get(_getContent());
     if (state) updateThreadListFooter(state);
-    else status.textContent = `Indexing chats... ${completed}/${total}`;
+    else if (!isHydrationIdle()) status.textContent = `Indexing chats... ${completed}/${total}`;
 }
 
 /**
@@ -2604,6 +2618,7 @@ export function renderThreadCards(visibleCount = RESULTS_PAGE_SIZE) {
     const totalCount = Object.keys(index).length;
 
     syncIndexDemand();
+    threadListRenderVersion = getIndexVersion();
 
     // Use filter/sort state
     const filterState = getFilterState();

@@ -140,3 +140,24 @@ test('no narrowing without a query or a character', async () => {
     context.characterId = undefined;
     assert.equal(await reader.findChatsMatchingKeyword('lantern'), null);
 });
+
+test('verifying chats invalidates a scan that could be reused', async () => {
+    await setup();
+    await reader.findChatsMatchingKeyword('drag');
+    bodies.set('c.jsonl', ['a dragon here', 'at all']);
+    await reader.buildIndex(null, null, { forceRevalidate: true });
+    while (reader.isBuilding()) await new Promise(resolve => setTimeout(resolve, 2));
+    assert.ok((await reader.findChatsMatchingKeyword('dragon')).includes('c.jsonl'));
+    assert.equal(searches.length, 2);
+});
+
+test('a read that finds changed text invalidates a scan that could be reused', async () => {
+    await setup();
+    await reader.loadEntryNow('c.jsonl');
+    reader.trimBodyCache({ keepActive: false, targetBytes: 0 });
+    await reader.findChatsMatchingKeyword('drag');
+    bodies.set('c.jsonl', ['a dragon here', 'at all']);
+    await reader.readChatMessages('c.jsonl');
+    assert.ok((await reader.findChatsMatchingKeyword('dragon')).includes('c.jsonl'));
+    assert.equal(searches.length, 2);
+});

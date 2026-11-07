@@ -49,12 +49,17 @@ test('disk and live parsing keep host IDs, ancestry and swipe content consistent
     assert.deepEqual(decodeDescriptors(fake.store('chatDescriptors').get('test.png:a.jsonl').payload, 'a.jsonl')[0].branches, ['child.jsonl']);
 });
 
-test('failed cold hydration stays retryable; successful empty content is loaded', async () => {
+test('failed cold hydration stays retryable; content the list calls empty is loaded', async () => {
     setup(); failures.add('a.jsonl'); await reader.buildIndex();
     assert.equal(await reader.loadEntryNow('a.jsonl'), false);
     assert.equal(reader.getIndex()['a.jsonl'].isLoaded, false);
     assert.equal(fake.writeTransactions, 0);
     failures.clear(); bodies.set('a.jsonl', []);
+    const warn = console.warn; console.warn = () => {};
+    try { assert.equal(await reader.loadEntryNow('a.jsonl'), false, 'the list counted messages, so this read missed the file'); } finally { console.warn = warn; }
+    assert.equal(reader.getIndex()['a.jsonl'].isLoaded, false);
+    rows[0].chat_items = 0;
+    await reader.buildIndex(null, null, { backgroundHydration: false });
     assert.equal(await reader.loadEntryNow('a.jsonl'), true);
     assert.equal(reader.getIndex()['a.jsonl'].messageCount, 0);
 });

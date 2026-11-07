@@ -56,7 +56,8 @@ loses nothing:
 
 Upgrading from the earlier stores deletes them. Nothing is re-downloaded until it
 is needed. Writes for the same file coalesce, and one write transaction runs at a
-time. A single chat's read may displace the least recently used stored bodies. An
+time. Removals, summaries and bodies commit separately, because a removal is the
+only lasting record of a local edit and a body is the write most likely to fail. A single chat's read may displace the least recently used stored bodies. An
 archive scan only fills free space, because evicting during a scan larger than the
 budget would rewrite everything and leave nothing useful. Cache failures fall back
 to the original chat files. Failed revalidation preserves previously known data but
@@ -101,6 +102,11 @@ An indexed chat stays valid while its summary matches the host's chat list:
 formatted file size, message count, and last message date. Age alone never expires
 a record. A chat needs reading again only when its list metadata differs, it has no
 cached record, or the user chooses **Verify chats**.
+
+The server answers a request for a missing file with an empty chat, and the host
+selects a new character before announcing it. So nothing is read or saved while the
+host is on another character, and an empty answer for a chat the list counted is not
+saved. Otherwise the chat would show as empty until it next changed.
 
 An edit in the host deletes that chat's cached records, even if the panel has never
 opened, so the next use re-reads it. The chat open in the host reads from the host's

@@ -370,7 +370,7 @@ test('verify control recovers its button when the re-read throws', async () => {
 });
 
 test('index progress restores the thread footer instead of a finished indexing count', () => {
-    const { sandbox, nodes } = setup();
+    const { sandbox, nodes } = setup({ isHydrationIdle: () => false });
     vm.runInContext("getCurrentSearchQuery = () => '';", sandbox);
     const status = nodes.get('chat-manager-status');
     sandbox.onIndexProgress(4, 10);
@@ -382,6 +382,66 @@ test('index progress restores the thread footer instead of a finished indexing c
     vm.runInContext("threadLists.set(document.getElementById('chat-manager-content'), { entries: [] });", sandbox);
     sandbox.onIndexProgress(10, 10);
     assert.equal(footers, 1);
+});
+
+test('index progress does not add list controls to a chart that is also indexing', () => {
+    const { sandbox, nodes } = setup({ isHydrationIdle: () => false });
+    const status = nodes.get('chat-manager-status');
+    status.textContent = 'Stats dashboard';
+    let footers = 0;
+    vm.runInContext("getCurrentSearchQuery = () => ''; statsActive = true; updateThreadListFooter = () => { globalThis.footerUpdated(); }; threadLists.set(document.getElementById('chat-manager-content'), { entries: [] });", Object.assign(sandbox, { footerUpdated: () => footers++ }));
+    sandbox.onIndexProgress(4, 10);
+    assert.equal(footers, 0);
+    assert.equal(status.textContent, 'Stats dashboard');
+});
+
+test('idle indexing leaves a list with no rows showing no running count', () => {
+    const { sandbox, nodes } = setup({ isHydrationIdle: () => true });
+    const status = nodes.get('chat-manager-status');
+    status.textContent = 'Showing 0 of 10 threads';
+    vm.runInContext("getCurrentSearchQuery = () => '';", sandbox);
+    sandbox.onIndexProgress(4, 10);
+    assert.equal(status.textContent, 'Showing 0 of 10 threads');
+});
+
+test('content-based order is recomputed once indexing settles, and only when something changed', () => {
+    let version = 2;
+    const rendered = [], patched = [];
+    const { sandbox, timers } = setup({ isHydrationIdle: () => true, getIndexVersion: () => version });
+    vm.runInContext("panelOpen = true; threadListRenderVersion = 1; getCurrentSearchQuery = () => ''; viewNeedsFullIndex = () => true; scheduleBranchDetection = () => {}; renderThreadCards = count => { threadListRenderVersion = getIndexVersion(); globalThis.rendered.push(count); }; patchCardData = () => globalThis.patched.push(true);", Object.assign(sandbox, { rendered, patched }));
+    sandbox.scheduleHydrationUIRefresh(); timers.at(-1)();
+    assert.deepEqual(rendered, [50]); assert.equal(patched.length, 0);
+    sandbox.scheduleHydrationUIRefresh(); timers.at(-1)();
+    assert.deepEqual(rendered, [50], 'a chat that keeps failing to index cannot cause a render loop');
+    assert.equal(patched.length, 1);
+    version = 3;
+    sandbox.scheduleHydrationUIRefresh(); timers.at(-1)();
+    assert.equal(rendered.length, 2);
+});
+
+test('a list refresh scheduled before a chart opened leaves the chart alone', () => {
+    const rendered = [], patched = [];
+    const { sandbox, timers } = setup({ isHydrationIdle: () => true, getIndexVersion: () => 2 });
+    vm.runInContext("panelOpen = true; threadListRenderVersion = 1; getCurrentSearchQuery = () => ''; renderThreadCards = () => globalThis.rendered.push(true); patchCardData = () => globalThis.patched.push(true);", Object.assign(sandbox, { rendered, patched }));
+    sandbox.scheduleHydrationUIRefresh();
+    vm.runInContext('statsActive = true;', sandbox);
+    timers.at(-1)();
+    assert.deepEqual(rendered, []);
+    assert.deepEqual(patched, []);
+});
+
+test('a timeline still building picks up chats indexed meanwhile', () => {
+    let mounted = false; const updates = [];
+    const { sandbox, timers } = setup({ isIcicleMounted: () => mounted, updateIcicleData: async () => { updates.push(true); } });
+    vm.runInContext('panelOpen = true; timelineActive = true;', sandbox);
+    sandbox.scheduleTimelineRefresh();
+    const before = timers.length;
+    timers.at(-1)();
+    assert.equal(updates.length, 0);
+    assert.equal(timers.length, before + 1, 'the refresh waits for the build instead of being dropped');
+    mounted = true;
+    timers.at(-1)();
+    assert.equal(updates.length, 1);
 });
 
 test('fresh alternate work drains after a cleared in-flight flush and its already-fired timer', async () => {

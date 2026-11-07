@@ -209,7 +209,9 @@ test('coalesced cache writes keep the latest body and allow only one transaction
     const body = text => [{ index: 0, role: 'assistant', text, swipes: [text], swipeId: 0 }];
     const write = text => cache.putCachedChat('memory.png', 'coalesce.jsonl', entry, { body: body(text) });
     await Promise.all([write('old'), write('new')]);
-    assert.equal(fake.puts.get('chatBodies'), 1); assert.equal(fake.writeTransactions, 1);
+    assert.equal(fake.puts.get('chatBodies'), 1);
+    assert.equal(fake.puts.get('chatSummaries'), 1);
+    assert.equal(fake.writeTransactions, 2, 'one for the records and one for the body');
     assert.equal((await cache.getCachedBody('memory.png', 'coalesce.jsonl')).messages[0].text, 'new');
     fake.holdWrites = true;
     const held = write('held');

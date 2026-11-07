@@ -622,6 +622,17 @@ function metaSignature(meta) {
  * and remote ones wait for a forceRevalidate build.
  */
 
+/**
+ * The host selects a new character before announcing the change. Until then a read
+ * would ask for our filenames under that character, and the server answers a missing
+ * file with an empty chat, which must never be saved as this chat's content.
+ */
+function isHostOnIndexedCharacter() {
+    if (!currentCharacterAvatar) return true;
+    const context = SillyTavern.getContext();
+    return context.characters?.[context.characterId]?.avatar === currentCharacterAvatar;
+}
+
 /** The host's array is newer than the file while a debounced save is pending. */
 function liveChatContext(fileName) {
     const context = SillyTavern.getContext();
@@ -910,6 +921,7 @@ async function hydrateEntry(fileName, sessionId, { retainBody = true, storeBody 
             const entry = chatIndex[fileName];
             if (!entry) return false;
             if (entry.isLoaded && !entry.needsHydration) return true;
+            if (!isHostOnIndexedCharacter()) return false;
 
             const expectedTimestamp = entry.lastModified;
             const live = liveChatContext(fileName);
@@ -940,8 +952,17 @@ async function hydrateEntry(fileName, sessionId, { retainBody = true, storeBody 
 
             const previous = await withPreviousMessages(current);
             if (sessionId !== hydrationSessionId || chatIndex[fileName] !== current) continue;
+            if (!isHostOnIndexedCharacter()) return false;
 
             const { messages = null, summary } = indexed;
+            // The list counted messages, so an empty answer means the read missed the
+            // file. Saving it would show this chat as empty until it next changes.
+            if (!live && summary.messageCount === 0 && current.messageCount > 0) {
+                console.warn(`[${MODULE_NAME}] Ignoring an empty read of ${fileName}, listed with ${current.messageCount} messages`);
+                return false;
+            }
+            // A read that finds different text means earlier keyword scans are out of date.
+            if (current.contentHash && current.contentHash !== summary.contentHash) keywordSearchEpoch++;
             const descriptorsPayload = indexed.descriptorsPayload ?? encodeDescriptors(indexed.descriptors);
             // Without a body, embedding state follows the stored rows instead.
             const comparable = messages ?? (hasResidentEmbeddingState(current) ? decodeDescriptors(descriptorsPayload, fileName) : []);
@@ -1063,6 +1084,7 @@ export async function buildIndex(onProgress, onMetadataReady, options = {}) {
 
     indexBuildInProgress = true;
     backgroundHydrationRequested = requestsHydration;
+    if (options.forceRevalidate) keywordSearchEpoch++;
     const buildToken = ++nextBuildToken;
     activeBuildToken = buildToken;
     const context = SillyTavern.getContext();
@@ -1404,9 +1426,12 @@ export async function readChatMessages(fileName, { signal, evictBodies = true, r
     if (!current) throw new Error(`Chat was removed while reading: ${fileName}`);
     if (current !== entry) return readChatMessages(fileName, { signal, evictBodies, retainBody });
     const messages = parseMessages(raw, fileName);
+    // The file vanished after the list was read. Say so, but do not remember it as empty.
+    if (messages.length === 0 && entry.messageCount > 0) return messages;
     const descriptors = descriptorsFor(messages);
     const summary = summarizeChat(messages, descriptors, mainChatFromData(raw));
     if (!entry.isLoaded || !sameContent(entry, summary, messages)) {
+        keywordSearchEpoch++;
         const previous = await withPreviousMessages(entry);
         assertBodyReadCurrent(sessionId, avatar, signal);
         if (chatIndex[fileName] !== entry) return readChatMessages(fileName, { signal, evictBodies, retainBody });
@@ -1623,10 +1648,14 @@ export async function updateActiveChat(fileName) {
     const updateSession = hydrationSessionId;
 
     try {
+        if (!isHostOnIndexedCharacter()) return false;
         // Prefer in-memory chat data over HTTP fetch
         const context = SillyTavern.getContext();
         let chatData;
         if (Array.isArray(context.chat)) {
+            // The host empties this array while it opens another chat, under that
+            // chat's name. Nothing can be learned until its messages arrive.
+            if (context.chat.length === 0 && chatIndex[fileName].messageCount > 0) return false;
             chatData = context.chat;
         } else {
             chatData = await fetchChatContent(fileName);
@@ -1654,6 +1683,7 @@ export async function updateActiveChat(fileName) {
             return false;
         }
 
+        keywordSearchEpoch++;
         const previous = await withPreviousMessages(cached);
         if (updateSession !== hydrationSessionId || chatIndex[fileName] !== cached) return false;
         const updated = {
@@ -1699,6 +1729,7 @@ export async function updateActiveChat(fileName) {
 // Comparisons repeat on every render, so results outlive one detection run. They
 // hold only numbers, keyed by the content of both chats.
 let branchMemo = { baseKey: null, results: new Map() };
+let latestBranchRun = 0;
 
 function isBranchMemoHit(hit, entry) {
     return !!hit && !!entry?.contentHash && entry.isLoaded && !entry.needsHydration && hit.token === entry.contentHash;
@@ -1712,8 +1743,12 @@ function isBranchMemoHit(hit, entry) {
  *   fileNames limits the comparison to those chats, such as the rendered cards.
  */
 export async function runDeferredBranchDetection(activeFilename, { fileNames = null, signal } = {}) {
+    // A newer run compares against the chat open now. An older one must not leave
+    // results measured from a different base where that run would trust them.
+    const run = ++latestBranchRun;
     const session = hydrationSessionId;
     const index = chatIndex;
+    const stillLatest = () => run === latestBranchRun && session === hydrationSessionId && index === chatIndex && !signal?.aborted;
     const activeEntry = activeFilename ? index[activeFilename] : null;
     const count = activeEntry?.isLoaded ? (activeEntry.messageCount ?? activeEntry.messages?.length ?? 0) : 0;
     const related = count >= 2 ? relatedThreadNames(index, activeFilename) : new Set();
@@ -1721,26 +1756,27 @@ export async function runDeferredBranchDetection(activeFilename, { fileNames = n
 
     const baseKey = activeEntry?.contentHash ? `${activeFilename}\u0000${activeEntry.contentHash}` : null;
     if (branchMemo.baseKey !== baseKey) branchMemo = { baseKey, results: new Map() };
+    const memo = branchMemo;
     const wanted = fileNames ? new Set(fileNames) : null;
     let base = null;
     for (const name of related) {
         if (wanted && !wanted.has(name)) continue;
-        if (session !== hydrationSessionId || signal?.aborted) return;
-        if (isBranchMemoHit(branchMemo.results.get(name), index[name])) continue;
+        if (!stillLatest()) return;
+        if (isBranchMemoHit(memo.results.get(name), chatIndex[name])) continue;
         try {
             base ??= await readChatDescriptors(activeFilename, { signal });
             const candidate = await readChatDescriptors(name, { signal });
-            if (session !== hydrationSessionId) return;
+            if (!stillLatest()) return;
             const branchPoint = base.length >= 2 && candidate.length >= 2 ? computeRelatedBranchPoint(base, candidate) : null;
-            branchMemo.results.set(name, { token: chatIndex[name]?.contentHash, branchPoint });
+            memo.results.set(name, { token: chatIndex[name]?.contentHash, branchPoint });
         } catch (error) {
             if (error?.name === 'AbortError') return;
             console.warn(`[${MODULE_NAME}] Branch comparison failed for ${name}:`, error);
         }
     }
-    if (session !== hydrationSessionId || index !== chatIndex || signal?.aborted) return;
+    if (!stillLatest()) return;
     for (const entry of Object.values(chatIndex)) {
-        const hit = related.has(entry.fileName) ? branchMemo.results.get(entry.fileName) : null;
+        const hit = related.has(entry.fileName) ? memo.results.get(entry.fileName) : null;
         entry.branchPoint = isBranchMemoHit(hit, entry) ? hit.branchPoint : null;
     }
 }

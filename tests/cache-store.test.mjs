@@ -199,3 +199,64 @@ test('reading a body keeps it through eviction even before anything was written 
     await isolated.removeCachedChat('a.png', 'one.jsonl');
     await isolated.flushPendingCacheWrites();
 });
+
+const bodyScope = scope => scope.includes('chatBodies') && !scope.includes('chatSummaries');
+
+test('a failed body write cannot take a removal or a summary down with it', async () => {
+    await cache.putCachedChat('a.png', 'edited.jsonl', entry(), { descriptorsPayload: '[]' });
+    fake.abortWrites = bodyScope;
+    const results = await Promise.all([
+        cache.removeCachedChat('a.png', 'edited.jsonl'),
+        cache.putCachedChat('a.png', 'large.jsonl', entry(), { body: body('text') }),
+    ]);
+    fake.abortWrites = null;
+    assert.deepEqual(results, [true, true], 'a body is optional, so losing one is not a failed write');
+    assert.equal(fake.store('chatSummaries').has('a.png:edited.jsonl'), false, 'the edit stays recorded');
+    assert.equal(fake.store('chatDescriptors').has('a.png:edited.jsonl'), false);
+    assert.equal(fake.store('chatSummaries').has('a.png:large.jsonl'), true);
+    assert.equal(fake.store('chatBodies').has('a.png:large.jsonl'), false);
+});
+
+test('a removal that fails is retried until it commits', async () => {
+    await cache.putCachedChat('a.png', 'edited.jsonl', entry());
+    let attempts = 0;
+    fake.abortWrites = scope => scope.includes('chatSummaries') && scope.includes('chatBodies') && ++attempts < 3;
+    assert.equal(await cache.removeCachedChat('a.png', 'edited.jsonl'), true);
+    fake.abortWrites = null;
+    assert.equal(attempts, 3);
+    assert.equal(fake.store('chatSummaries').has('a.png:edited.jsonl'), false);
+});
+
+test('a removal that keeps failing gives up instead of spinning', async () => {
+    await cache.putCachedChat('a.png', 'stuck.jsonl', entry());
+    fake.abortWrites = scope => scope.includes('chatSummaries') && scope.includes('chatBodies');
+    assert.equal(await cache.removeCachedChat('a.png', 'stuck.jsonl'), false);
+    fake.abortWrites = null;
+});
+
+test('a body the browser refuses costs only that body', async () => {
+    fake.onPut = (name, record) => { if (name === 'chatBodies' && record.key.includes('huge')) throw new Error('value too large'); };
+    const warn = console.warn; console.warn = () => {};
+    try {
+        await cache.putCachedChats('a.png', [
+            { fileName: 'huge.jsonl', entry: entry(), body: body('huge') },
+            { fileName: 'fine.jsonl', entry: entry(), body: body('fine') },
+        ]);
+    } finally { console.warn = warn; fake.onPut = null; }
+    assert.equal(fake.store('chatSummaries').has('a.png:huge.jsonl'), true);
+    assert.equal(fake.store('chatBodies').has('a.png:huge.jsonl'), false);
+    assert.equal(fake.store('chatBodies').has('a.png:fine.jsonl'), true);
+    assert.equal(fake.store('chatBodyLedger').has('a.png:huge.jsonl'), false, 'no space is charged for it');
+    assert.equal(cache.getBodyStoreStats().storedBytes, 100);
+});
+
+test('the space ledger follows what actually committed', async () => {
+    await cache.putCachedChat('a.png', 'kept.jsonl', entry(), { body: body('kept') });
+    fake.abortWrites = bodyScope;
+    await cache.putCachedChat('a.png', 'lost.jsonl', entry(), { body: body('lost') });
+    fake.abortWrites = null;
+    await cache.putCachedChat('a.png', 'next.jsonl', entry(), { body: body('next') });
+    assert.equal(fake.store('chatBodies').has('a.png:lost.jsonl'), false);
+    assert.equal(cache.getBodyStoreStats().storedBytes, 200);
+    assert.equal(cache.getBodyStoreStats().storedChats, 2);
+});

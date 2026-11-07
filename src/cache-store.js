@@ -20,6 +20,7 @@ const BODY_STORE = 'chatBodies';
 const LEDGER_STORE = 'chatBodyLedger';
 const ALL_STORES = [SUMMARY_STORE, DESCRIPTOR_STORE, BODY_STORE, LEDGER_STORE];
 const WRITE_BATCH_SIZE = 50;
+const MAX_REMOVAL_ATTEMPTS = 3;
 
 /**
  * Logical bytes, shared by every character because storage is shared. Only reading
@@ -258,57 +259,109 @@ function admitBody(item, ledgerStore, bodyStore) {
         }
     }
     const usedAt = Date.now();
-    bodyStore.put(item.body);
+    try {
+        bodyStore.put(item.body);
+    } catch (error) {
+        // A browser's limit on one value throws here. Other chats are unaffected.
+        console.warn(`[chat_manager] Could not store ${item.key}:`, error);
+        return;
+    }
     ledgerStore.put({ key: item.key, bytes, usedAt });
     bodyLedger.set(item.key, { bytes, usedAt });
     bodyLedgerBytes += bytes;
 }
 
+function runWrite(database, stores, apply) {
+    return new Promise(resolve => {
+        let tx;
+        try {
+            tx = database.transaction(stores, 'readwrite');
+            tx.oncomplete = () => resolve(true);
+            tx.onerror = tx.onabort = () => resolve(false);
+            apply(tx);
+        } catch (error) {
+            console.warn('[chat_manager] A cache write failed:', error);
+            try { tx?.abort(); } catch { /* Already finished. */ }
+            resolve(false);
+        }
+    });
+}
+
+/** A browser's limit on one value can throw here. Only that record is lost. */
+function tryPut(store, record) {
+    try {
+        store.put(record);
+    } catch (error) {
+        console.warn(`[chat_manager] Could not store ${record.key}:`, error);
+    }
+}
+
+function writeRemovals(database, items) {
+    return runWrite(database, ALL_STORES, tx => {
+        const bodies = tx.objectStore(BODY_STORE);
+        const ledger = tx.objectStore(LEDGER_STORE);
+        for (const item of items) {
+            tx.objectStore(SUMMARY_STORE).delete(item.key);
+            tx.objectStore(DESCRIPTOR_STORE).delete(item.key);
+            forgetLedgerBody(item.key, ledger, bodies);
+            bodies.delete(item.key);
+        }
+    });
+}
+
+function writeRecords(database, items) {
+    return runWrite(database, [SUMMARY_STORE, DESCRIPTOR_STORE], tx => {
+        for (const item of items) {
+            if (item.summary) tryPut(tx.objectStore(SUMMARY_STORE), item.summary);
+            if (item.descriptors) tryPut(tx.objectStore(DESCRIPTOR_STORE), item.descriptors);
+        }
+    });
+}
+
+function writeBodies(database, items) {
+    return runWrite(database, [BODY_STORE, LEDGER_STORE], tx => {
+        const bodies = tx.objectStore(BODY_STORE);
+        const ledger = tx.objectStore(LEDGER_STORE);
+        // Recency must be current before admitting a body can evict anything.
+        for (const [key, usedAt] of touchedLedgerKeys) {
+            const known = bodyLedger.get(key);
+            if (!known) continue;
+            known.usedAt = usedAt;
+            ledger.put({ key, ...known });
+        }
+        touchedLedgerKeys.clear();
+        for (const item of items) admitBody(item, ledger, bodies);
+    });
+}
+
 async function flushWriteLoop() {
     while (pendingWrites.size) {
-        // A single transaction is outstanding at a time. Its completion provides
+        // One transaction is outstanding at a time. Its completion provides
         // backpressure to the indexer and prevents unlimited structured clones.
         const batch = [...pendingWrites.values()].slice(0, WRITE_BATCH_SIZE);
         for (const item of batch) pendingWrites.delete(item.key);
-        let committed = false;
+        const removals = batch.filter(item => item.remove);
+        const records = batch.filter(item => !item.remove && (item.summary || item.descriptors));
+        const bodies = batch.filter(item => !item.remove && item.body);
+        let removed = false, recorded = false, stored = false;
         try {
             const database = await openDB();
             await loadBodyLedger(database);
-            committed = await new Promise(resolve => {
-                const tx = database.transaction(ALL_STORES, 'readwrite');
-                const summaries = tx.objectStore(SUMMARY_STORE);
-                const descriptors = tx.objectStore(DESCRIPTOR_STORE);
-                const bodies = tx.objectStore(BODY_STORE);
-                const ledger = tx.objectStore(LEDGER_STORE);
-                // Recency must be current before admitting a body can evict anything.
-                for (const [key, usedAt] of touchedLedgerKeys) {
-                    const known = bodyLedger.get(key);
-                    if (known) known.usedAt = usedAt;
-                }
-                for (const item of batch) {
-                    if (item.remove) {
-                        summaries.delete(item.key);
-                        descriptors.delete(item.key);
-                        forgetLedgerBody(item.key, ledger, bodies);
-                        bodies.delete(item.key);
-                        continue;
-                    }
-                    if (item.summary) summaries.put(item.summary);
-                    if (item.descriptors) descriptors.put(item.descriptors);
-                    if (item.body) admitBody(item, ledger, bodies);
-                }
-                for (const [key, usedAt] of touchedLedgerKeys) {
-                    const known = bodyLedger.get(key);
-                    if (!known) continue;
-                    known.usedAt = usedAt;
-                    ledger.put({ key, ...known });
-                }
-                touchedLedgerKeys.clear();
-                tx.oncomplete = () => resolve(true);
-                tx.onerror = tx.onabort = () => resolve(false);
-            });
+            // A removal is the only lasting record of a local edit, and a body is the
+            // write most likely to fail. Neither may take the other down with it.
+            removed = !removals.length || await writeRemovals(database, removals);
+            recorded = !records.length || await writeRecords(database, records);
+            stored = !bodies.length || await writeBodies(database, bodies);
+            // The ledger changed ahead of a commit that did not happen. Read it again.
+            if (!removed || !stored) { bodyLedger = null; bodyLedgerBytes = 0; }
         } catch { /* A cache failure never changes the source chat files. */ }
         for (const item of batch) {
+            if (item.remove && !removed && !pendingWrites.has(item.key)
+                && (item.attempts = (item.attempts || 0) + 1) < MAX_REMOVAL_ATTEMPTS) {
+                pendingWrites.set(item.key, item);
+                continue;
+            }
+            const committed = item.remove ? removed : (item.summary || item.descriptors ? recorded : stored);
             for (const resolve of item.waiters) resolve(committed);
             item.body = item.summary = item.descriptors = null;
         }

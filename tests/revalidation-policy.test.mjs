@@ -419,3 +419,135 @@ test('sibling context stops reading once it has enough relatives', async () => {
     assert.deepEqual(siblings.map(item => item.fileName), ['three.jsonl'], 'newest first');
     assert.deepEqual(gets.toSorted(), ['main.jsonl', 'three.jsonl']);
 });
+
+/** Serve only what the selected character has, as the server does: a miss is an empty chat. */
+function serveByCharacter() {
+    const inner = globalThis.fetch;
+    globalThis.fetch = async (url, options) => {
+        const parsed = JSON.parse(options.body);
+        if (url === '/api/chats/get' && parsed.avatar_url !== 'alpha.png') {
+            gets.push(`${parsed.avatar_url}:${parsed.file_name}`);
+            return { ok: true, status: 200, json: async () => [] };
+        }
+        return inner(url, options);
+    };
+}
+
+test('switching character while indexing never saves a chat as empty', async () => {
+    setup(); serveByCharacter();
+    await reader.buildIndex(null, null, { backgroundHydration: false });
+    // The host has selected the next character but has not announced it yet.
+    context.characterId = 1;
+    reader.requestFullHydration();
+    await idle();
+    assert.deepEqual(gets, [], 'nothing is read for a character that is not selected');
+    assert.equal(fake.store('chatSummaries').size, 0);
+    assert.equal(reader.isEntryLoaded('a.jsonl'), false);
+
+    context.characterId = 0;
+    reader.clearIndex();
+    await buildAndSettle();
+    assert.equal(reader.getIndex()['a.jsonl'].messageCount, 2);
+    assert.equal(await text('a.jsonl'), 'a.jsonl text');
+});
+
+test('switching character mid-read discards the answer', async () => {
+    setup(); serveByCharacter();
+    await reader.buildIndex(null, null, { backgroundHydration: false });
+    let release;
+    const gate = new Promise(resolve => { release = resolve; });
+    const inner = globalThis.fetch;
+    globalThis.fetch = async (url, options) => { await gate; return inner(url, options); };
+    reader.requestHydration(['a.jsonl']);
+    await new Promise(resolve => setTimeout(resolve, 5));
+    context.characterId = 1;
+    release();
+    await idle();
+    assert.equal(fake.store('chatSummaries').size, 0, 'the old character gains nothing from this read');
+    assert.equal(reader.isEntryLoaded('a.jsonl'), false);
+});
+
+test('an empty answer for a chat the list counted is never remembered', async () => {
+    setup();
+    await reader.buildIndex(null, null, { backgroundHydration: false });
+    bodies.set('a.jsonl', []);
+    const warn = console.warn; console.warn = () => {};
+    try {
+        reader.requestHydration(['a.jsonl']);
+        await idle();
+    } finally { console.warn = warn; }
+    assert.equal(reader.isEntryLoaded('a.jsonl'), false);
+    assert.equal(fake.store('chatSummaries').has('alpha.png:a.jsonl'), false);
+    assert.equal(reader.getIndex()['a.jsonl'].messageCount, 2, 'the card keeps what the list said');
+});
+
+test('an empty answer on reading an indexed chat changes nothing', async () => {
+    setup(); await buildAndSettle();
+    const held = reader.getIndex()['a.jsonl'];
+    bodies.set('a.jsonl', []);
+    assert.deepEqual(await reader.readChatMessages('a.jsonl'), []);
+    await cache.flushPendingCacheWrites();
+    assert.equal(reader.getIndex()['a.jsonl'], held);
+    assert.equal(fake.store('chatSummaries').get('alpha.png:a.jsonl').messageCount, 2);
+});
+
+test('opening another chat does not save the emptied host array as its content', async () => {
+    setup(); await buildAndSettle();
+    const held = reader.getIndex()['b.jsonl'];
+    // The host has cleared the array under the new name and is still fetching.
+    context.chatId = 'b'; context.chat = [];
+    assert.equal(await reader.updateActiveChat('b.jsonl'), false);
+    await cache.flushPendingCacheWrites();
+    assert.equal(reader.getIndex()['b.jsonl'], held);
+    assert.equal(fake.store('chatSummaries').get('alpha.png:b.jsonl').messageCount, 2);
+});
+
+test('a message event after the host selected another character updates nothing', async () => {
+    setup(); await buildAndSettle();
+    const held = reader.getIndex()['a.jsonl'];
+    context.characterId = 1; context.chatId = 'a'; context.chat = [raw('from the other character')];
+    assert.equal(await reader.updateActiveChat('a.jsonl'), false);
+    assert.equal(reader.getIndex()['a.jsonl'], held);
+});
+
+test('an older branch detection cannot leave results measured from another chat', async () => {
+    const turns = (prefix, shared, total) => Array.from({ length: total }, (_, i) => ({ ...raw(i < shared ? `shared ${i}` : `${prefix} ${i}`), is_user: i % 2 === 0 }));
+    setup(['m.jsonl', 'b1.jsonl', 'b2.jsonl', 'b3.jsonl']);
+    bodies.set('m.jsonl', [{ chat_metadata: {} }, ...turns('m', 100, 100)]);
+    for (const [name, prefix, shared, total] of [['b1.jsonl', 'x', 10, 30], ['b2.jsonl', 'y', 20, 40], ['b3.jsonl', 'z', 30, 50]]) {
+        bodies.set(name, [{ chat_metadata: { main_chat: 'm' } }, ...turns(prefix, shared, total)]);
+        rows.find(row => row.file_name === name).chat_metadata = { main_chat: 'm' };
+    }
+    context.chatId = 'm'; context.chat = bodies.get('m.jsonl').slice(1);
+    await reader.buildIndex(null, null, { backgroundHydration: false });
+
+    const gates = new Map();
+    const hold = name => { let open; gates.set(name, new Promise(resolve => { open = resolve; })); return () => { gates.delete(name); open(); }; };
+    const inner = globalThis.fetch;
+    globalThis.fetch = async (url, options) => {
+        const name = url === '/api/chats/get' ? `${JSON.parse(options.body).file_name}.jsonl` : null;
+        if (gates.has(name)) await gates.get(name);
+        return inner(url, options);
+    };
+    const tick = () => new Promise(resolve => setTimeout(resolve, 5));
+    const names = ['m.jsonl', 'b1.jsonl', 'b2.jsonl', 'b3.jsonl'];
+
+    const openB3 = hold('b3.jsonl');
+    const older = reader.runDeferredBranchDetection('m.jsonl', { fileNames: names });
+    await tick();
+    const openB2 = hold('b2.jsonl');
+    reader.markChatDirty('b2.jsonl');
+    context.chatId = 'b1'; context.chat = bodies.get('b1.jsonl').slice(1); context.chatMetadata = { main_chat: 'm' };
+    await reader.updateActiveChat('b1.jsonl');
+    const newer = reader.runDeferredBranchDetection('b1.jsonl', { fileNames: names });
+    await tick();
+    openB3();
+    await tick();
+    openB2();
+    await Promise.all([older, newer]);
+
+    const index = reader.getIndex();
+    assert.equal(index['b3.jsonl'].branchPoint, 10, 'measured from the chat open now');
+    assert.equal(index['b2.jsonl'].branchPoint, 10);
+    assert.equal(index['m.jsonl'].branchPoint, 10);
+});

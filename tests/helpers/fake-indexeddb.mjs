@@ -21,10 +21,12 @@ export function installFakeIndexedDB({ schedule = queueMicrotask } = {}) {
         peakWrites: 0,
         puts: new Map(),
         onRead: null,
+        onPut: null,
+        abortWrites: null,
         reset() {
             for (const store of this.stores.values()) store.clear();
             this.transactions = []; this.writeTransactions = 0; this.activeWrites = 0; this.peakWrites = 0;
-            this.puts = new Map(); this.onRead = null; this.unavailable = false; this.holdWrites = false; this.holdReads = false;
+            this.puts = new Map(); this.onRead = null; this.onPut = null; this.abortWrites = null; this.unavailable = false; this.holdWrites = false; this.holdReads = false;
             this.release();
         },
         release() {
@@ -58,8 +60,15 @@ export function installFakeIndexedDB({ schedule = queueMicrotask } = {}) {
             let pending = 0;
             let scheduled = false;
             const tx = {};
+            const aborts = mode === 'readwrite' && !!fake.abortWrites?.(scope);
+            const before = aborts ? new Map(scope.map(name => [name, new Map(fake.store(name))])) : null;
             const complete = () => {
                 if (mode === 'readwrite') fake.activeWrites--;
+                if (aborts) {
+                    for (const [name, data] of before) fake.stores.set(name, data);
+                    tx.onabort?.();
+                    return;
+                }
                 tx.oncomplete?.();
             };
             const settle = () => {
@@ -87,6 +96,7 @@ export function installFakeIndexedDB({ schedule = queueMicrotask } = {}) {
                     get(key) { fake.onRead?.(name, key); return request(() => data.get(key)); },
                     getAll() { return request(() => [...data.values()]); },
                     put(record) {
+                        fake.onPut?.(name, record);
                         data.set(record.key, structuredClone(record));
                         fake.puts.set(name, (fake.puts.get(name) || 0) + 1);
                     },
