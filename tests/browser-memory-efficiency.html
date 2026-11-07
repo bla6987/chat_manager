@@ -32,8 +32,11 @@ document.getElementById('run').onclick = async () => {
     const nativeFetch = window.fetch;
     let db, moduleURL, timer;
     try {
-        db = await open(dbName, 2, database => database.createObjectStore('chats', { keyPath: 'key' }));
-        await transaction(db, 'chats', 'readwrite', tx => tx.objectStore('chats').put({ key:'fixture:legacy', messages:[{text:'preserved legacy'}] }));
+        db = await open(dbName, 3, database => {
+            database.createObjectStore('chats', { keyPath: 'key' });
+            database.createObjectStore('chatMetadata', { keyPath: 'key' });
+        });
+        await transaction(db, 'chats', 'readwrite', tx => tx.objectStore('chats').put({ key:'fixture:legacy', messages:[{text:'old uncapped body'}] }));
         db.close();
         const original = await (await fetch('../src/cache-store.js')).text();
         const source = original.replace("const DB_NAME = 'chat_manager_cache';", `const DB_NAME = ${JSON.stringify(dbName)};`)
@@ -41,44 +44,37 @@ document.getElementById('run').onclick = async () => {
         assert(source !== original, 'cache fixture uses a unique isolated database');
         moduleURL = URL.createObjectURL(new Blob([source], {type:'text/javascript'}));
         const cache = await import(moduleURL);
-        let reads = 0;
-        IDBObjectStore.prototype.get = function(key) {
-            if (this.transaction.db.name === dbName && this.name === 'chats') reads++;
-            return nativeGet.call(this, key);
-        };
-        const valid = (_file, entry) => entry.lastModified === 1 && entry.serverSignature === 'current'
-            && Date.now() - entry.validatedAt >= 0 && Date.now() - entry.validatedAt < 60_000;
-        await cache.consumeCachedChatsForCharacter('fixture', ['legacy'], valid, batch => assert(batch.size === 0, 'metadata-less v2 records are not restored as fresh'));
-        assert(reads === 0, 'migration does not deserialize legacy bodies');
-        db = await open(dbName, 3);
-        assert(db.objectStoreNames.contains('chats') && db.objectStoreNames.contains('chatMetadata'), 'real IndexedDB upgrade preserves bodies and adds metadata');
-        let legacy;
-        await transaction(db, 'chats', 'readonly', tx => {
-            const request = tx.objectStore('chats').get('fixture:legacy');
-            request.onsuccess = () => { legacy = request.result; };
-        });
-        assert(legacy.messages[0].text === 'preserved legacy', 'v2 body survives the schema upgrade');
+        assert((await cache.getCachedSummaries('fixture')).size === 0, 'an upgraded database starts with no summaries');
+        db = await open(dbName, 4);
+        const stores = [...db.objectStoreNames].sort().join();
+        assert(stores === 'chatBodies,chatBodyLedger,chatDescriptors,chatSummaries', 'real IndexedDB upgrade replaces the old uncapped stores');
         const names = Array.from({length:121}, (_, i) => `fresh-${i}`);
-        await cache.putCachedChats('fixture', [...names, 'expired'].map(fileName => ({fileName, entry:{
-            lastModified:1, serverSignature:'current', validatedAt:Date.now() - (fileName === 'expired' ? 90_000 : 0),
-            messageCount:1, messages:[{text:fileName}],
-        }})));
-        await pause();
-        // This later readonly transaction also waits for the paired cache write.
-        let count;
-        await transaction(db, 'chatMetadata', 'readonly', tx => {
-            const request = tx.objectStore('chatMetadata').count(); request.onsuccess = () => { count = request.result; };
-        });
-        assert(count === 122, 'production cache write commits matching metadata in real IndexedDB');
-        reads = 0; let restored = 0; const sizes = [];
-        await cache.consumeCachedChatsForCharacter('fixture', [...names, 'expired'], valid, batch => {
-            sizes.push(batch.size); restored += batch.size;
-            assert([...batch].every(([name, entry]) => entry.messages[0].text === name), 'restored batch preserves message contents');
-        });
-        assert(reads === 121 && restored === 121, 'expired body is skipped before deserialization');
-        assert(JSON.stringify(sizes) === '[50,50,21]', 'real IndexedDB restoration consumes bounded batches');
-        await transaction(db, 'chats', 'readwrite', tx => tx.objectStore('chats').put({key:'fixture:fresh-0',cacheFormatVersion:2,lastModified:1,serverSignature:'current',validatedAt:0,messages:[]}));
-        await cache.consumeCachedChatsForCharacter('fixture', ['fresh-0'], valid, batch => assert(batch.size === 0, 'mismatched body and metadata revisions are rejected'));
+        const validity = { lastModified:1, serverSignature:'current', validatedAt:7, messageCount:1 };
+        await cache.putCachedChats('fixture', names.map(fileName => ({ fileName, entry:{ ...validity, lastMessagePreview:fileName }, descriptorsPayload:'[]' })));
+        await cache.putCachedChat('other', 'other.jsonl', validity);
+        await cache.flushPendingCacheWrites();
+        let summaries = 0;
+        const nativeGetAll = IDBIndex.prototype.getAll;
+        IDBIndex.prototype.getAll = function(...args) { if (this.objectStore.transaction.db.name === dbName) summaries++; return nativeGetAll.apply(this, args); };
+        const restored = await cache.getCachedSummaries('fixture');
+        IDBIndex.prototype.getAll = nativeGetAll;
+        assert(restored.size === 121 && summaries === 1, 'one real read restores a whole character');
+        assert([...restored].every(([name, record]) => record.lastMessagePreview === name && record.validatedAt === 7), 'summaries keep their contents');
+        assert(!restored.has('other.jsonl'), 'summaries are separated by character');
+        assert((await cache.getCachedDescriptors('fixture', 'fresh-3')).payload === '[]', 'per-message rows are stored separately');
+        const body = (fileName, bodyBytes, evictBodies = true) => cache.putCachedChat('fixture', fileName, { ...validity, bodyBytes }, { body:[{ text:fileName }], evictBodies });
+        const stored = async fileName => (await cache.getCachedBody('fixture', fileName))?.messages[0].text ?? null;
+        cache.setBodyStoreBudget(1000);
+        await body('a', 400); await body('b', 400);
+        await body('scan', 400, false);
+        assert(await stored('scan') === null, 'an archive scan does not evict stored bodies');
+        await new Promise(resolve => setTimeout(resolve, 5));
+        await stored('a');
+        await body('c', 400);
+        assert(await stored('c') === 'c' && await stored('a') === 'a' && await stored('b') === null, 'a single read evicts the least recently used body in real IndexedDB');
+        await cache.removeCachedChat('fixture', 'a');
+        assert(await stored('a') === null && cache.getBodyStoreStats().storedBytes === 400, 'removing a chat frees its stored space');
+        db.close();
 
         const small = Array.from({length:30}, (_, i) => [3, Math.sin(i), Math.cos(i * .3), i / 10]);
         const expected = pca3D(small), actual = await pca3DAsync(small);

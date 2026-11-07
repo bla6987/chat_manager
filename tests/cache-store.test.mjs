@@ -162,3 +162,40 @@ test('the worker entry point rejects a malformed response', () => {
     assert.equal(summary.messageCount, 1);
     assert.equal(decodeDescriptors(descriptorsPayload, 'f.jsonl')[0].preview, 'x');
 });
+
+test('same-turn writes to one chat keep every record they carry', async () => {
+    const full = cache.putCachedChat('a.png', 'merge.jsonl', entry({ messageCount: 3 }), { descriptorsPayload: '["rows"]' });
+    const bodyOnly = cache.putCachedBody('a.png', 'merge.jsonl', entry(), body('text'));
+    const summaryOnly = cache.putCachedChat('a.png', 'merge.jsonl', entry({ messageCount: 4 }));
+    await Promise.all([full, bodyOnly, summaryOnly]);
+    assert.equal(fake.store('chatSummaries').get('a.png:merge.jsonl').messageCount, 4);
+    assert.equal(fake.store('chatDescriptors').get('a.png:merge.jsonl').payload, '["rows"]');
+    assert.equal(fake.store('chatBodies').get('a.png:merge.jsonl').messages[0].text, 'text');
+});
+
+test('a removal in the same turn wins over an earlier write', async () => {
+    const write = cache.putCachedChat('a.png', 'gone.jsonl', entry(), { descriptorsPayload: '[]', body: body('text') });
+    const removal = cache.removeCachedChat('a.png', 'gone.jsonl');
+    await Promise.all([write, removal]);
+    assert.equal(fake.store('chatSummaries').has('a.png:gone.jsonl'), false);
+    assert.equal(fake.store('chatBodies').has('a.png:gone.jsonl'), false);
+});
+
+test('reading a body keeps it through eviction even before anything was written this session', async () => {
+    cache.setBodyStoreBudget(250);
+    await cache.putCachedChat('a.png', 'one.jsonl', entry(), { body: body('one') });
+    await cache.putCachedChat('a.png', 'two.jsonl', entry(), { body: body('two') });
+    fake.store('chatBodyLedger').get('a.png:one.jsonl').usedAt = 1;
+    fake.store('chatBodyLedger').get('a.png:two.jsonl').usedAt = 2;
+    const isolated = await import(`../src/cache-store.js?fresh-session=${Date.now()}`);
+    isolated.setBodyStoreBudget(250);
+    await isolated.getCachedBody('a.png', 'one.jsonl');
+    await isolated.putCachedChat('a.png', 'three.jsonl', entry(), { body: body('three') });
+    await isolated.flushPendingCacheWrites();
+    assert.equal(fake.store('chatBodies').has('a.png:one.jsonl'), true, 'the body just read survives');
+    assert.equal(fake.store('chatBodies').has('a.png:two.jsonl'), false);
+    assert.equal(fake.store('chatBodies').has('a.png:three.jsonl'), true);
+    await isolated.removeCachedChat('a.png', 'three.jsonl');
+    await isolated.removeCachedChat('a.png', 'one.jsonl');
+    await isolated.flushPendingCacheWrites();
+});

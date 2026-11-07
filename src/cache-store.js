@@ -21,8 +21,12 @@ const LEDGER_STORE = 'chatBodyLedger';
 const ALL_STORES = [SUMMARY_STORE, DESCRIPTOR_STORE, BODY_STORE, LEDGER_STORE];
 const WRITE_BATCH_SIZE = 50;
 
-/** Shared by every character, because storage is shared. */
-export const DEFAULT_BODY_STORE_BYTES = 64 * 1024 * 1024;
+/**
+ * Logical bytes, shared by every character because storage is shared. Only reading
+ * a chat's text stores it, so this fills only for people who search whole archives,
+ * and they gain most: IndexedDB returns a body several times faster than the server.
+ */
+export const DEFAULT_BODY_STORE_BYTES = 1024 * 1024 * 1024;
 let bodyStoreBudget = DEFAULT_BODY_STORE_BYTES;
 
 const pendingWrites = new Map();
@@ -31,7 +35,8 @@ let flushingWrites = null;
 /** key -> { bytes, usedAt }, loaded once and kept in step with each write. */
 let bodyLedger = null;
 let bodyLedgerBytes = 0;
-const touchedLedgerKeys = new Set();
+/** key -> time of the latest read, recorded with the next write. */
+const touchedLedgerKeys = new Map();
 
 /** @type {IDBDatabase|null} */
 let db = null;
@@ -155,11 +160,7 @@ export function getCachedDescriptors(avatar, fileName, { signal } = {}) {
 export async function getCachedBody(avatar, fileName, { signal } = {}) {
     const key = makeKey(avatar, fileName);
     const record = await readRecord(BODY_STORE, key, signal);
-    const known = record && bodyLedger?.get(key);
-    if (known) {
-        known.usedAt = Date.now();
-        touchedLedgerKeys.add(key);
-    }
+    if (record) touchedLedgerKeys.set(key, Date.now());
     return record;
 }
 
@@ -191,11 +192,15 @@ function queueWrite(key, operation) {
     return new Promise(resolve => {
         const previous = pendingWrites.get(key);
         operation.waiters = [...(previous?.waiters || []), resolve];
-        // A later chat update must not lose a body queued by the same chat's read.
-        if (previous && !operation.remove && !previous.remove && !operation.body) {
-            operation.body = previous.body;
-            operation.bodyBytes = previous.bodyBytes;
-            operation.evict = previous.evict;
+        // Writes to one chat carry different records. A later one replaces only its own.
+        if (previous && !operation.remove && !previous.remove) {
+            operation.summary ??= previous.summary;
+            operation.descriptors ??= previous.descriptors;
+            if (!operation.body) {
+                operation.body = previous.body;
+                operation.bodyBytes = previous.bodyBytes;
+                operation.evict = previous.evict;
+            }
         }
         pendingWrites.set(key, operation);
         scheduleFlush();
@@ -275,6 +280,11 @@ async function flushWriteLoop() {
                 const descriptors = tx.objectStore(DESCRIPTOR_STORE);
                 const bodies = tx.objectStore(BODY_STORE);
                 const ledger = tx.objectStore(LEDGER_STORE);
+                // Recency must be current before admitting a body can evict anything.
+                for (const [key, usedAt] of touchedLedgerKeys) {
+                    const known = bodyLedger.get(key);
+                    if (known) known.usedAt = usedAt;
+                }
                 for (const item of batch) {
                     if (item.remove) {
                         summaries.delete(item.key);
@@ -287,9 +297,11 @@ async function flushWriteLoop() {
                     if (item.descriptors) descriptors.put(item.descriptors);
                     if (item.body) admitBody(item, ledger, bodies);
                 }
-                for (const key of touchedLedgerKeys) {
+                for (const [key, usedAt] of touchedLedgerKeys) {
                     const known = bodyLedger.get(key);
-                    if (known) ledger.put({ key, ...known });
+                    if (!known) continue;
+                    known.usedAt = usedAt;
+                    ledger.put({ key, ...known });
                 }
                 touchedLedgerKeys.clear();
                 tx.oncomplete = () => resolve(true);

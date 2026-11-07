@@ -13,12 +13,21 @@ Runs the real entry point, templates and IndexedDB inside an iframe, so reloadin
 the iframe is a real page reload. Only the SillyTavern server and host are mocked,
 with synthetic chats. Serve from a test origin: this clears chat_manager_cache there.
 Keep the tab in front for meaningful timings: opening waits on animation frames,
-which browsers throttle to about one per second in background tabs.
+which browsers throttle heavily in background tabs.
 -->
 <script type="module">
 const isFrame = new URLSearchParams(location.search).has('frame');
 
 if (isFrame) {
+    // A hidden tab may barely fire animation frames, and opening the panel waits for
+    // them. Bound that wait so a run in the background finishes, more slowly.
+    const realRaf = window.requestAnimationFrame.bind(window);
+    window.requestAnimationFrame = callback => {
+        let ran = false;
+        const run = time => { if (!ran) { ran = true; callback(time); } };
+        setTimeout(() => run(performance.now()), 100);
+        return realRaf(run);
+    };
     const server = window.parent.fixtureServer;
     const realFetch = window.fetch.bind(window);
     window.fetch = async (url, options) => {
@@ -26,6 +35,12 @@ if (isFrame) {
         const template = path.match(/\/templates\/([\w.-]+)$/);
         if (template) return realFetch(`../templates/${template[1]}`);
         return server.handle(path, options);
+    };
+    // Count real worker use. The worker itself runs for real.
+    const RealWorker = window.Worker;
+    window.Worker = class extends RealWorker {
+        constructor(...args) { super(...args); server.workers.created++; }
+        postMessage(...args) { server.workers.posted++; return super.postMessage(...args); }
     };
     const listeners = new Map();
     const context = server.context({
@@ -43,12 +58,14 @@ if (isFrame) {
         moment: () => ({ isValid: () => true, format: () => 'Oct 16', fromNow: () => 'just now' }),
     } };
     window.reader = await import('../src/chat-reader.js');
+    window.cache = await import('../src/cache-store.js');
     await import('../index.js');
     window.hostContext = context;
     window.fixtureReady = true;
 } else {
     const CHATS = Number(new URLSearchParams(location.search).get('chats')) || 300;
-    const MESSAGES = 40, WORDS = 150;
+    const MESSAGES = 40, WORDS = 150, PAGE = 50;
+    const ACTIVE = `chat-${CHATS - 10}`, NEXT_ACTIVE = `chat-${CHATS - 11}`, CHANGED = `chat-${CHATS - 20}`, REMOTE = `chat-${CHATS - 21}`, RARE = 'chat-7';
     const results = document.getElementById('results');
     const frame = document.getElementById('frame');
     const assert = (value, label) => { if (!value) throw Error(label); results.textContent += `PASS ${label}\n`; };
@@ -71,9 +88,10 @@ if (isFrame) {
         chats.set(`chat-${chat}`, [{ user_name: 'User', character_name: 'Mira', chat_metadata: {} },
             ...Array.from({ length: MESSAGES }, (_, index) => message(chat, index))]);
     }
+    chats.get(RARE)[6].mes += ' zephyrine';
     const server = window.fixtureServer = {
-        gets: [], lists: 0, toasts: [], settings: {}, activeChat: 'chat-0',
-        sizes: new Map(),
+        gets: [], lists: 0, searches: [], toasts: [], settings: {}, activeChat: ACTIVE,
+        sizes: new Map(), workers: { created: 0, posted: 0 },
         context(extra) {
             return {
                 characterId: 0, characters: [{ avatar: 'fixture.png', name: 'Mira' }], name1: 'User', name2: 'Mira',
@@ -90,6 +108,13 @@ if (isFrame) {
                     chat_items: rows.length - 1, mes: rows.at(-1).mes, last_mes: rows.at(-1).send_date,
                 })));
             }
+            if (path === '/api/chats/search') {
+                const { query } = JSON.parse(options.body);
+                this.searches.push(query);
+                const words = query.trim().toLowerCase().split(/\s+/);
+                return Response.json([...chats].filter(([, rows]) => words.every(word => rows.some(row => String(row.mes || '').toLowerCase().includes(word))))
+                    .map(([id]) => ({ file_name: id })));
+            }
             if (path === '/api/chats/get') {
                 const id = JSON.parse(options.body).file_name;
                 this.gets.push(id);
@@ -100,7 +125,9 @@ if (isFrame) {
     };
     const win = () => frame.contentWindow;
     const doc = () => frame.contentDocument;
-    const clearCounts = () => { server.gets = []; server.lists = 0; server.toasts = []; };
+    const clearCounts = () => { server.gets = []; server.lists = 0; server.searches = []; server.toasts = []; };
+    const loadedModules = () => win().performance.getEntriesByType('resource').map(entry => entry.name.split('/').pop());
+    const cachedWrites = async () => { await win().cache.flushPendingCacheWrites(); };
     async function reload() {
         const loaded = new Promise(resolve => frame.addEventListener('load', resolve, { once: true }));
         frame.src = `browser-open-reuse.html?frame=${Date.now()}`;
@@ -118,7 +145,6 @@ if (isFrame) {
         await until(() => doc().querySelector('.chat-manager-card'), 'cards rendered');
         const cards = performance.now() - start;
         await settled();
-        await until(() => indexingCards() === 0 || server.gets.length === 0, 'cards patched', 5000);
         const ready = performance.now() - start;
         note(`${label}: cards in ${Math.round(cards)} ms, fully indexed in ${Math.round(ready)} ms, ${server.gets.length} chats downloaded`);
         return { cards, ready };
@@ -128,6 +154,7 @@ if (isFrame) {
         await until(() => !doc().querySelector('.chat-manager-panel.open'), 'panel closed');
     }
     const bodyText = async name => (await win().reader.readChatMessages(name)).find(item => item.index === 3).text;
+    const idle = () => until(() => win().reader.isHydrationIdle() && !win().reader.isBuilding(), 'indexing idle');
     async function editOnServer(id, transform) {
         chats.get(id)[4].mes = transform(chats.get(id)[4].mes);
     }
@@ -140,51 +167,122 @@ if (isFrame) {
             await new Promise(resolve => { const request = indexedDB.deleteDatabase('chat_manager_cache'); request.onsuccess = request.onerror = request.onblocked = resolve; });
             await reload();
 
+            await until(() => toggleButton(), 'toolbar button');
+            const atStartup = loadedModules();
+            for (const view of ['icicle-view.js', 'semantic-map-view.js', 'graph-view.js', 'stats-view.js']) {
+                assert(!atStartup.includes(view), `${view} does not load with the page`);
+            }
+
             await open('First open, nothing cached');
-            assert(server.gets.length === CHATS - 1, 'first open downloads every chat except the live one');
-            assert(indexingCards() === 0 && doc().querySelector('.chat-manager-card'), 'first open ends with no card still indexing');
+            await idle();
+            assert(server.lists === 1, 'first open lists once');
+            assert(server.gets.length === PAGE - 1, 'first open reads only the rendered cards, minus the live chat');
+            assert(server.workers.created === 1 && server.workers.posted === PAGE - 1, 'the real worker parsed those chats');
+            assert(win().reader.isHydrationComplete() === false, 'the rest of the archive stays unindexed');
+            await until(() => indexingCards() === 0, 'cards patched', 10000);
+            assert(doc().querySelectorAll('.chat-manager-card').length === PAGE, 'one page of cards rendered');
+            const summaries = Object.values(win().reader.getIndex());
+            assert(summaries.filter(entry => entry.bodyResident === true).length === 1, 'only the live chat has a body in memory');
+            assert(summaries.every(entry => entry.fileName.startsWith(ACTIVE) || entry.messages.length === 0), 'no other chat holds message records');
+            assert(summaries.every(entry => entry.messageCount === MESSAGES), 'every chat knows its size from the list');
+            const unindexedCard = Object.values(win().reader.getIndex()).find(entry => !entry.isLoaded);
+            assert(unindexedCard.lastMessagePreview.startsWith(`chat ${unindexedCard.fileName.slice(5, -6)} message ${MESSAGES - 1}`), 'an unindexed chat still has its last message');
+
+            clearCounts();
+            doc().querySelector('.chat-manager-threads-more').click();
+            await idle();
+            assert(server.gets.length === PAGE, 'loading more cards reads exactly those');
+            assert(doc().querySelectorAll('.chat-manager-card').length === PAGE * 2, 'the next page rendered');
 
             await close();
             await open('Reopen in the same page');
             assert(server.gets.length === 0 && server.lists === 1, 'reopening downloads nothing');
 
             await close();
+            await cachedWrites();
             await reload();
             assert(win().reader.isBuilding() === false && Object.keys(win().reader.getIndex()).length === 0, 'a reload starts with no index in memory');
             await open('Open after a page reload');
+            await idle();
             assert(server.gets.length === 0 && server.lists === 1, 'a reload restores from IndexedDB without downloading');
             assert(indexingCards() === 0, 'restored cards do not stay on Indexing...');
-            const entries = Object.values(win().reader.getIndex());
-            assert(entries.length === CHATS && entries.every(entry => entry.isLoaded && !entry.needsHydration && entry.messageCount === MESSAGES), 'every restored chat reports its real message count');
+            const restored = Object.values(win().reader.getIndex());
+            assert(restored.filter(entry => entry.isLoaded && !entry.needsHydration).length === PAGE * 2, 'only the indexed chats came back');
+            assert(restored.every(entry => entry.messageCount === MESSAGES), 'every chat reports its real message count');
             assert(doc().querySelector('.chat-manager-card-meta span').textContent === `${MESSAGES} messages`, 'restored cards show the message count');
-            assert((await bodyText('chat-5.jsonl')).startsWith('chat 5 message 3'), 'complete text is available for a restored chat');
-            assert(server.gets.length === 0, 'reading a restored chat comes from the cached body');
+            assert(doc().querySelector('.chat-manager-summary-text, .chat-manager-last-message-fallback')?.textContent.includes('message'), 'restored cards show the last message');
+            assert((await bodyText(`${REMOTE}.jsonl`)).startsWith(`chat ${REMOTE.slice(5)} message 3`), 'complete text is available for a restored chat');
+            assert(server.gets.length === 1, 'an unstored body is read once');
+            clearCounts();
+            assert((await bodyText(`${REMOTE}.jsonl`)).startsWith(`chat ${REMOTE.slice(5)} message 3`), 'the stored body serves the next read');
+            assert(server.gets.length === 0, 'a stored body needs no download');
 
             // A local edit while the index is not loaded, the case that had no record before.
             await close();
+            await cachedWrites();
             await reload();
             const editedText = text => text.replace('message 3', 'MESSAGE 3');
-            await editOnServer('chat-0', editedText);
+            await editOnServer(ACTIVE, editedText);
             win().hostContext.chat[3].mes = editedText(win().hostContext.chat[3].mes);
             await win().hostContext.eventSource.emit('message_edited', 3);
             await sleep(50);
             assert(Object.keys(win().reader.getIndex()).length === 0, 'a local edit with the panel closed does not build an index');
-            server.activeChat = 'chat-1';
+            await cachedWrites();
+            server.activeChat = NEXT_ACTIVE;
             await reload();
             await open('Open after a same-size local edit');
-            assert(server.gets.length === 1 && server.gets[0] === 'chat-0', 'only the locally edited chat is re-read after a reload');
-            assert((await bodyText('chat-0.jsonl')).startsWith('chat 0 MESSAGE 3'), 'the local edit is visible');
+            await idle();
+            assert(server.gets.length === 1 && server.gets[0] === ACTIVE, 'only the locally edited chat is re-read after a reload');
+            assert((await bodyText(`${ACTIVE}.jsonl`)).includes(`${ACTIVE.slice(5)} MESSAGE 3`), 'the local edit is visible');
 
             await close();
-            server.sizes.set('chat-7', '100.01KB');
+            server.sizes.set(CHANGED, '100.01KB');
             await open('Reopen after one chat changed size');
-            assert(server.gets.length === 1 && server.gets[0] === 'chat-7', 'only the chat with changed metadata is re-read');
+            await idle();
+            assert(server.gets.length === 1 && server.gets[0] === CHANGED, 'only the chat with changed metadata is re-read');
 
             await close();
-            await editOnServer('chat-8', editedText);
+            await editOnServer(REMOTE, editedText);
             await open('Reopen after a same-size remote edit');
+            await idle();
             assert(server.gets.length === 0, 'a same-size remote edit does not trigger a download');
-            assert((await bodyText('chat-8.jsonl')).startsWith('chat 8 message 3'), 'that edit stays unseen until verified');
+            assert((await bodyText(`${REMOTE}.jsonl`)).includes('message 3'), 'that edit stays unseen until verified');
+
+            // Keyword search asks the server first, and reads only what it names.
+            clearCounts();
+            const searchBox = doc().getElementById('chat-manager-search');
+            searchBox.value = 'zephyrine';
+            searchBox.dispatchEvent(new (win().Event)('input', { bubbles: true }));
+            await until(() => doc().querySelector('.chat-manager-search-result'), 'search results');
+            note(`Keyword search: ${server.searches.length} server scan, ${new Set(server.gets).size} chats read`);
+            assert(server.searches.length === 1 && server.searches[0] === 'zephyrine', 'keyword search asks the server once');
+            assert(!server.gets.some(name => name !== RARE && name !== NEXT_ACTIVE), 'keyword search reads only the matching chat');
+            assert(doc().querySelectorAll('.chat-manager-search-result').length === 1, 'the one match is found');
+            searchBox.value = '';
+            searchBox.dispatchEvent(new (win().Event)('input', { bubbles: true }));
+            await until(() => doc().querySelector('.chat-manager-card'), 'cards after clearing search');
+            await idle();
+
+            // Stats need the whole archive: the view loads now and indexes the rest.
+            clearCounts();
+            doc().getElementById('chat-manager-stats-toggle').click();
+            await until(() => doc().querySelector('.chat-manager-stats-container'), 'stats view');
+            assert(loadedModules().includes('stats-view.js'), 'the stats view loads when opened');
+            await idle();
+            assert(win().reader.isHydrationComplete() === true, 'opening stats indexes the whole archive');
+            const statsShow = (...values) => values.every(value => doc().querySelector('.chat-manager-stats-container')?.innerText.includes(value.toLocaleString()));
+            await until(() => statsShow(CHATS * MESSAGES, CHATS * MESSAGES / 2), 'stats totals', 20000);
+            assert(statsShow(CHATS * MESSAGES, CHATS * MESSAGES / 2), 'stats totals and role split come from summaries');
+            doc().getElementById('chat-manager-stats-toggle').click();
+            await until(() => doc().querySelector('.chat-manager-card'), 'cards after stats');
+
+            // The timeline rebuilds from stored records with no bodies held.
+            doc().getElementById('chat-manager-timeline-toggle').click();
+            await until(() => doc().querySelector('#chat-manager-content canvas'), 'timeline canvas');
+            assert(loadedModules().includes('icicle-view.js'), 'the timeline loads when opened');
+            assert(win().reader.getBodyCacheStats().residentChats <= 2, 'the timeline holds no archive of bodies');
+            doc().getElementById('chat-manager-timeline-toggle').click();
+            await until(() => doc().querySelector('.chat-manager-card'), 'cards after timeline');
 
             clearCounts();
             const verify = doc().getElementById('chat-manager-verify-chats');
@@ -197,10 +295,12 @@ if (isFrame) {
             assert(server.gets.length === CHATS - 1 || server.gets.length === CHATS, 'verify re-reads the archive');
             assert(server.toasts[0].kind === 'success' && server.toasts[0].message === `Checked ${CHATS} chats.`, 'verify reports success');
             assert(!verify.disabled && !verify.hasAttribute('aria-busy'), 'the verify control recovers');
-            assert((await bodyText('chat-8.jsonl')).startsWith('chat 8 MESSAGE 3'), 'verify reveals the same-size remote edit');
+            assert((await bodyText(`${REMOTE}.jsonl`)).includes('MESSAGE 3'), 'verify reveals the same-size remote edit');
+            assert(win().reader.getBodyCacheStats().residentChats <= 3, 'verifying the archive leaves no bodies in memory');
 
             await close();
             server.settings.chat_manager.displayMode = 'popup';
+            await cachedWrites();
             await reload();
             clearCounts();
             toggleButton().click();

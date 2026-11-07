@@ -16,7 +16,7 @@ import {
 import { updateBranchContextInjection, clearBranchContextInjection } from './src/branch-context.js';
 import { attachMomentumScroll } from './src/momentum-scroll.js';
 import { acknowledgeEmbeddingModelChange, clearEmbeddingCache, getCacheStats, getEmbeddingRecipeKey, invalidateEmbeddingOperations } from './src/embedding-service.js';
-import { updateGraphViewData, isGraphViewMounted } from './src/graph-view.js';
+import { updateGraphViewData, isGraphViewMounted } from './src/lazy-views.js';
 import { resolveActiveChatFilename } from './src/active-chat.js';
 import { initGenerationFailureAlert, primeFailureAlertAudio } from './src/generation-failure-alert.js';
 import { initEmbeddingGenerationLifecycle } from './src/generation-lifecycle.js';

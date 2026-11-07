@@ -32,21 +32,15 @@ import {
     focusMessageInIcicle, isIcicleMounted, setIcicleCallbacks,
     invalidateIcicleEmbeddings,
     setThreadFocus as setIcicleThreadFocus,
-} from './icicle-view.js';
-import {
     mountSemanticMap, unmountSemanticMap, updateSemanticMapData,
     focusMessageInSemanticMap, isSemanticMapMounted, setSemanticMapCallbacks,
     invalidateSemanticMapEmbeddings,
-} from './semantic-map-view.js';
-import {
     mountGraphView, unmountGraphView, updateGraphViewData,
     isGraphViewMounted, setGraphViewCallbacks, setGraphScope,
     invalidateGraphEmbeddings,
-} from './graph-view.js';
-import {
     mountStatsView, unmountStatsView, updateStatsView,
     isStatsMounted, setStatsCallbacks,
-} from './stats-view.js';
+} from './lazy-views.js';
 import {
     embedText, embedTexts, getCachedEmbeddingForText, getCachedEmbeddingsForTexts, hashEmbeddingText, isEmbeddingConfigured,
     captureEmbeddingOperation, isEmbeddingOperationCurrent, invalidateEmbeddingOperations, isStaleEmbeddingOperationError,
@@ -2013,13 +2007,16 @@ function scheduleSearchRefresh() {
 function scheduleTimelineRefresh() {
     if (refreshTimelineFromHydrationTimer) return;
 
+    // A rebuild reads every indexed chat's records. Spend at most a sixth of the
+    // time rebuilding, so a large archive keeps indexing between refreshes.
     refreshTimelineFromHydrationTimer = setTimeout(() => {
         refreshTimelineFromHydrationTimer = null;
         if (!panelOpen || !timelineActive) return;
         if (isIcicleMounted()) {
-            updateIcicleData();
+            const started = Date.now();
+            void Promise.resolve(updateIcicleData()).finally(() => { timelineRefreshCost = Date.now() - started; });
         }
-    }, 600);
+    }, Math.max(600, timelineRefreshCost * 5));
 }
 
 function scheduleSemanticMapRefresh() {
@@ -2121,6 +2118,7 @@ async function refreshAfterPanelPaint(root, requestId) {
 }
 
 let chatVerificationInProgress = false;
+let timelineRefreshCost = 0;
 
 /** Re-read every chat from the server. Only this can reveal a remote same-size edit. */
 export async function verifyAllChats() {
@@ -2651,6 +2649,8 @@ export function renderThreadCardsFromEntries(entries, container, status, totalCo
     updateThreadListFooter(state);
     bindCardEvents(container);
     requestHydration(entries.slice(0, state.visibleCount).map(entry => entry.fileName));
+    // Badges are computed per rendered card, so a new set of cards needs its own.
+    scheduleBranchDetection();
 }
 
 function updateThreadListFooter(state) {

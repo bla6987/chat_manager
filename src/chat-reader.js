@@ -4,7 +4,8 @@
  */
 
 import { getCachedBody, getCachedDescriptors, getCachedSummaries, putCachedBody, putCachedChat, removeCachedChat, flushPendingCacheWrites } from './cache-store.js';
-import { LAST_MESSAGE_PREVIEW_CHARS, canonicalFilename, decodeDescriptors, embeddingTextFromMessages, encodeDescriptors, mainChatFromData, parseMessages, summarizeChat } from './chat-index-data.js';
+import { LAST_MESSAGE_PREVIEW_CHARS, canonicalFilename, decodeDescriptors, embeddingTextFromMessages, encodeDescriptors, indexChatData, indexChatText, mainChatFromData, parseMessages, summarizeChat } from './chat-index-data.js';
+import { IndexWorkerUnavailable, indexChatTextInWorker, isIndexWorkerAvailable } from './chat-index-client.js';
 import { getRepresentativeEmbeddingText } from './embedding-text.js';
 import { timestampMs, localDateBoundary } from './timestamps.js';
 import { resolveActiveChatFilename } from './active-chat.js';
@@ -482,11 +483,19 @@ export async function fetchChatList() {
  * @returns {Promise<Array>} Array of message objects
  */
 export async function fetchChatContent(fileName, { signal } = {}) {
+    const response = await requestChatContent(fileName, { signal });
+    if (!response) return [];
+    const data = await response.json();
+    if (!Array.isArray(data)) throw new Error(`Invalid chat content response for ${fileName}`);
+    return data;
+}
+
+async function requestChatContent(fileName, { signal } = {}) {
     const context = SillyTavern.getContext();
-    if (context.characterId === undefined) return [];
+    if (context.characterId === undefined) return null;
 
     const character = context.characters[context.characterId];
-    if (!character) return [];
+    if (!character) return null;
 
     const response = await fetch('/api/chats/get', {
         method: 'POST',
@@ -503,10 +512,25 @@ export async function fetchChatContent(fileName, { signal } = {}) {
         console.error(`[${MODULE_NAME}] Failed to fetch chat content for ${fileName}:`, response.status);
         throw new Error(`Failed to fetch ${fileName} (${response.status})`);
     }
+    return response;
+}
 
-    const data = await response.json();
-    if (!Array.isArray(data)) throw new Error(`Invalid chat content response for ${fileName}`);
-    return data;
+/** Index a chat nobody is reading, keeping its body off the page where possible. */
+async function indexChatInBackground(fileName) {
+    if (isIndexWorkerAvailable()) {
+        const response = await requestChatContent(fileName);
+        if (!response) return null;
+        const text = await response.text();
+        try {
+            return await indexChatTextInWorker(text, fileName);
+        } catch (error) {
+            if (!(error instanceof IndexWorkerUnavailable)) throw error;
+            console.warn(`[${MODULE_NAME}] Indexing on the page instead of a worker:`, error.message);
+            return indexChatText(text, fileName);
+        }
+    }
+    const { descriptors, summary } = indexChatData(await fetchChatContent(fileName), fileName);
+    return { summary, descriptorsPayload: encodeDescriptors(descriptors) };
 }
 
 /**
@@ -842,7 +866,7 @@ function messagesEqual(a, b) {
 }
 
 function hasResidentEmbeddingState(entry) {
-    return entry.messageEmbeddings instanceof Map ? entry.messageEmbeddings.size > 0 : entry.cachedMessageEmbeddingKeys?.size > 0;
+    return entry.messageEmbeddings?.size > 0 || entry.cachedMessageEmbeddingKeys?.size > 0;
 }
 
 /** Embedding state follows unchanged messages, which needs the previous records. */
@@ -889,9 +913,13 @@ async function hydrateEntry(fileName, sessionId, { retainBody = true, storeBody 
 
             const expectedTimestamp = entry.lastModified;
             const live = liveChatContext(fileName);
+            const offPage = !retainBody && !storeBody && !onBody && !live;
             let indexed;
             try {
-                indexed = await indexChatContent(fileName, live, entry.bodyResident !== false ? entry.messages : null);
+                indexed = offPage
+                    ? await indexChatInBackground(fileName)
+                    : await indexChatContent(fileName, live, entry.bodyResident !== false ? entry.messages : null);
+                if (!indexed) return false;
             } catch (err) {
                 console.error(`[${MODULE_NAME}] Failed to hydrate ${fileName}:`, err);
                 return false;
@@ -913,20 +941,23 @@ async function hydrateEntry(fileName, sessionId, { retainBody = true, storeBody 
             const previous = await withPreviousMessages(current);
             if (sessionId !== hydrationSessionId || chatIndex[fileName] !== current) continue;
 
-            const { messages, descriptors, summary } = indexed;
+            const { messages = null, summary } = indexed;
+            const descriptorsPayload = indexed.descriptorsPayload ?? encodeDescriptors(indexed.descriptors);
+            // Without a body, embedding state follows the stored rows instead.
+            const comparable = messages ?? (hasResidentEmbeddingState(current) ? decodeDescriptors(descriptorsPayload, fileName) : []);
             // The open chat stays resident: it may hold edits no file has yet.
             const keepBody = retainBody || !!live;
             const next = {
                 ...withSummary(current, summary),
                 messages: keepBody ? messages : [],
-                messageDescriptors: keepBody ? descriptors : null,
+                messageDescriptors: keepBody ? indexed.descriptors : null,
                 bodyResident: keepBody,
                 branchPoint: null,
                 isLoaded: true,
                 needsHydration: false,
                 validatedAt: Date.now(),
-                messageEmbeddings: retainMessageEmbeddings(previous, messages),
-                cachedMessageEmbeddingKeys: retainCachedEmbeddingKeys(previous, messages),
+                messageEmbeddings: retainMessageEmbeddings(previous, comparable),
+                cachedMessageEmbeddingKeys: retainCachedEmbeddingKeys(previous, comparable),
             };
             chatIndex[fileName] = next;
             if (keepBody) rememberResidentBody(next);
@@ -942,7 +973,7 @@ async function hydrateEntry(fileName, sessionId, { retainBody = true, storeBody 
 
             if (currentCharacterAvatar) {
                 await putCachedChat(currentCharacterAvatar, fileName, next, {
-                    descriptorsPayload: encodeDescriptors(descriptors),
+                    descriptorsPayload,
                     body: storeBody && !live ? messages : undefined,
                     evictBodies,
                 });
@@ -983,7 +1014,9 @@ function startHydrationLoop() {
 
                 await Promise.all(batch.map(fileName => hydrateEntry(fileName, sessionId, { retainBody: false, storeBody: false })));
                 if (sessionId === hydrationSessionId) emitHydrationUpdate();
-                if (sessionId === hydrationSessionId && hydrationQueue.length > 0) {
+                // Only parsing on the page needs to give way. This wait is also what a
+                // background tab stretches to a second, so a worker skips it.
+                if (sessionId === hydrationSessionId && hydrationQueue.length > 0 && !isIndexWorkerAvailable()) {
                     await new Promise(resolve => setTimeout(resolve, HYDRATION_YIELD_MS));
                 }
             }
