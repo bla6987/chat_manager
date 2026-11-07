@@ -4,11 +4,11 @@
  */
 
 import { getCachedBody, getCachedDescriptors, getCachedSummaries, putCachedBody, putCachedChat, removeCachedChat, flushPendingCacheWrites } from './cache-store.js';
-import { canonicalFilename, decodeDescriptors, embeddingTextFromMessages, encodeDescriptors, mainChatFromData, parseMessages, summarizeChat } from './chat-index-data.js';
+import { LAST_MESSAGE_PREVIEW_CHARS, canonicalFilename, decodeDescriptors, embeddingTextFromMessages, encodeDescriptors, mainChatFromData, parseMessages, summarizeChat } from './chat-index-data.js';
 import { getRepresentativeEmbeddingText } from './embedding-text.js';
 import { timestampMs, localDateBoundary } from './timestamps.js';
 import { resolveActiveChatFilename } from './active-chat.js';
-import { createMessageDescriptor, estimateMessageBodyBytes, sameMessageContent } from './message-descriptors.js';
+import { createMessageDescriptor, estimateMessageBodyBytes, messagePreview, sameMessageContent } from './message-descriptors.js';
 import { isVector, toFloat32Vector, vectorByteLength, ByteBudgetLRU } from './vector-utils.js';
 export { messageFingerprint, normalizedMessageFingerprint, sameMessageContent } from './message-descriptors.js';
 
@@ -16,6 +16,7 @@ const MODULE_NAME = 'chat_manager';
 const HYDRATION_BATCH_SIZE = 2;
 const HYDRATION_YIELD_MS = 16;
 const FALLBACK_SORT_TIMESTAMP = 0;
+const EMPTY_MESSAGE_PLACEHOLDER = '[The message is empty]';
 
 /** @type {Object<string, ChatIndexEntry>} filename -> index entry */
 let chatIndex = {};
@@ -24,8 +25,8 @@ let indexBuildInProgress = false;
 let nextBuildToken = 0;
 let activeBuildToken = null;
 let nextInitialOrder = 0;
-// Startup work can build a catalog without downloading the archive. Any caller
-// that wants hydration latches this, including while another build is running.
+// Most work needs no chat bodies. Only callers that need the whole archive set
+// this, including while another build is running.
 let backgroundHydrationRequested = false;
 let forcedBuildPending = false;
 let lastBuildFailed = false;
@@ -461,7 +462,8 @@ export async function fetchChatList() {
     const response = await fetch('/api/characters/chats', {
         method: 'POST',
         headers: context.getRequestHeaders(),
-        body: JSON.stringify({ avatar_url: character.avatar }),
+        // Headers carry main_chat, which identifies a chat's relatives without reading it.
+        body: JSON.stringify({ avatar_url: character.avatar, metadata: true }),
     });
 
     if (!response.ok) {
@@ -572,6 +574,12 @@ function normalizeMeta(chatMeta) {
     return metaObj;
 }
 
+/** The list reports the last message, so a card needs no download to show it. */
+function getMetaPreview(metaObj) {
+    if (typeof metaObj?.mes !== 'string' || !getMetaMessageCount(metaObj)) return '';
+    return metaObj.mes === EMPTY_MESSAGE_PLACEHOLDER ? '' : messagePreview(metaObj.mes.trim(), LAST_MESSAGE_PREVIEW_CHARS);
+}
+
 function normalizeTimestamp(value) {
     if (value === null || value === undefined || value === '') {
         return FALLBACK_SORT_TIMESTAMP;
@@ -664,7 +672,7 @@ function emitHydrationUpdate() {
 
     for (const listener of hydrationListeners) {
         try {
-            listener({ ...progress, complete: isHydrationComplete() });
+            listener({ ...progress, complete: isHydrationComplete(), idle: isHydrationIdle() });
         } catch (err) {
             console.error(`[${MODULE_NAME}] Hydration listener failed:`, err);
         }
@@ -672,6 +680,11 @@ function emitHydrationUpdate() {
 }
 
 function markEntryForHydration(fileName) {
+    if (!backgroundHydrationRequested) return;
+    enqueueHydration(fileName);
+}
+
+function enqueueHydration(fileName) {
     const entry = chatIndex[fileName];
     if (!entry || (entry.isLoaded && !entry.needsHydration)) return;
     if (queuedFiles.has(fileName)) return;
@@ -679,6 +692,50 @@ function markEntryForHydration(fileName) {
 
     hydrationQueue.push(fileName);
     queuedFiles.add(fileName);
+}
+
+/**
+ * Index specific chats now, ahead of anything already queued.
+ * @param {string[]} fileNames
+ */
+export function requestHydration(fileNames) {
+    if (!Array.isArray(fileNames)) return;
+    for (const fileName of fileNames) enqueueHydration(fileName);
+    prioritizeHydrationFiles(fileNames);
+    // A running build may be about to restore these from their summaries.
+    if (!indexBuildInProgress) startHydrationLoop();
+}
+
+/** Index every chat, for a view that reports on the whole archive. */
+export function requestFullHydration() {
+    backgroundHydrationRequested = true;
+    for (const fileName of Object.keys(chatIndex)) enqueueHydration(fileName);
+    if (!indexBuildInProgress) startHydrationLoop();
+}
+
+/** Stop indexing chats nobody is waiting for. In-flight reads finish normally. */
+export function cancelBackgroundHydration() {
+    backgroundHydrationRequested = false;
+    if (hydrationQueue.length === 0) return;
+    hydrationQueue = [];
+    queuedFiles = new Set();
+    emitHydrationUpdate();
+}
+
+/**
+ * Whether any requested indexing is still queued or running.
+ * @returns {boolean}
+ */
+export function isHydrationIdle() {
+    return !hydrationInProgress && !hasPendingHydration();
+}
+
+/**
+ * How many chats are waiting to be indexed.
+ * @returns {number}
+ */
+export function getPendingHydrationCount() {
+    return hydrationQueue.length + entryHydrationPromises.size;
 }
 
 /**
@@ -813,12 +870,13 @@ async function indexChatContent(fileName, live, previousMessages) {
  * Fetch and index a single entry, re-trying if metadata changed during fetch.
  * @param {string} fileName
  * @param {number} sessionId
- * @param {{ retainBody?: boolean, evictBodies?: boolean }} [options]
- *   retainBody false keeps only the summary in memory. evictBodies lets the body
- *   displace older stored bodies; archive scans leave it off.
+ * @param {{ retainBody?: boolean, storeBody?: boolean, evictBodies?: boolean, onBody?: Function }} [options]
+ *   retainBody false keeps only the summary in memory. storeBody writes complete
+ *   text to the capped store, where evictBodies lets it displace older bodies;
+ *   archive scans leave that off. onBody receives text the caller asked to borrow.
  * @returns {Promise<boolean>}
  */
-async function hydrateEntry(fileName, sessionId, { retainBody = true, evictBodies = true } = {}) {
+async function hydrateEntry(fileName, sessionId, { retainBody = true, storeBody = true, evictBodies = true, onBody = null } = {}) {
     if (entryHydrationPromises.has(fileName)) {
         return entryHydrationPromises.get(fileName);
     }
@@ -885,13 +943,14 @@ async function hydrateEntry(fileName, sessionId, { retainBody = true, evictBodie
             if (currentCharacterAvatar) {
                 await putCachedChat(currentCharacterAvatar, fileName, next, {
                     descriptorsPayload: encodeDescriptors(descriptors),
-                    body: retainBody && !live ? messages : undefined,
+                    body: storeBody && !live ? messages : undefined,
                     evictBodies,
                 });
                 if (sessionId !== hydrationSessionId || !chatIndex[fileName]) return false;
                 trimBodyCache({ keepFile: fileName });
             }
 
+            onBody?.(messages);
             return true;
         }
 
@@ -922,7 +981,7 @@ function startHydrationLoop() {
                     queuedFiles.delete(fileName);
                 }
 
-                await Promise.all(batch.map(fileName => hydrateEntry(fileName, sessionId, { retainBody: false, evictBodies: false })));
+                await Promise.all(batch.map(fileName => hydrateEntry(fileName, sessionId, { retainBody: false, storeBody: false })));
                 if (sessionId === hydrationSessionId) emitHydrationUpdate();
                 if (sessionId === hydrationSessionId && hydrationQueue.length > 0) {
                     await new Promise(resolve => setTimeout(resolve, HYDRATION_YIELD_MS));
@@ -957,10 +1016,10 @@ function startHydrationLoop() {
  */
 export async function buildIndex(onProgress, onMetadataReady, options = {}) {
     progressCallback = onProgress || null;
-    const requestsHydration = options.backgroundHydration !== false;
-    if (requestsHydration) backgroundHydrationRequested = true;
+    const requestsHydration = options.forceRevalidate === true || options.backgroundHydration !== false;
 
     if (indexBuildInProgress) {
+        if (requestsHydration) backgroundHydrationRequested = true;
         if (options.forceRevalidate) forcedBuildPending = true;
         if (Object.keys(chatIndex).length > 0) {
             notifyMetadataReady(onMetadataReady, false);
@@ -970,6 +1029,7 @@ export async function buildIndex(onProgress, onMetadataReady, options = {}) {
     }
 
     indexBuildInProgress = true;
+    backgroundHydrationRequested = requestsHydration;
     const buildToken = ++nextBuildToken;
     activeBuildToken = buildToken;
     const context = SillyTavern.getContext();
@@ -1053,6 +1113,7 @@ export async function buildIndex(onProgress, onMetadataReady, options = {}) {
                 validatedAt: 0,
                 serverSignature: metaSignature(metaObj),
                 mainChat: canonicalFilename(metaObj.chat_metadata?.main_chat),
+                lastMessagePreview: getMetaPreview(metaObj),
                 chatEmbedding: null,
                 chatEmbeddingHash: null,
                 clusterLabel: null,
@@ -1060,6 +1121,7 @@ export async function buildIndex(onProgress, onMetadataReady, options = {}) {
             };
             markEntryForHydration(fileName);
             changed = true;
+            keywordSearchEpoch++;
         }
         if (changed) {
             bumpIndexVersion();
@@ -1128,6 +1190,17 @@ export async function buildIndex(onProgress, onMetadataReady, options = {}) {
                 sortTimestamp: metadataChanged ? serverTimestamp : entry.sortTimestamp,
                 needsHydration: true,
             };
+            if (metadataChanged) {
+                // The chat may wait a long time for its next read. Show what the list knows.
+                keywordSearchEpoch++;
+                const lastTimestamp = getMetaTimestampString(metaObj) ?? entry.lastMessageTimestamp;
+                Object.assign(chatIndex[fileName], {
+                    messageCount: getMetaMessageCount(metaObj) ?? entry.messageCount,
+                    lastMessageTimestamp: lastTimestamp,
+                    lastTimestampMs: normalizeTimestamp(lastTimestamp),
+                    lastMessagePreview: getMetaPreview(metaObj) || entry.lastMessagePreview,
+                });
+            }
             if (entry.isLoaded && entry.bodyResident !== false) rememberResidentBody(chatIndex[fileName]);
             markEntryForHydration(fileName);
             changed = true;
@@ -1169,7 +1242,11 @@ export async function buildIndex(onProgress, onMetadataReady, options = {}) {
 
         emitHydrationUpdate();
 
-        if (hydrationQueue.length > 0 && backgroundHydrationRequested) {
+        // A request made while this build ran may need chats it has now listed.
+        if (backgroundHydrationRequested) {
+            for (const fileName of Object.keys(chatIndex)) markEntryForHydration(fileName);
+        }
+        if (hydrationQueue.length > 0) {
             const activeFile = resolveActiveChatFilename(SillyTavern.getContext(), chatIndex);
             const recent = getSortedEntries().filter(entry => !entry.isLoaded || entry.needsHydration)
                 .slice(0, 12).map(entry => entry.fileName);
@@ -1250,7 +1327,7 @@ function assertBodyReadCurrent(sessionId, avatar, signal) {
  * keep only IDs/previews after use. No residency or content revision changes are
  * made for a successful read of an unchanged cached body.
  */
-export async function readChatMessages(fileName, { signal, evictBodies = true } = {}) {
+export async function readChatMessages(fileName, { signal, evictBodies = true, retainBody = true } = {}) {
     fileName = canonicalFilename(fileName);
     const sessionId = hydrationSessionId;
     const avatar = currentCharacterAvatar;
@@ -1259,12 +1336,14 @@ export async function readChatMessages(fileName, { signal, evictBodies = true } 
     if (!entry) throw new Error(`Chat not present in this character's catalog: ${fileName}`);
     normalizeEntryShape(entry);
     if (!entry.isLoaded || entry.needsHydration) {
-        const loaded = await hydrateEntry(fileName, sessionId, { evictBodies });
+        let borrowed = null;
+        const loaded = await hydrateEntry(fileName, sessionId, { evictBodies, retainBody, onBody: messages => { borrowed = messages; } });
         assertBodyReadCurrent(sessionId, avatar, signal);
         entry = chatIndex[fileName];
         if (!loaded || !entry?.isLoaded || entry.needsHydration) {
             throw new Error(`Could not refresh chat ${fileName}; its previous cached data was preserved`);
         }
+        if (borrowed) return borrowed;
     }
     if (entry?.isLoaded && entry.bodyResident !== false) {
         touchResidentBody(fileName);
@@ -1277,7 +1356,7 @@ export async function readChatMessages(fileName, { signal, evictBodies = true } 
     assertBodyReadCurrent(sessionId, avatar, signal);
     const cached = avatar ? await getCachedBody(avatar, fileName, { signal }) : null;
     assertBodyReadCurrent(sessionId, avatar, signal);
-    if (chatIndex[fileName] !== entry) return readChatMessages(fileName, { signal, evictBodies });
+    if (chatIndex[fileName] !== entry) return readChatMessages(fileName, { signal, evictBodies, retainBody });
     if (cached && Array.isArray(cached.messages) && !cached.messages.some(message => message?.isDescriptor)
         && cached.lastModified === entry.lastModified && cached.serverSignature === entry.serverSignature
         && cached.validatedAt === entry.validatedAt) {
@@ -1290,14 +1369,14 @@ export async function readChatMessages(fileName, { signal, evictBodies = true } 
     assertBodyReadCurrent(sessionId, avatar, signal);
     const current = chatIndex[fileName];
     if (!current) throw new Error(`Chat was removed while reading: ${fileName}`);
-    if (current !== entry) return readChatMessages(fileName, { signal, evictBodies });
+    if (current !== entry) return readChatMessages(fileName, { signal, evictBodies, retainBody });
     const messages = parseMessages(raw, fileName);
     const descriptors = descriptorsFor(messages);
     const summary = summarizeChat(messages, descriptors, mainChatFromData(raw));
     if (!entry.isLoaded || !sameContent(entry, summary, messages)) {
         const previous = await withPreviousMessages(entry);
         assertBodyReadCurrent(sessionId, avatar, signal);
-        if (chatIndex[fileName] !== entry) return readChatMessages(fileName, { signal, evictBodies });
+        if (chatIndex[fileName] !== entry) return readChatMessages(fileName, { signal, evictBodies, retainBody });
         const updated = {
             ...withSummary(entry, summary), messages, isLoaded: true, needsHydration: false,
             validatedAt: Date.now(), branchPoint: null,
@@ -1370,10 +1449,86 @@ export async function* iterateChatBodies({ fileNames, signal } = {}) {
         assertBodyReadCurrent(sessionId, avatar, signal);
         const fileName = canonicalFilename(name);
         if (!chatIndex[fileName]) continue;
-        const messages = await readChatMessages(fileName, { signal, evictBodies: false });
+        const messages = await readChatMessages(fileName, { signal, evictBodies: false, retainBody: false });
         assertBodyReadCurrent(sessionId, avatar, signal);
         yield { entry: chatIndex[fileName], messages };
     }
+}
+
+// Results stay valid until a chat changes. Indexing alone never invalidates them.
+let keywordSearchEpoch = 0;
+let keywordSearchMemo = null;
+let keywordSearchRunning = null;
+
+function matchesKeywordMemo(needle, avatar) {
+    const memo = keywordSearchMemo;
+    // A chat holding a longer query also holds any part of it, so one scan can
+    // answer every keystroke that extends it.
+    return memo && memo.avatar === avatar && memo.epoch === keywordSearchEpoch && needle.includes(memo.needle) ? memo.files : null;
+}
+
+function waitUnlessAborted(promise, signal) {
+    if (!signal) return promise;
+    return new Promise((resolve, reject) => {
+        if (signal.aborted) { reject(signal.reason || new DOMException('Aborted', 'AbortError')); return; }
+        const onAbort = () => reject(signal.reason || new DOMException('Aborted', 'AbortError'));
+        signal.addEventListener('abort', onAbort, { once: true });
+        promise.then(resolve, reject).finally(() => signal.removeEventListener('abort', onAbort));
+    });
+}
+
+async function scanServerForKeyword(needle, character, headers) {
+    const epoch = keywordSearchEpoch;
+    try {
+        const response = await fetch('/api/chats/search', {
+            method: 'POST', headers,
+            body: JSON.stringify({ query: needle, avatar_url: character.avatar }),
+        });
+        if (!response.ok) return null;
+        const rows = await response.json();
+        if (!Array.isArray(rows)) return null;
+        const files = new Set(rows.map(row => canonicalFilename(row?.file_name)).filter(Boolean));
+        keywordSearchMemo = { avatar: character.avatar, epoch, needle, files };
+        return files;
+    } catch (error) {
+        console.warn(`[${MODULE_NAME}] Server chat search failed:`, error);
+        return null;
+    }
+}
+
+/**
+ * Ask the server which chats could hold a substring of their active message text,
+ * so a keyword search reads only those. The server requires every word to appear
+ * somewhere in the chat, which every true match satisfies, so nothing is lost. The
+ * open chat is always included because it may hold text no file has yet.
+ * @param {string} query
+ * @param {{ signal?: AbortSignal }} [options]
+ * @returns {Promise<string[]|null>} Newest first, or null to read every chat
+ */
+export async function findChatsMatchingKeyword(query, { signal } = {}) {
+    const needle = String(query || '').trim().toLowerCase();
+    const context = SillyTavern.getContext();
+    const character = context.characters?.[context.characterId];
+    const avatar = currentCharacterAvatar;
+    if (!needle || !avatar || character?.avatar !== avatar) return null;
+
+    let files = matchesKeywordMemo(needle, avatar);
+    while (!files) {
+        // The server cannot cancel a scan, so never start a second one beside it.
+        if (keywordSearchRunning) {
+            await waitUnlessAborted(keywordSearchRunning, signal);
+            files = matchesKeywordMemo(needle, avatar);
+            continue;
+        }
+        keywordSearchRunning = scanServerForKeyword(needle, character, context.getRequestHeaders())
+            .finally(() => { keywordSearchRunning = null; });
+        files = await waitUnlessAborted(keywordSearchRunning, signal);
+        if (!files) return null;
+    }
+    if (signal?.aborted) throw signal.reason || new DOMException('Aborted', 'AbortError');
+    if (currentCharacterAvatar !== avatar) throw new DOMException('The selected character changed', 'AbortError');
+    const active = resolveActiveChatFilename(SillyTavern.getContext(), chatIndex);
+    return getSortedEntries().map(entry => entry.fileName).filter(name => files.has(name) || name === active);
 }
 
 /** Invalidate a locally edited body even when the manager panel is closed. */
@@ -1381,6 +1536,7 @@ export function markChatDirty(fileName) {
     const entry = chatIndex[fileName];
     if (!entry) return false;
     chatIndex[fileName] = { ...entry, needsHydration: true };
+    keywordSearchEpoch++;
     if (entry.isLoaded && entry.bodyResident !== false) rememberResidentBody(chatIndex[fileName]);
     // A same-length edit may not change list metadata, even after a page reload.
     if (currentCharacterAvatar) removeCachedChat(currentCharacterAvatar, fileName);
@@ -1412,6 +1568,7 @@ export function removeChatFromIndex(fileName) {
     const resolved = canonicalFilename(fileName);
     if (!resolved || !chatIndex[resolved]) return false;
     delete chatIndex[resolved];
+    keywordSearchEpoch++;
     forgetResidentBody(resolved);
     forgetEntryVectors(resolved);
     queuedFiles.delete(resolved);
@@ -1709,6 +1866,8 @@ export function clearIndex() {
     residentBodyBytes = 0;
     activeBodyFile = null;
     currentCharacterAvatar = null;
+    keywordSearchMemo = null;
+    keywordSearchEpoch++;
     nextInitialOrder = 0;
     progressCallback = null;
     indexBuildInProgress = false;

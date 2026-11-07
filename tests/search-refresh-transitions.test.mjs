@@ -17,7 +17,7 @@ function fixture({ complete = true } = {}) {
         clearTimeout: id => timers.delete(id),
         onEmbeddingDimensionsInvalidated() {},
         onHydrationUpdate: callback => { hydrationListener = callback; },
-        isHydrationComplete: () => complete,
+        isHydrationIdle: () => complete,
         paints,
         getIndexVersion: () => 1, getEmbeddingSettings: () => ({}),
         searchArchivePage: options => new Promise(resolve => requests.push({ query: options.query,

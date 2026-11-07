@@ -75,7 +75,7 @@ function setup(overrides = {}) {
         searchArchivePage: options => searchArchivePage({ ...options, embeddingOperation: undefined }),
         persistThreadFocus: meta.setThreadFocus,
         getIndex: () => index, getIndexVersion: () => 1, getEmbeddingSettings: () => settings,
-        getHydrationProgress: () => ({ loaded: 0, total: 0 }), isHydrationComplete: () => true,
+        getHydrationProgress: () => ({ loaded: 0, total: 0 }), isHydrationIdle: () => true,
         getSearchableMessages: () => [], isEmbeddingConfigured: () => true,
         getMessageActiveSwipeIndex: reader.getMessageActiveSwipeIndex,
         getMessageEmbedding: reader.getMessageEmbedding, setMessageEmbedding: reader.setMessageEmbedding,

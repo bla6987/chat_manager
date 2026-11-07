@@ -215,7 +215,7 @@ const onMessageUpdate = (() => {
 
     registerSlashCommands();
     onHydrationUpdate(progress => {
-        if (!progress.complete || !isBranchContextActive()) return;
+        if (!progress.idle || !isBranchContextActive()) return;
         const context = SillyTavern.getContext();
         if (context.characters?.[context.characterId]?.avatar !== getIndexCharacterAvatar()) return;
         const activeFile = getActiveChatFile(context);
@@ -1462,7 +1462,7 @@ async function onChatChanged() {
             if (!isBranchContextActive()) return;
             const owner = currentAvatar;
             if (!sameCharacter && !isPanelOpen()) {
-                try { await buildIndex(); } catch (error) { console.warn(`[${MODULE_NAME}] Branch index refresh failed`, error); return; }
+                try { await buildIndex(null, null, { backgroundHydration: false }); } catch (error) { console.warn(`[${MODULE_NAME}] Branch index refresh failed`, error); return; }
                 const current = SillyTavern.getContext();
                 if (current.characters?.[current.characterId]?.avatar !== owner) return;
             }

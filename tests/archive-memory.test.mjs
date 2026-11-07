@@ -250,3 +250,19 @@ test('vector eviction follows the current entry after active-message replacement
     assert.ok(entry.cachedMessageEmbeddingKeys.has('m:0:s:0'));
     assert.equal(reader.getVectorCacheStats().residentBytes, 0);
 });
+
+test('an archive scan over unindexed chats holds one body at a time', async () => {
+    await setup(4);
+    await reader.buildIndex(null, null, { backgroundHydration: false });
+    let chats = 0;
+    for await (const { entry, messages } of reader.iterateChatBodies()) {
+        assert.equal(messages[1].text, bodies.get(entry.fileName)[2].mes);
+        assert.equal(reader.getBodyCacheStats().residentChats, 0);
+        assert.deepEqual(entry.messages, []);
+        chats++;
+    }
+    assert.equal(chats, 4);
+    assert.equal(reader.isHydrationComplete(), true, 'a scan leaves every chat indexed');
+    await cache.flushPendingCacheWrites();
+    assert.equal(fake.store('chatSummaries').size, 4);
+});

@@ -276,3 +276,146 @@ test('a cached summary whose chat was deleted while unloaded is removed from sto
     assert.equal(fake.store('chatSummaries').has('alpha.png:c.jsonl'), false);
     assert.equal(fake.store('chatDescriptors').has('alpha.png:c.jsonl'), false);
 });
+
+test('specific chats can be indexed without touching the rest of the archive', async () => {
+    setup();
+    await reader.buildIndex(null, null, { backgroundHydration: false });
+    assert.equal(reader.isHydrationIdle(), true, 'nothing queued means nothing running');
+    assert.deepEqual(gets, []);
+    reader.requestHydration(['b.jsonl']);
+    assert.equal(reader.isHydrationIdle(), false);
+    assert.equal(reader.getPendingHydrationCount() > 0, true);
+    await idle();
+    assert.deepEqual(gets, ['b.jsonl']);
+    assert.equal(reader.isEntryLoaded('b.jsonl'), true);
+    assert.equal(reader.isEntryLoaded('a.jsonl'), false);
+    assert.equal(reader.isHydrationIdle(), true);
+    reader.requestHydration(['b.jsonl']);
+    await idle();
+    assert.deepEqual(gets, ['b.jsonl'], 'an indexed chat is not read again');
+});
+
+test('a request during a build does not download what its summaries restore', async () => {
+    setup(); await reload();
+    let release;
+    listGate = new Promise(resolve => { release = resolve; });
+    const building = reader.buildIndex(null, () => reader.requestHydration(['a.jsonl']), { backgroundHydration: false });
+    release();
+    await building; await idle();
+    assert.deepEqual(gets, []);
+    assert.equal(reader.isEntryLoaded('a.jsonl'), true);
+    assert.equal(reader.isHydrationIdle(), true);
+});
+
+test('cancelling leaves requested work behind and later builds stay partial', async () => {
+    setup(['a.jsonl', 'b.jsonl', 'c.jsonl', 'd.jsonl', 'e.jsonl', 'f.jsonl']);
+    await reader.buildIndex(null, null, { backgroundHydration: false });
+    reader.requestFullHydration();
+    reader.cancelBackgroundHydration();
+    await idle();
+    assert.ok(gets.length <= 2, `${gets.length} chats were read after cancelling`);
+    gets.length = 0;
+    await buildAndSettle({ backgroundHydration: false });
+    assert.deepEqual(gets, []);
+    assert.equal(reader.isHydrationIdle(), true);
+});
+
+test('full indexing reaches every chat and a list change updates an unindexed card', async () => {
+    setup();
+    await reader.buildIndex(null, null, { backgroundHydration: false });
+    rows[0].chat_items = 9; rows[0].mes = 'newer last message'; rows[0].last_mes = '2026-10-20T12:00:00Z';
+    await reader.buildIndex(null, null, { backgroundHydration: false });
+    const stale = reader.getIndex()['a.jsonl'];
+    assert.equal(stale.isLoaded, false);
+    assert.equal(stale.messageCount, 9);
+    assert.equal(stale.lastMessageTimestamp, '2026-10-20T12:00:00Z');
+    assert.equal(stale.lastMessagePreview, 'newer last message');
+    reader.requestFullHydration();
+    await idle();
+    assert.equal(reader.isHydrationComplete(), true);
+    assert.equal(gets.length, 3);
+});
+
+test('an empty chat shows no placeholder as its last message', async () => {
+    setup();
+    Object.assign(rows[0], { chat_items: 0, mes: '[The chat is empty]' });
+    Object.assign(rows[1], { chat_items: 1, mes: '[The message is empty]' });
+    Object.assign(rows[2], { chat_items: 1, mes: 'real text' });
+    await reader.buildIndex(null, null, { backgroundHydration: false });
+    assert.equal(reader.getIndex()['a.jsonl'].lastMessagePreview, '');
+    assert.equal(reader.getIndex()['b.jsonl'].lastMessagePreview, '');
+    assert.equal(reader.getIndex()['c.jsonl'].lastMessagePreview, 'real text');
+});
+
+test('the list request asks for headers so relatives are known before any download', async () => {
+    setup();
+    const bodiesSeen = [];
+    const realFetch = globalThis.fetch;
+    globalThis.fetch = async (url, options) => { if (url === '/api/characters/chats') bodiesSeen.push(JSON.parse(options.body)); return realFetch(url, options); };
+    rows[1].chat_metadata = { main_chat: 'a' };
+    await reader.buildIndex(null, null, { backgroundHydration: false });
+    assert.equal(bodiesSeen[0].metadata, true);
+    assert.equal(reader.getIndex()['b.jsonl'].mainChat, 'a.jsonl');
+    assert.deepEqual(gets, []);
+});
+
+function relatives() {
+    setup(['main.jsonl', 'child.jsonl', 'other.jsonl', 'grandchild.jsonl']);
+    rows[1].chat_metadata = { main_chat: 'main' };
+    rows[3].chat_metadata = { main_chat: 'child' };
+    bodies.set('main.jsonl', [{}, raw('greeting'), raw('shared'), raw('main path')]);
+    bodies.set('child.jsonl', [{ chat_metadata: { main_chat: 'main' } }, raw('greeting'), raw('shared'), raw('child path')]);
+    bodies.set('grandchild.jsonl', [{ chat_metadata: { main_chat: 'child' } }, raw('greeting'), raw('other path')]);
+    context.chatId = 'main';
+    context.chat = bodies.get('main.jsonl').slice(1);
+}
+
+test('branch detection reads only provenance relatives, and only once', async () => {
+    relatives();
+    await reader.buildIndex(null, null, { backgroundHydration: false });
+    assert.deepEqual(gets, [], 'the open chat comes from the host');
+    await reader.runDeferredBranchDetection('main.jsonl');
+    assert.deepEqual(gets.toSorted(), ['child.jsonl', 'grandchild.jsonl']);
+    assert.equal(reader.getIndex()['child.jsonl'].branchPoint, 2);
+    assert.equal(reader.getIndex()['grandchild.jsonl'].branchPoint, 1);
+    assert.equal(reader.getIndex()['other.jsonl'].branchPoint, null);
+    gets.length = 0;
+    await reader.runDeferredBranchDetection('main.jsonl');
+    assert.deepEqual(gets, [], 'a repeated comparison needs no read');
+    assert.equal(reader.getIndex()['child.jsonl'].branchPoint, 2);
+});
+
+test('branch detection can be limited to the rendered cards', async () => {
+    relatives();
+    await reader.buildIndex(null, null, { backgroundHydration: false });
+    await reader.runDeferredBranchDetection('main.jsonl', { fileNames: ['child.jsonl'] });
+    assert.deepEqual(gets, ['child.jsonl']);
+    assert.equal(reader.getIndex()['child.jsonl'].branchPoint, 2);
+    assert.equal(reader.getIndex()['grandchild.jsonl'].branchPoint, null);
+});
+
+test('branch comparison survives a reload using stored records', async () => {
+    relatives();
+    await reader.buildIndex(null, null, { backgroundHydration: false });
+    await reader.runDeferredBranchDetection('main.jsonl');
+    await cache.flushPendingCacheWrites();
+    reader.clearIndex(); gets.length = 0;
+    await reader.buildIndex(null, null, { backgroundHydration: false });
+    await reader.runDeferredBranchDetection('main.jsonl');
+    assert.deepEqual(gets, []);
+    assert.equal(reader.getIndex()['child.jsonl'].branchPoint, 2);
+});
+
+test('sibling context stops reading once it has enough relatives', async () => {
+    setup(['main.jsonl', 'one.jsonl', 'two.jsonl', 'three.jsonl']);
+    bodies.set('main.jsonl', [{}, raw('greeting'), raw('main')]);
+    for (const [i, name] of ['one', 'two', 'three'].entries()) {
+        rows[i + 1].chat_metadata = { main_chat: 'main' };
+        rows[i + 1].last_mes = `2026-10-1${i + 1}T12:00:00Z`;
+        bodies.set(`${name}.jsonl`, [{ chat_metadata: { main_chat: 'main' } }, raw('greeting'), raw(name)]);
+    }
+    await reader.buildIndex(null, null, { backgroundHydration: false });
+    const siblings = await reader.getSiblingBranchContextForThread('main.jsonl', 1);
+    assert.deepEqual(siblings.map(item => item.fileName), ['three.jsonl'], 'newest first');
+    assert.deepEqual(gets.toSorted(), ['main.jsonl', 'three.jsonl']);
+});

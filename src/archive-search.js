@@ -58,8 +58,11 @@ export async function searchArchivePage(options) {
     };
     assertCurrent();
     const limit = Math.max(1, Math.min(100, Number(options.limit) || 50));
+    // Failure to narrow is not failure to search: no answer reads every chat.
+    const fileNames = options.fileNames ?? (await options.narrowFileNames?.()) ?? undefined;
+    assertCurrent();
     const source = options.sourceFactory || (() => (semantic ? iterateCachedMessageVectors : iterateMessageVariants)({
-        fileNames: options.fileNames, signal: options.signal, settings: options.settings,
+        fileNames, signal: options.signal, settings: options.settings,
         embeddingOperation,
         mode: semantic && options.settings?.showAlternateSwipesInResults === true ? 'all' : 'active',
     }));

@@ -3,9 +3,9 @@
  */
 
 import {
-    buildIndex, didLastBuildFail, getHydrationProgress, getIndex, getIndexCharacterAvatar, getSortedEntries,
-    getFilteredSortedEntries, getIndexVersion, isBuilding,
-    isHydrationComplete, onHydrationUpdate, prioritizeInQueue, prioritizeHydrationFiles, runDeferredBranchDetection,
+    buildIndex, cancelBackgroundHydration, didLastBuildFail, findChatsMatchingKeyword, getHydrationProgress, getIndex, getIndexCharacterAvatar, getSortedEntries,
+    getFilteredSortedEntries, getIndexVersion, getPendingHydrationCount, isBuilding,
+    isHydrationIdle, onHydrationUpdate, prioritizeInQueue, prioritizeHydrationFiles, requestFullHydration, requestHydration, runDeferredBranchDetection,
     readChatMessages, trimBodyCache,
     ensureMessageEmbeddingMap, getMessageActiveSwipeIndex, getMessageEmbedding, setMessageEmbedding, setChatEmbedding, clearResidentVectors, makeMessageEmbeddingKey,
 } from './chat-reader.js';
@@ -737,7 +737,9 @@ async function computeClusterLabels(vectors, fixedK) {
     return { labels, k };
 }
 
-async function recomputeArchiveEmbeddingClusters(entries, options) {
+async function recomputeArchiveEmbeddingClusters(allEntries, options) {
+    // Clustering must not download unindexed chats just to find they have no vector.
+    const entries = allEntries.filter(entry => entry.isLoaded && !entry.needsHydration);
     const operation = captureEmbeddingOperation();
     const fixedK = Number.isFinite(options.fixedK) && options.fixedK > 0 ? Math.floor(options.fixedK) : null;
     const signature = entries.map(entry => `${entry.fileName}:${hashEmbeddingText(getRepresentativeEmbeddingText(entry))}:${entry.cachedChatEmbeddingHash || entry.chatEmbeddingHash || ''}`).join('\u0001');
@@ -1015,9 +1017,9 @@ async function runEmbeddingGenerationWork(targetFileNames = null, options = {}) 
     }
 
     if (options.ensureIndex && Object.keys(getIndex()).length === 0) {
-        // Automatic runs only restore cached vectors for chats already known here.
-        // They must not download a character's archive at page load or on a switch.
-        await buildIndex(null, null, { backgroundHydration: !options.automatic });
+        // A run reads what it needs chat by chat. It must not also index the
+        // character's archive, least of all at page load or on a switch.
+        await buildIndex(null, null, { backgroundHydration: false });
     }
 
     requireCurrentEmbeddingRun(operation);
@@ -1586,6 +1588,8 @@ export function toggleTimeline() {
         // Initialize thread focus from persisted preference
         setIcicleThreadFocus(getThreadFocus());
 
+        requestFullHydration();
+
         // Show loading state immediately so the browser can paint before heavy work
         if (content) content.innerHTML = '<div class="chat-manager-loading"><div class="chat-manager-spinner"></div> Building chart\u2026</div>';
         const status = _getStatus();
@@ -1659,6 +1663,7 @@ export function toggleStats() {
             content.innerHTML = '';
             mountStatsView(content);
         }
+        requestFullHydration();
 
         const status = _getStatus();
         if (status) status.textContent = 'Stats dashboard';
@@ -1844,11 +1849,24 @@ async function handleTimelineJumpToMessage(filename, msgIndex) {
 }
 
 function getIndexingSuffix() {
-    const { loaded, total } = getHydrationProgress();
-    if (!isHydrationComplete() && total > 0) {
-        return ` • Indexing chats... ${loaded}/${total}`;
-    }
-    return '';
+    if (isHydrationIdle()) return '';
+    const pending = getPendingHydrationCount();
+    return pending > 0 ? ` • Indexing ${pending} chat${pending === 1 ? '' : 's'}...` : '';
+}
+
+/** What needs every chat's content, rather than the list and the rendered cards. */
+function viewNeedsFullIndex() {
+    if (statsActive || timelineActive) return true;
+    if (semanticMapActive || graphViewActive) return false;
+    const sort = getSortState();
+    const filter = getFilterState();
+    return sort.field === 'created' || sort.field === 'cluster' || sort.secondaryField === 'created'
+        || (filter.dateBasis === 'created' && !!(filter.dateFrom || filter.dateTo));
+}
+
+function syncIndexDemand() {
+    if (viewNeedsFullIndex()) requestFullHydration();
+    else if (!chatVerificationInProgress) cancelBackgroundHydration();
 }
 
 function withIndexingSuffix(text) {
@@ -1925,7 +1943,7 @@ function scheduleHydrationUIRefresh() {
 
         patchCardData();
 
-        if (isHydrationComplete()) scheduleBranchDetection();
+        if (isHydrationIdle()) scheduleBranchDetection();
     }, 600);
 }
 
@@ -1978,12 +1996,12 @@ function scheduleSearchRefresh() {
     }
     // An archive scan already reads cold chats on demand. Let it finish before
     // refreshing, and coalesce indexing batches until the archive is ready.
-    if (searchPageAbort || !isHydrationComplete()) return;
+    if (searchPageAbort || !isHydrationIdle()) return;
 
     refreshSearchFromHydrationTimer = setTimeout(() => {
         refreshSearchFromHydrationTimer = null;
         if (!searchRefreshPending || !panelOpen || isAnyViewActive()) return;
-        if (searchPageAbort || !isHydrationComplete()) return;
+        if (searchPageAbort || !isHydrationIdle()) return;
 
         const latestQuery = getCurrentSearchQuery();
         searchRefreshPending = false;
@@ -2201,6 +2219,7 @@ function closePopup() {
 function releaseClosedPanelData() {
     const content = document.getElementById('chat-manager-content');
     if (content) content.innerHTML = '';
+    if (!chatVerificationInProgress) cancelBackgroundHydration();
     trimBodyCache({ keepActive: true, targetBytes: 0 });
     queryEmbeddingCache.clear();
     queryEmbeddingInFlight.clear();
@@ -2248,7 +2267,10 @@ function deactivateTimeline() {
 export async function refreshPanel(options = {}) {
     if (!panelOpen) return;
     const refreshRequestId = panelOpenRequestId;
-    const buildOptions = { forceRevalidate: options.forceRevalidate === true };
+    const buildOptions = {
+        forceRevalidate: options.forceRevalidate === true,
+        backgroundHydration: options.forceRevalidate === true || viewNeedsFullIndex(),
+    };
     const context = SillyTavern.getContext();
     ensureHydrationSubscription();
     ensureSearchModeBadge();
@@ -2430,7 +2452,7 @@ export async function refreshPanel(options = {}) {
 function onIndexProgress(completed, total) {
     const status = document.getElementById('chat-manager-status');
     if (!status || getCurrentSearchQuery().length >= 2) return;
-    const state = completed >= total ? threadLists.get(_getContent()) : null;
+    const state = threadLists.get(_getContent());
     if (state) updateThreadListFooter(state);
     else status.textContent = `Indexing chats... ${completed}/${total}`;
 }
@@ -2583,6 +2605,8 @@ export function renderThreadCards(visibleCount = RESULTS_PAGE_SIZE) {
     const index = getIndex();
     const totalCount = Object.keys(index).length;
 
+    syncIndexDemand();
+
     // Use filter/sort state
     const filterState = getFilterState();
     const sortState = getSortState();
@@ -2626,6 +2650,7 @@ export function renderThreadCardsFromEntries(entries, container, status, totalCo
     container.innerHTML = SillyTavern.libs.DOMPurify.sanitize(buildThreadCardsHtml(entries.slice(0, state.visibleCount)));
     updateThreadListFooter(state);
     bindCardEvents(container);
+    requestHydration(entries.slice(0, state.visibleCount).map(entry => entry.fileName));
 }
 
 function updateThreadListFooter(state) {
@@ -2647,6 +2672,8 @@ function updateThreadListFooter(state) {
             ));
             state.visibleCount = end;
             updateThreadListFooter(state);
+            requestHydration(page.map(entry => entry.fileName));
+            scheduleBranchDetection();
         });
         container.appendChild(more);
     }
@@ -3503,6 +3530,7 @@ async function performArchiveSearch(trimmed, requestId, mode, pageIndex = 0) {
         const settings = getEmbeddingSettings();
         const page = await searchArchivePage({
             query: trimmed, mode, queryVector, settings, excluded, embeddingOperation,
+            narrowFileNames: mode === 'keyword' ? () => findChatsMatchingKeyword(trimmed, { signal: controller.signal }) : null,
             limit: mode === 'semantic' ? HYBRID_SEARCH_LIMIT : RESULTS_PAGE_SIZE,
             signal: controller.signal,
             onProgress: scanned => {
@@ -4313,7 +4341,7 @@ async function handleJumpToGraphMessage(e) {
     }
 
     if (!isLoaded) {
-        prioritizeInQueue(filename);
+        requestHydration([filename]);
         toastr.info(`Loading thread into ${semanticMapActive ? 'semantic map' : 'graph'}…`);
     }
 }
